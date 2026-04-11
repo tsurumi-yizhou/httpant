@@ -1,0 +1,6 @@
+build/
+build*/
+docs/
+memories/
+**/.DS_Store
+CMakePresets.json
