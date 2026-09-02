@@ -10,11 +10,13 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <format>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -28,7 +30,7 @@ namespace httpant::examples {
 [[nodiscard]] inline auto quic_address_to_string(const QUIC_ADDR& address) -> std::string;
 
 [[nodiscard]] inline auto quic_error_message(std::string_view what, QUIC_STATUS status) -> std::string {
-    return std::string(what) + " failed (" + std::to_string(static_cast<long>(status)) + ')';
+    return std::format("{} failed ({})", what, status);
 }
 
 inline void check_quic_status(QUIC_STATUS status, std::string_view what) {
@@ -38,6 +40,12 @@ inline void check_quic_status(QUIC_STATUS status, std::string_view what) {
 
 template <typename T>
 class callback_queue {
+    struct waiter_state {
+        std::mutex mutex{};
+        std::coroutine_handle<> continuation{};
+        bool canceled{false};
+    };
+
 public:
     callback_queue(asio::any_io_executor executor, std::string name)
         : executor_(executor), name_(std::move(name)) {}
@@ -46,44 +54,81 @@ public:
     auto operator=(const callback_queue&) -> callback_queue& = delete;
 
     struct pop_operation {
+        struct stop_callback {
+            callback_queue* queue;
+            std::shared_ptr<waiter_state> waiter;
+
+            void operator()() const noexcept {
+                queue->cancel(waiter);
+            }
+        };
+
         callback_queue* queue;
+        std::stop_token stop;
+        std::shared_ptr<waiter_state> waiter{std::make_shared<waiter_state>()};
+        std::optional<std::stop_callback<stop_callback>> callback{};
+
+        pop_operation(callback_queue* queue, std::stop_token stop)
+            : queue(queue), stop(stop) {}
+
+        ~pop_operation() {
+            callback.reset();
+            queue->disarm(waiter);
+        }
 
         bool await_ready() noexcept {
-            return queue->ready();
+            if (!stop.stop_requested())
+                return queue->ready();
+            std::lock_guard lock(waiter->mutex);
+            waiter->canceled = true;
+            return true;
         }
 
         auto await_suspend(std::coroutine_handle<> continuation) -> bool {
-            return queue->arm_waiter(continuation);
+            {
+                std::lock_guard lock(waiter->mutex);
+                waiter->continuation = continuation;
+            }
+            if (!queue->arm_waiter(waiter))
+                return false;
+            callback.emplace(stop, stop_callback{queue, waiter});
+            return true;
         }
 
         auto await_resume() -> T {
+            callback.reset();
+            queue->disarm(waiter);
+            {
+                std::lock_guard lock(waiter->mutex);
+                if (waiter->canceled || stop.stop_requested())
+                    throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+            }
             return queue->pop();
         }
     };
 
     auto async_pop() -> pop_operation {
-        return {this};
+        return {this, {}};
+    }
+
+    auto async_pop(std::stop_token stop) -> pop_operation {
+        return {this, stop};
     }
 
     void push(T value) {
-        std::optional<std::coroutine_handle<>> waiter;
+        std::shared_ptr<waiter_state> waiter;
         {
             std::lock_guard lock(mutex_);
             if (closed_)
                 return;
             values_.push_back(std::move(value));
-            if (waiter_)
-                waiter = std::exchange(waiter_, {});
+            waiter = std::exchange(waiter_, {});
         }
-
-        if (waiter)
-            asio::post(executor_, [continuation = *waiter]() mutable {
-                continuation.resume();
-            });
+        resume(std::move(waiter));
     }
 
     void close(std::exception_ptr error = {}) {
-        std::optional<std::coroutine_handle<>> waiter;
+        std::shared_ptr<waiter_state> waiter;
         {
             std::lock_guard lock(mutex_);
             if (closed_)
@@ -91,14 +136,9 @@ public:
             closed_ = true;
             if (error && !error_)
                 error_ = std::move(error);
-            if (waiter_)
-                waiter = std::exchange(waiter_, {});
+            waiter = std::exchange(waiter_, {});
         }
-
-        if (waiter)
-            asio::post(executor_, [continuation = *waiter]() mutable {
-                continuation.resume();
-            });
+        resume(std::move(waiter));
     }
 
 private:
@@ -107,14 +147,52 @@ private:
         return !values_.empty() || closed_;
     }
 
-    auto arm_waiter(std::coroutine_handle<> continuation) -> bool {
+    auto arm_waiter(const std::shared_ptr<waiter_state>& waiter) -> bool {
         std::lock_guard lock(mutex_);
         if (!values_.empty() || closed_)
             return false;
         if (waiter_)
             throw std::runtime_error(name_ + ": concurrent waiters are not supported");
-        waiter_ = continuation;
+        waiter_ = waiter;
         return true;
+    }
+
+    void cancel(const std::shared_ptr<waiter_state>& waiter) noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            if (waiter_ != waiter)
+                return;
+            waiter_.reset();
+        }
+        {
+            std::lock_guard lock(waiter->mutex);
+            waiter->canceled = true;
+        }
+        resume(waiter);
+    }
+
+    void disarm(const std::shared_ptr<waiter_state>& waiter) noexcept {
+        {
+            std::lock_guard lock(mutex_);
+            if (waiter_ == waiter)
+                waiter_.reset();
+        }
+        std::lock_guard lock(waiter->mutex);
+        waiter->continuation = {};
+    }
+
+    void resume(std::shared_ptr<waiter_state> waiter) {
+        if (!waiter)
+            return;
+        asio::post(executor_, [waiter = std::move(waiter)]() mutable {
+            std::coroutine_handle<> continuation;
+            {
+                std::lock_guard lock(waiter->mutex);
+                continuation = std::exchange(waiter->continuation, {});
+            }
+            if (continuation)
+                continuation.resume();
+        });
     }
 
     auto pop() -> T {
@@ -133,7 +211,7 @@ private:
     std::string name_;
     std::mutex mutex_;
     std::deque<T> values_{};
-    std::coroutine_handle<> waiter_{};
+    std::shared_ptr<waiter_state> waiter_{};
     std::exception_ptr error_{};
     bool closed_{false};
 };
@@ -275,18 +353,81 @@ public:
     struct write_operation;
 
     auto async_read(std::span<std::byte> buffer) -> read_operation;
+    auto async_read(std::span<std::byte> buffer, std::stop_token stop) -> read_operation;
     auto async_write(std::span<const std::byte> buffer) -> write_operation;
     auto async_write(std::span<const std::byte> buffer, bool fin) -> write_operation;
+    auto async_write(std::span<const std::byte> buffer, bool fin, std::stop_token stop) -> write_operation;
 
     [[nodiscard]] auto id() const -> std::int64_t;
+    // stream_factory contract: identity, direction, receive credit, and
+    // per-side shutdown (RFC 9114 §4.1 — the HTTP/3 layer drives these).
+    [[nodiscard]] auto identifier() const -> http::stream_identifier;
+    [[nodiscard]] auto access() const -> http::stream_access;
+    void consume(std::size_t consumed);
+    void shutdown(http::stream_side side, http::application_error error);
 
 private:
     std::shared_ptr<quic_stream_state> state_{};
 };
 
 struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
-    explicit quic_stream_state(asio::any_io_executor executor, std::int64_t stream_id)
-        : executor(std::move(executor)), stream_id(stream_id) {}
+    // Per-write shared state. MsQuic reports send completion through a raw
+    // ClientContext pointer that must remain valid until SEND_COMPLETE fires;
+    // the awaiter that initiated the send may already be destroyed. Holding the
+    // operation's bookkeeping in a shared state decouples the backend callback
+    // from the coroutine frame lifetime.
+    struct write_state : std::enable_shared_from_this<write_state> {
+        std::mutex mutex{};
+        std::coroutine_handle<> continuation{};
+        std::size_t payload_size{0};
+        std::size_t result{0};
+        std::exception_ptr error{};
+        bool completed{false};
+
+        void set_continuation(std::coroutine_handle<> handle) {
+            std::scoped_lock lock(mutex);
+            continuation = handle;
+        }
+
+        void detach() noexcept {
+            std::scoped_lock lock(mutex);
+            continuation = {};
+        }
+
+        // Records a synchronous Send failure without resuming: the awaiter
+        // returns false from await_suspend and await_resume observes the error.
+        void record_error(std::exception_ptr failure) {
+            std::scoped_lock lock(mutex);
+            if (completed)
+                return;
+            completed = true;
+            error = std::move(failure);
+        }
+
+        void complete(bool canceled) {
+            std::coroutine_handle<> handle;
+            {
+                std::scoped_lock lock(mutex);
+                if (completed)
+                    return;
+                completed = true;
+                if (canceled) {
+                    error = std::make_exception_ptr(
+                        std::runtime_error("quic stream send was canceled"));
+                } else {
+                    result = payload_size;
+                }
+                handle = std::exchange(continuation, {});
+            }
+            if (handle)
+                handle.resume();
+        }
+    };
+
+    explicit quic_stream_state(asio::any_io_executor executor,
+                               std::int64_t stream_id,
+                               http::stream_access access = http::stream_access::bidirectional)
+        : executor(std::move(executor)), stream_id(stream_id), access_(access) {}
 
     [[nodiscard]] auto can_read() -> bool {
         std::lock_guard lock(mutex);
@@ -301,6 +442,11 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
             throw std::runtime_error("quic stream does not support concurrent reads");
         read_waiter = continuation;
         return true;
+    }
+
+    void disarm_read() noexcept {
+        std::lock_guard lock(mutex);
+        read_waiter = {};
     }
 
     auto consume(std::span<std::byte> buffer) -> std::size_t {
@@ -321,7 +467,48 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
         throw std::runtime_error("quic stream resumed without available data");
     }
 
-    void complete_send(quic_stream::write_operation* operation, bool canceled);
+    // Receive-credit accounting for the stream_factory contract: every byte
+    // the protocol layer has consumed is returned to the peer (RFC 9114 §6.1 /
+    // [QUIC-TRANSPORT] §4.1 — flow control credit is per stream). MsQuic
+    // credits are coarse (a single absolute byte count, not per-buffer), so
+    // consumed bytes are tracked absolutely and granted when they grow.
+    void grant_credit(std::size_t consumed) {
+        std::lock_guard lock(mutex);
+        consumed_total += consumed;
+    }
+
+    void release_credit() noexcept {
+        std::size_t granted = 0;
+        {
+            std::lock_guard lock(mutex);
+            if (consumed_total > credit_granted) {
+                granted = consumed_total - credit_granted;
+                credit_granted = consumed_total;
+            }
+        }
+        if (granted != 0 && stream)
+            static_cast<void>(stream->ReceiveComplete(static_cast<std::uint64_t>(granted)));
+    }
+
+    // Per-side shutdown with an H3 application error (RFC 9114 §8 — stream
+    // errors carry the H3 error code on the QUIC reset).
+    void shutdown(http::stream_side side, http::application_error error) {
+        if (!stream)
+            return;
+        auto flags = QUIC_STREAM_SHUTDOWN_FLAG_NONE;
+        if (side == http::stream_side::sending || side == http::stream_side::both)
+            // msquic treats GRACEFUL and ABORT_SEND as mutually exclusive: a
+            // nonzero application error must abort the send side so the typed
+            // code reaches the peer on RESET_STREAM; zero means a graceful FIN.
+            flags = static_cast<QUIC_STREAM_SHUTDOWN_FLAGS>(
+                flags | (error.value != 0 ? QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND
+                                          : QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL));
+        if (side == http::stream_side::receiving || side == http::stream_side::both)
+            flags = static_cast<QUIC_STREAM_SHUTDOWN_FLAGS>(flags | QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE);
+        static_cast<void>(stream->Shutdown(error.value, flags));
+    }
+
+    void complete_send(void* context, bool canceled);
 
     void fail(std::exception_ptr failure) {
         std::optional<std::coroutine_handle<>> waiter;
@@ -387,20 +574,19 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
                     state->append_received(*event);
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_SEND_COMPLETE:
-                    state->complete_send(
-                        static_cast<quic_stream::write_operation*>(event->SEND_COMPLETE.ClientContext),
-                        event->SEND_COMPLETE.Canceled != FALSE);
+                    state->complete_send(event->SEND_COMPLETE.ClientContext,
+                                         event->SEND_COMPLETE.Canceled != FALSE);
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
                     state->note_peer_fin();
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-                    state->fail(std::make_exception_ptr(
-                        std::runtime_error("quic peer aborted the receive side of the stream")));
+                    state->fail(std::make_exception_ptr(http::stream_reset{
+                        http::application_error{event->PEER_SEND_ABORTED.ErrorCode}}));
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
-                    state->fail(std::make_exception_ptr(
-                        std::runtime_error("quic peer aborted the send side of the stream")));
+                    state->fail(std::make_exception_ptr(http::stream_reset{
+                        http::application_error{event->PEER_RECEIVE_ABORTED.ErrorCode}}));
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE: {
                     std::optional<std::coroutine_handle<>> waiter;
@@ -428,33 +614,30 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
 
     asio::any_io_executor executor;
     std::int64_t stream_id{0};
+    http::stream_access access_{http::stream_access::bidirectional};
     std::unique_ptr<MsQuicStream> stream{};
     std::mutex mutex{};
     std::deque<std::byte> receive_buffer{};
     std::coroutine_handle<> read_waiter{};
     std::exception_ptr error{};
+    std::size_t consumed_total{0};
+    std::size_t credit_granted{0};
     bool peer_fin{false};
     bool shutdown_complete{false};
 };
 
 class quic_connection_transport {
 public:
+    // stream_factory contract: the handle type created/accepted by this
+    // connection factory.
+    using stream_type = quic_stream;
+    // callback_queue marshals MsQuic callbacks onto the connection's asio
+    // executor, satisfying httpant's sole-mutator nghttp3/QPACK contract.
+    static constexpr auto completion_order =
+        http::stream_completion_order::serialized;
+
     quic_connection_transport() = default;
     explicit quic_connection_transport(std::shared_ptr<quic_connection_state> state) : state_(std::move(state)) {}
-
-    struct connection_io_operation {
-        std::string message;
-
-        bool await_ready() const noexcept {
-            return true;
-        }
-
-        void await_suspend(std::coroutine_handle<>) const noexcept {}
-
-        auto await_resume() -> std::size_t {
-            throw std::runtime_error(message);
-        }
-    };
 
     struct open_operation {
         std::shared_ptr<quic_connection_state> state;
@@ -483,23 +666,36 @@ public:
         auto open() -> quic_stream;
     };
 
-    auto async_read(std::span<std::byte>) -> connection_io_operation {
-        return {"quic connections do not support connection-level reads"};
-    }
-
-    auto async_write(std::span<const std::byte>) -> connection_io_operation {
-        return {"quic connections do not support connection-level writes"};
-    }
-
-    auto async_write(std::span<const std::byte>, bool) -> connection_io_operation {
-        return {"quic connections do not support connection-level writes"};
-    }
-
     auto async_accept() const -> decltype(auto);
-    auto async_open(std::int64_t stream_id) const -> open_operation {
-        return {state_, stream_id};
+    auto async_accept(std::stop_token stop) const -> decltype(auto);
+
+    // stream_factory surface: open local streams with explicit direction,
+    // close the connection with an H3 application error (RFC 9114 §8 — the
+    // H3 error code rides on the QUIC CONNECTION_CLOSE).
+    auto async_open_bidirectional(std::stop_token) const -> open_operation {
+        return {state_, next_stream_id(true)};
     }
+    auto async_open_unidirectional(std::stop_token) const -> open_operation {
+        return {state_, next_stream_id(false)};
+    }
+
+    struct close_operation {
+        std::shared_ptr<quic_connection_state> state;
+        http::application_error error;
+
+        bool await_ready() const noexcept {
+            return true;
+        }
+        void await_suspend(std::coroutine_handle<>) const noexcept {}
+        void await_resume() const;
+    };
+
+    auto async_close(http::application_error error) const -> close_operation {
+        return {state_, error};
+    }
+
     auto async_connected() const -> decltype(auto);
+    auto async_connected(std::stop_token stop) const -> decltype(auto);
 
     void shutdown(std::uint64_t error_code = 0) const;
 
@@ -510,6 +706,13 @@ public:
 
 private:
     std::shared_ptr<quic_connection_state> state_{};
+
+    // Peek at the next local stream id of the requested direction without
+    // consuming it. The id sequence is fixed by QUIC (RFC 9000 §2.1 — client
+    // streams start at 0, server streams at 1, uni streams offset by 2);
+    // open_stream validates the sequence and advances the counter when it
+    // actually opens the stream.
+    [[nodiscard]] auto next_stream_id(bool bidirectional) const -> std::int64_t;
 };
 
 struct quic_connection_state : std::enable_shared_from_this<quic_connection_state> {
@@ -568,11 +771,23 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
         return accepted_streams.async_pop();
     }
 
+    auto async_accept(std::stop_token stop) -> decltype(auto) {
+        return accepted_streams.async_pop(stop);
+    }
+
     auto async_connected() -> decltype(auto) {
         return connected_events.async_pop();
     }
 
+    auto async_connected(std::stop_token stop) -> decltype(auto) {
+        return connected_events.async_pop(stop);
+    }
+
     auto open_stream(std::int64_t stream_id) -> quic_stream {
+        return open_stream(stream_id, http::stream_access::bidirectional);
+    }
+
+    auto open_stream(std::int64_t stream_id, http::stream_access access) -> quic_stream {
         std::shared_ptr<quic_stream_state> existing;
         {
             std::lock_guard lock(mutex);
@@ -593,7 +808,14 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
                 throw std::runtime_error("quic local stream id sequence is inconsistent with HTTP/3 expectations");
         }
 
-        auto stream_state = std::make_shared<quic_stream_state>(executor, stream_id);
+        // RFC 9114 §6.2 — local unidirectional streams are send-only from the
+        // initiator's perspective; the direction is carried on the handle
+        // rather than guessed from the id by the application.
+        auto stream_access_value = access;
+        if (is_unidirectional)
+            stream_access_value = http::stream_access::send_only;
+
+        auto stream_state = std::make_shared<quic_stream_state>(executor, stream_id, stream_access_value);
         auto open_flags = is_unidirectional ? QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL : QUIC_STREAM_OPEN_FLAG_NONE;
         auto stream = std::make_unique<MsQuicStream>(*connection, open_flags, CleanUpManual, &quic_stream_state::callback, stream_state.get());
         if (!stream || !stream->IsValid())
@@ -649,6 +871,10 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
     }
 
     void note_remote_stream(HQUIC handle) {
+        // RFC 9114 §6.2 — a peer-initiated unidirectional stream is
+        // receive-only from our side; bidirectional streams carry both
+        // directions. The direction is reported by access(), never guessed
+        // from the id by the application.
         auto stream_state = std::make_shared<quic_stream_state>(executor, -1);
         auto stream = std::make_unique<MsQuicStream>(handle, CleanUpManual, &quic_stream_state::callback, stream_state.get());
         if (!stream || !stream->IsValid()) {
@@ -659,6 +885,9 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
         }
 
         stream_state->stream_id = static_cast<std::int64_t>(stream->ID());
+        stream_state->access_ = (stream_state->stream_id & 0x2) != 0
+            ? http::stream_access::receive_only
+            : http::stream_access::bidirectional;
         stream_state->stream = std::move(stream);
 
         {
@@ -731,6 +960,10 @@ public:
         return state_->accepted_connections->async_pop();
     }
 
+    auto async_accept(std::stop_token stop) const -> decltype(auto) {
+        return state_->accepted_connections->async_pop(stop);
+    }
+
 private:
     struct state {
         state(asio::any_io_executor executor,
@@ -789,8 +1022,26 @@ private:
 struct quic_stream::read_operation {
     std::shared_ptr<quic_stream_state> state;
     std::span<std::byte> buffer;
+    std::stop_token stop;
+
+    read_operation(std::shared_ptr<quic_stream_state> s,
+                   std::span<std::byte> b,
+                   std::stop_token st)
+        : state(std::move(s)), buffer(b), stop(st) {}
+
+    read_operation(const read_operation&) = delete;
+    auto operator=(const read_operation&) -> read_operation& = delete;
+    read_operation(read_operation&&) = default;
+    auto operator=(read_operation&&) -> read_operation& = default;
+
+    ~read_operation() {
+        if (state)
+            state->disarm_read();
+    }
 
     bool await_ready() {
+        if (stop.stop_requested())
+            return true;
         return state->can_read();
     }
 
@@ -799,72 +1050,162 @@ struct quic_stream::read_operation {
     }
 
     auto await_resume() -> std::size_t {
+        if (stop.stop_requested())
+            throw std::system_error(std::make_error_code(std::errc::operation_canceled));
         return state->consume(buffer);
     }
 };
 
 struct quic_stream::write_operation {
+    // The stream_factory write contract distinguishes acceptance, buffer
+    // release, and peer acknowledgement (REFACTOR §3.5). MsQuic copies send
+    // buffers synchronously, so buffer release completes immediately with the
+    // Send call; SEND_COMPLETE (which fires once the peer acknowledges the
+    // data) completes the acknowledgement with the acked byte count.
+    struct release_awaiter {
+        bool await_ready() const noexcept { return true; }
+        void await_suspend(std::coroutine_handle<>) const noexcept {}
+        void await_resume() const noexcept {}
+    };
+
+    struct ack_awaiter {
+        std::size_t count{0};
+
+        bool await_ready() const noexcept { return true; }
+        void await_suspend(std::coroutine_handle<>) const noexcept {}
+        auto await_resume() const noexcept -> std::size_t { return count; }
+    };
+
     std::shared_ptr<quic_stream_state> state;
+    std::shared_ptr<quic_stream_state::write_state> wstate;
     std::span<const std::byte> source;
     bool fin{false};
-    std::vector<std::byte> payload{};
-    QUIC_BUFFER buffer{};
-    std::coroutine_handle<> continuation{};
-    std::size_t result{0};
-    std::exception_ptr error{};
+    std::stop_token stop;
+
+    write_operation(std::shared_ptr<quic_stream_state> s,
+                    std::span<const std::byte> src,
+                    bool f,
+                    std::stop_token st)
+        : state(std::move(s)), source(src), fin(f), stop(st) {}
+
+    write_operation(const write_operation&) = delete;
+    auto operator=(const write_operation&) -> write_operation& = delete;
+    write_operation(write_operation&&) = default;
+    auto operator=(write_operation&&) -> write_operation& = default;
+
+    ~write_operation() {
+        if (wstate)
+            wstate->detach();
+    }
 
     bool await_ready() const noexcept {
-        return false;
+        return stop.stop_requested();
     }
 
     auto await_suspend(std::coroutine_handle<> continuation_handle) -> bool {
-        continuation = continuation_handle;
-        payload.assign(source.begin(), source.end());
+        if (stop.stop_requested())
+            return false;
+
+        wstate = std::make_shared<quic_stream_state::write_state>();
+        wstate->payload_size = source.size();
+        wstate->set_continuation(continuation_handle);
+
+        // MsQuic copies the buffers synchronously by default, so the payload
+        // only needs to outlive the Send call itself.
+        std::vector<std::byte> payload(source.begin(), source.end());
+        QUIC_BUFFER buffer{};
         buffer.Buffer = reinterpret_cast<std::uint8_t*>(payload.data());
         buffer.Length = static_cast<std::uint32_t>(payload.size());
 
         auto flags = fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE;
-        auto status = state->stream->Send(&buffer, 1, flags, this);
+        auto* context = new std::shared_ptr<quic_stream_state::write_state>(wstate);
+        auto status = state->stream->Send(&buffer, 1, flags, context);
         if (QUIC_FAILED(status)) {
-            error = std::make_exception_ptr(std::runtime_error(quic_error_message("quic stream send", status)));
+            delete context;
+            wstate->record_error(std::make_exception_ptr(
+                std::runtime_error(quic_error_message("quic stream send", status))));
             return false;
         }
         return true;
     }
 
-    auto await_resume() -> std::size_t {
-        if (error)
-            std::rethrow_exception(error);
-        return result;
+    auto await_resume() -> http::stream_write_result<release_awaiter, ack_awaiter> {
+        if (stop.stop_requested())
+            throw std::system_error(std::make_error_code(std::errc::operation_canceled));
+        if (wstate->error)
+            std::rethrow_exception(wstate->error);
+        return http::stream_write_result<release_awaiter, ack_awaiter>{
+            .accepted = wstate->payload_size,
+            .buffer_release = {},
+            .acknowledgement = {.count = wstate->result},
+        };
     }
 };
 
-inline void quic_stream_state::complete_send(quic_stream::write_operation* operation, bool canceled) {
-    asio::post(executor, [operation, canceled]() mutable {
-        if (canceled) {
-            operation->error = std::make_exception_ptr(
-                std::runtime_error("quic stream send was canceled"));
-        } else {
-            operation->result = operation->payload.size();
-        }
-        operation->continuation.resume();
+inline void quic_stream_state::complete_send(void* context, bool canceled) {
+    auto* holder = static_cast<std::shared_ptr<write_state>*>(context);
+    auto state = std::move(*holder);
+    delete holder;
+    asio::post(executor, [state = std::move(state), canceled]() mutable {
+        state->complete(canceled);
     });
 }
 
 inline auto quic_stream::async_read(std::span<std::byte> buffer) -> read_operation {
-    return {state_, buffer};
+    return read_operation{state_, buffer, std::stop_token{}};
+}
+
+inline auto quic_stream::async_read(std::span<std::byte> buffer, std::stop_token stop) -> read_operation {
+    return read_operation{state_, buffer, stop};
 }
 
 inline auto quic_stream::async_write(std::span<const std::byte> buffer) -> write_operation {
-    return {state_, buffer, false};
+    return write_operation{state_, buffer, false, std::stop_token{}};
 }
 
 inline auto quic_stream::async_write(std::span<const std::byte> buffer, bool fin) -> write_operation {
-    return {state_, buffer, fin};
+    return write_operation{state_, buffer, fin, std::stop_token{}};
+}
+
+inline auto quic_stream::async_write(std::span<const std::byte> buffer, bool fin, std::stop_token stop) -> write_operation {
+    return write_operation{state_, buffer, fin, stop};
 }
 
 inline auto quic_stream::id() const -> std::int64_t {
     return state_ ? state_->stream_id : -1;
+}
+
+inline auto quic_stream::identifier() const -> http::stream_identifier {
+    return {static_cast<std::uint64_t>(id())};
+}
+
+inline auto quic_stream::access() const -> http::stream_access {
+    return state_ ? state_->access_ : http::stream_access::bidirectional;
+}
+
+inline void quic_stream::consume(std::size_t consumed) {
+    if (!state_)
+        throw std::runtime_error("quic stream is not initialized");
+    state_->grant_credit(consumed);
+    state_->release_credit();
+}
+
+inline void quic_stream::shutdown(http::stream_side side, http::application_error error) {
+    if (state_)
+        state_->shutdown(side, error);
+}
+
+inline void quic_connection_transport::close_operation::await_resume() const {
+    if (state)
+        state->shutdown(error.value);
+}
+
+inline auto quic_connection_transport::next_stream_id(bool bidirectional) const -> std::int64_t {
+    auto* next = bidirectional
+        ? &state_->next_local_bidirectional_id
+        : &state_->next_local_unidirectional_id;
+    std::lock_guard lock(state_->mutex);
+    return *next;
 }
 
 inline auto quic_connection_transport::open_operation::open() -> quic_stream {
@@ -877,8 +1218,16 @@ inline auto quic_connection_transport::async_accept() const -> decltype(auto) {
     return state_->async_accept();
 }
 
+inline auto quic_connection_transport::async_accept(std::stop_token stop) const -> decltype(auto) {
+    return state_->async_accept(stop);
+}
+
 inline auto quic_connection_transport::async_connected() const -> decltype(auto) {
     return state_->async_connected();
+}
+
+inline auto quic_connection_transport::async_connected(std::stop_token stop) const -> decltype(auto) {
+    return state_->async_connected(stop);
 }
 
 inline void quic_connection_transport::shutdown(std::uint64_t error_code) const {

@@ -1,11 +1,12 @@
 {
     "name": "httpant",
     "version": "0.1.0",
-    "builtin-baseline": "efa4634bd526b87559684607d2cbbdeeec0f07d8",
+    "builtin-baseline": "818beed257310e1319826eb887651ba7ed61a29a",
     "dependencies": [
         "llhttp",
         "nghttp2",
-        "nghttp3"
+        "nghttp3",
+        "stdexec"
     ],
     "features": {
         "examples": {

@@ -1,8 +1,4 @@
-cmake_minimum_required(VERSION 4.3.1)
-
-set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
-    "451f2fe2-a8a2-47c3-bc32-94786d8fc91b"
-    CACHE STRING "Enable experimental import std support" FORCE)
+cmake_minimum_required(VERSION 4.0.0)
 
 option(ENABLE_TESTING "Build Tests" ON)
 if(ENABLE_TESTING)
@@ -17,9 +13,8 @@ endif()
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_MODULE_STD ON CACHE BOOL "Enable import std support" FORCE)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
-set(BOOST_UT_DISABLE_MODULE OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(httpant VERSION 0.1.0 LANGUAGES CXX)
 
@@ -29,6 +24,7 @@ endif()
 
 find_package(llhttp CONFIG REQUIRED)
 find_package(nghttp3 CONFIG REQUIRED)
+find_package(stdexec CONFIG REQUIRED)
 find_path(NGHTTP2_INCLUDE_DIR
     NAMES nghttp2/nghttp2.h
     REQUIRED
@@ -89,12 +85,30 @@ add_library(${PROJECT_NAME} STATIC)
 target_sources(
     ${PROJECT_NAME} PUBLIC FILE_SET CXX_MODULES FILES
     modules/httpant.cppm
+    modules/error.cppm
     modules/trait.cppm
     modules/message.cppm
-    modules/codec.cppm
-    modules/session.cppm
-    modules/channel.cppm
-    modules/exchange.cppm
+    modules/role.cppm
+    modules/validate/llhttp.cppm
+    modules/parse/llhttp.cppm
+    modules/serialize/llhttp.cppm
+    modules/client/llhttp.cppm
+    modules/server/llhttp.cppm
+    modules/session/core.cppm
+    modules/session/nghttp2.cppm
+    modules/parse/nghttp2.cppm
+    modules/serialize/nghttp2.cppm
+    modules/endpoint/nghttp2.cppm
+    modules/client/nghttp2.cppm
+    modules/server/nghttp2.cppm
+    modules/session/nghttp3.cppm
+    modules/parse/nghttp3.cppm
+    modules/serialize/nghttp3.cppm
+    modules/endpoint/nghttp3.cppm
+    modules/client/nghttp3.cppm
+    modules/server/nghttp3.cppm
+    modules/coroutine.cppm
+    modules/execution.cppm
     modules/caching.cppm
     modules/cookie.cppm
 )
@@ -109,11 +123,19 @@ target_link_libraries(
     llhttp::llhttp_static
     nghttp2::nghttp2
     $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
+    STDEXEC::stdexec
+    $<$<TARGET_EXISTS:clang-cxx-runtime>:clang-cxx-runtime>
 )
 
 if(ENABLE_TESTING)
     file(GLOB_RECURSE TEST_FILES CONFIGURE_DEPENDS testing/*.cpp)
     add_executable(${PROJECT_NAME}-test ${TEST_FILES})
+    # Homebrew LLVM 22 modules × libc++ std::stop_callback workaround — see
+    # examples/stop_support.cpp. Test TUs that both import the httpant module
+    # and instantiate std::stop_callback do not emit the weak
+    # __atomic_unique_lock::__set_locked_bit definition; the anchor TU provides
+    # it for the whole test link.
+    target_sources(${PROJECT_NAME}-test PRIVATE examples/stop_support.cpp)
     target_link_libraries(${PROJECT_NAME}-test PRIVATE
         ${PROJECT_NAME}
         Boost::ut
@@ -122,6 +144,7 @@ if(ENABLE_TESTING)
         msquic
     )
     add_test(NAME ${PROJECT_NAME}-test COMMAND ${PROJECT_NAME}-test)
+    set_tests_properties(${PROJECT_NAME}-test PROPERTIES TIMEOUT 60)
 endif()
 
 if(ENABLE_EXAMPLES)

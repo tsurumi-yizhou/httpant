@@ -1,5 +1,7 @@
 #include <boost/ut.hpp>
 
+#include <stdexcept>
+
 #include "test_support.hpp"
 
 namespace httpant::testing {
