@@ -1,21 +1,6 @@
-module;
-
-#include <algorithm>
-#include <array>
-#include <charconv>
-#include <chrono>
-#include <concepts>
-#include <cstdint>
-#include <expected>
-#include <optional>
-#include <span>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:cookie;
 
+import std;
 import :message;
 
 export namespace http {

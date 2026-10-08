@@ -1,13 +1,7 @@
-#include <stdexec/execution.hpp>
-
-#include <array>
-#include <cstddef>
-#include <stop_token>
-#include <tuple>
-
+import httpant.dependencies.stdexec;
+import std;
 import httpant;
-
-#include "../client_support.hpp"
+import httpant.examples.client;
 
 auto main() -> int {
     httpant::examples::memory_stream transport{

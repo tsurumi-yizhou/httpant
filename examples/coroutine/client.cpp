@@ -1,10 +1,6 @@
 import httpant;
-
-#include <array>
-#include <cstddef>
-#include <stop_token>
-
-#include "../client_support.hpp"
+import std;
+import httpant.examples.client;
 
 namespace {
 

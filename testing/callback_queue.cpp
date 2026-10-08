@@ -1,17 +1,8 @@
-#include <boost/ut.hpp>
-
-#include <asio.hpp>
-
-#include <coroutine>
-#include <exception>
-#include <stop_token>
-#include <string>
-#include <system_error>
-#include <utility>
-
+import httpant.dependencies.boost.ut;
+import httpant.dependencies.asio;
+import std;
 import httpant;
-
-#include "../examples/quic_support.hpp"
+import httpant.examples.quic;
 
 namespace httpant::testing {
 

@@ -1,31 +1,7 @@
-module;
-
-#include <nghttp2/nghttp2.h>
-
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <deque>
-#include <exception>
-#include <format>
-#include <functional>
-#include <memory>
-#include <optional>
-#include <ranges>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
 export module httpant:session.nghttp2;
 
+import httpant.dependencies.nghttp2;
+import std;
 import :trait;
 import :message;
 import :error;
@@ -165,7 +141,6 @@ inline auto make_goaway_rejection(std::optional<std::uint64_t> exchange)
 inline auto parse_status(std::string_view value) -> std::optional<std::uint16_t> {
     return http::detail::parse_status(value);
 }
-
 
 inline auto check_stream_id(int id, std::string_view op) -> int {
     if (id < 0) throw make_error(op, id);

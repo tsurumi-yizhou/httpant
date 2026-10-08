@@ -1,23 +1,7 @@
-module;
-
-#include <nghttp2/nghttp2.h>
-
-#include <algorithm>
-#include <coroutine>
-#include <cstdint>
-#include <exception>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:client.nghttp2;
 
+import httpant.dependencies.nghttp2;
+import std;
 import :endpoint.nghttp2;
 import :serialize.nghttp2;
 import :session.nghttp2;

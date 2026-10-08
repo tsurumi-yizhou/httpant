@@ -2,6 +2,100 @@
 
 A modern C++ library with no I/O and pure protocols.
 
+## Build
+
+Httpant requires CMake 4.0+, Ninja, C++23, and the
+[xclang toolchain](https://github.com/clice-io/xclang). Its `xclang::std`
+target builds the standard library module; Httpant links it transitively.
+With dependencies installed in a prefix:
+
+```sh
+cmake -S . -B build -G Ninja \
+  --toolchain "$XCLANG_ROOT/lib/cmake/xclang/toolchain.cmake" \
+  -DCMAKE_PREFIX_PATH=/path/to/dependencies \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+Use xclang's toolchain file as the common build entry on all platforms.
+`XCLANG_TARGET` selects the target, for example
+`-DXCLANG_TARGET=x86_64-pc-windows-msvc` for Windows with the MSVC ABI.
+That target uses Clang with Microsoft's STL and Windows SDK, including
+Microsoft's `std` module; it does not invoke `cl.exe`. The SDK must be
+available to xclang. See the
+[xclang CMake guide](https://github.com/clice-io/xclang/blob/main/docs/en/integrations/cmake.md)
+for supported targets and SDK setup. Build dependencies with the same
+toolchain and target. Httpant's Windows and macOS builds have not yet been
+validated.
+
+`BUILD_TESTING` is the standard CTest option (default `ON`);
+`ENABLE_EXAMPLES` controls examples (default `ON`). Both can be disabled for
+a library-only build. Core dependencies are llhttp, nghttp2, nghttp3, and
+stdexec. Tests and examples additionally need Asio, OpenSSL, and MsQuic;
+only tests need Boost.UT.
+
+Dependencies can come from vcpkg, FetchContent, or the parent project.
+Httpant reuses existing CMake targets before calling `find_package`:
+
+| Dependency | Accepted targets (in preference order) |
+| --- | --- |
+| llhttp | `llhttp::llhttp`, `llhttp::llhttp_static`, `llhttp_static`, `llhttp_shared` |
+| nghttp2 | `nghttp2::nghttp2`, `nghttp2::nghttp2_static`, `nghttp2`, `nghttp2_static` |
+| nghttp3 | `nghttp3::nghttp3`, `nghttp3::nghttp3_static`, `nghttp3`, `nghttp3_static` |
+| stdexec | `STDEXEC::stdexec`, `stdexec` |
+| Asio | `asio::asio`, `asio` |
+| OpenSSL | `OpenSSL::SSL` and `OpenSSL::Crypto` |
+| MsQuic | `msquic` |
+| Boost.UT | `Boost::ut` |
+
+For example, create dependency targets in the parent before adding Httpant:
+
+```cmake
+# Set these before creating dependency and application targets.
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+# find_package(...) or FetchContent_MakeAvailable(...) for the dependencies
+set(BUILD_TESTING OFF CACHE BOOL "Build tests")
+set(ENABLE_EXAMPLES OFF CACHE BOOL "Build examples")
+add_subdirectory(httpant)
+target_link_libraries(my_app PRIVATE httpant)
+```
+
+A dependency without a CMake build can be supplied as an interface/imported
+target with one of the names above and the appropriate include directories,
+compile definitions, and link libraries. nghttp2 also supports a fallback
+search for installed headers and libraries.
+
+When using vcpkg, select its toolchain with `CMAKE_TOOLCHAIN_FILE` and
+chain-load xclang with `VCPKG_CHAINLOAD_TOOLCHAIN_FILE`. Omit the vcpkg
+toolchain to build without vcpkg; `VCPKG_MANIFEST_INSTALL=OFF` disables its
+automatic installation while retaining the toolchain. Only standalone
+builds add features to Httpant's vcpkg manifest; an `add_subdirectory` build
+leaves dependency acquisition to the parent project. Use a custom vcpkg
+triplet that also chain-loads xclang, so the dependencies use the same
+compiler, ABI, and sysroot as Httpant. All module targets must agree on the
+C++ language standard and extension settings (`CMAKE_CXX_EXTENSIONS=OFF`).
+
+Httpant owns the `.ixx` wrappers in `modules/dependencies`. They expose the
+API needed by Httpant under `httpant.dependencies.*` module names and do not
+replace upstream dependency targets. Applications can continue using those
+targets and upstream headers themselves; the wrappers are not a complete
+module API for each upstream library. Textual includes are confined to these
+wrappers. Constant/function macros used by Httpant are exposed as typed C++
+entities, and protocol invariants formerly guarded by `assert` now throw
+`std::logic_error` in all build configurations.
+
+Compiler checks on Linux passed with xclang 23.1.2.8 and Ubuntu Clang
+23.1.3 with libc++. GCC is not currently supported by these dependency
+modules: GCC 15.2 rejects declarations exposing translation-unit-local
+entities in stdexec, Asio, and MsQuic; GCC 16 (20260322 snapshot) crashes
+while compiling stdexec's `forwarding_query`. The GCC 16 failure also
+occurs with a minimal module containing only the stdexec header, without
+Httpant code. Neither GCC build reached test execution.
+
 ## How to use
 
 Wrap your own backend such as `asio`, OpenSSL, wolfSSL, or MsQuic with Httpant's transport concepts. HTTP/1.1 and HTTP/2 use a stop-aware `byte_stream`; HTTP/3 uses a `stream_factory` that explicitly opens and accepts QUIC streams. Copying a handle never means “open another stream”. Httpant keeps only the state the HTTP protocols require; sockets, TLS, QUIC, caching, cookie storage, and connection management stay in your application.

@@ -1,39 +1,10 @@
-// Include order matters: every third-party/std header precedes the single
-// `import httpant;`. clang 22.1.8 mis-merges textual global-module-fragment
-// declarations that appear *after* an import with the same declarations
-// deserialized from a module's GMF ("cannot add 'abi_tag' attribute in a
-// redeclaration" inside libc++ <algorithm>), so no #include may follow the
-// import except the local support headers (whose own includes are already
-// hoisted above and collapse to #pragma-once no-ops).
-#include <asio.hpp>
-#include <asio/ssl.hpp>
-#include <msquic.hpp>
-#include <openssl/err.h>
-#include <openssl/ssl.h>
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstddef>
-#include <coroutine>
-#include <exception>
-#include <functional>
-#include <iostream>
-#include <memory>
-#include <optional>
-#include <print>
-#include <span>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
-
+import httpant.dependencies.asio;
+import httpant.dependencies.msquic;
+import httpant.dependencies.openssl;
+import std;
 import httpant;
-
-#include "asio_support.hpp"
-#include "quic_support.hpp"
+import httpant.examples.asio;
+import httpant.examples.quic;
 
 const MsQuicApi* MsQuic = nullptr;
 
@@ -286,7 +257,7 @@ inline auto select_h2_alpn(SSL*,
 }
 
 inline void configure_tls_common(SSL_CTX* context) {
-    check_openssl(SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION), "set minimum TLS version");
+    check_openssl(httpant::dependencies::ssl_ctx_set_min_proto_version(context, TLS1_2_VERSION), "set minimum TLS version");
     SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
 }
 
@@ -317,9 +288,9 @@ struct h2_client_tls_context {
         : context(asio::ssl::context::tls_client), alpn_wire(make_alpn_wire("h2")) {
         configure_tls_common(context.native_handle());
         if (options.insecure_no_verify) {
-            context.set_verify_mode(asio::ssl::verify_none);
+            context.set_verify_mode(httpant::dependencies::asio_verify_none);
         } else {
-            context.set_verify_mode(asio::ssl::verify_peer);
+            context.set_verify_mode(httpant::dependencies::asio_verify_peer);
             context.load_verify_file(*options.ca_certificate_file);
         }
         auto rc = SSL_CTX_set_alpn_protos(
@@ -834,10 +805,10 @@ auto connect_upstream_h2_transport(const std::shared_ptr<proxy_state>& state) ->
 
     asio::ssl::stream<tcp::socket> tls_socket{std::move(upstream_socket), state->upstream_h2_tls->context};
     check_openssl(
-        SSL_set_tlsext_host_name(tls_socket.native_handle(), state->config.upstream_tls->server_name.c_str()),
+        httpant::dependencies::ssl_set_tlsext_host_name(tls_socket.native_handle(), state->config.upstream_tls->server_name.c_str()),
         "set TLS server name indication");
     if (!state->config.upstream_tls->insecure_no_verify) {
-        tls_socket.set_verify_mode(asio::ssl::verify_peer);
+        tls_socket.set_verify_mode(httpant::dependencies::asio_verify_peer);
         tls_socket.set_verify_callback(asio::ssl::host_name_verification(state->config.upstream_tls->server_name));
     }
 
@@ -1219,15 +1190,8 @@ auto run_proxy(asio::io_context& io_context,
 
 } // namespace
 
-namespace httpant::examples {
-// stop_support.cpp holds the toolchain workaround's force-instantiation; the
-// call below keeps a real reference so the linker cannot dead-strip it.
-void stop_support_anchor();
-} // namespace httpant::examples
-
 auto main(int argc, const char** argv) -> int {
     try {
-        httpant::examples::stop_support_anchor();
         auto config = parse_arguments(argc, argv);
         asio::io_context io_context{1};
         auto exit_code = 0;

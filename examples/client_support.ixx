@@ -1,14 +1,9 @@
-#pragma once
+export module httpant.examples.client;
 
-#include <algorithm>
-#include <cstddef>
-#include <coroutine>
-#include <span>
-#include <stop_token>
-#include <string_view>
-#include <vector>
+import std;
+import httpant;
 
-namespace httpant::examples {
+export namespace httpant::examples {
 
 struct memory_stream {
     struct read_awaiter {

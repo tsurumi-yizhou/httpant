@@ -1,16 +1,22 @@
 cmake_minimum_required(VERSION 4.0.0)
 
-option(ENABLE_TESTING "Build Tests" ON)
-if(ENABLE_TESTING)
-    list(APPEND VCPKG_MANIFEST_FEATURES "tests")
-endif()
-
 option(ENABLE_EXAMPLES "Build examples" ON)
-if(ENABLE_EXAMPLES)
-    list(APPEND VCPKG_MANIFEST_FEATURES "examples")
+
+# Only the standalone build selects features for Httpant's vcpkg manifest.
+# A parent project owns dependency acquisition for its whole project tree.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    # Match CTest's default before project() installs the vcpkg dependencies.
+    if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
+        list(APPEND VCPKG_MANIFEST_FEATURES "tests")
+    endif()
+    if(ENABLE_EXAMPLES)
+        list(APPEND VCPKG_MANIFEST_FEATURES "examples")
+    endif()
 endif()
 
-set(CMAKE_CXX_STANDARD 23)
+if(NOT CMAKE_CXX_STANDARD OR CMAKE_CXX_STANDARD LESS 23)
+    set(CMAKE_CXX_STANDARD 23)
+endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
@@ -18,68 +24,40 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 project(httpant VERSION 0.1.0 LANGUAGES CXX)
 
-if(WIN32 AND (ENABLE_TESTING OR ENABLE_EXAMPLES))
+include(CTest)
+if(NOT TARGET xclang::std)
+    find_package(xclang CONFIG REQUIRED)
+endif()
+
+if(WIN32 AND (BUILD_TESTING OR ENABLE_EXAMPLES))
     add_compile_definitions(_WIN32_WINNT=0x0601)
 endif()
 
-find_package(llhttp CONFIG REQUIRED)
-find_package(nghttp3 CONFIG REQUIRED)
-find_package(stdexec CONFIG REQUIRED)
-find_path(NGHTTP2_INCLUDE_DIR
-    NAMES nghttp2/nghttp2.h
-    REQUIRED
+include(cmake/Dependencies.cmake)
+
+add_library(httpant-dependencies STATIC)
+target_sources(httpant-dependencies PUBLIC FILE_SET CXX_MODULES FILES
+    modules/dependencies/llhttp.ixx
+    modules/dependencies/nghttp2.ixx
+    modules/dependencies/nghttp3.ixx
+    modules/dependencies/stdexec.ixx
 )
-find_library(NGHTTP2_LIBRARY_RELEASE
-    NAMES nghttp2
-    PATH_SUFFIXES lib
+target_compile_definitions(httpant-dependencies PRIVATE NGHTTP2_NO_SSIZE_T)
+get_target_property(HTTPANT_NGHTTP2_TYPE ${HTTPANT_NGHTTP2_TARGET} TYPE)
+if(HTTPANT_NGHTTP2_TYPE STREQUAL "STATIC_LIBRARY" OR HTTPANT_NGHTTP2_TYPE STREQUAL "UNKNOWN_LIBRARY")
+    target_compile_definitions(httpant-dependencies PRIVATE NGHTTP2_STATICLIB)
+endif()
+get_target_property(HTTPANT_NGHTTP3_TYPE ${HTTPANT_NGHTTP3_TARGET} TYPE)
+if(HTTPANT_NGHTTP3_TYPE STREQUAL "STATIC_LIBRARY")
+    target_compile_definitions(httpant-dependencies PRIVATE NGHTTP3_STATICLIB)
+endif()
+target_link_libraries(httpant-dependencies PUBLIC
+    xclang::std
+    ${HTTPANT_LLHTTP_TARGET}
+    ${HTTPANT_NGHTTP2_TARGET}
+    ${HTTPANT_NGHTTP3_TARGET}
+    ${HTTPANT_STDEXEC_TARGET}
 )
-find_library(NGHTTP2_LIBRARY_DEBUG
-    NAMES nghttp2
-    PATH_SUFFIXES debug/lib
-)
-if(NOT NGHTTP2_LIBRARY_RELEASE AND NOT NGHTTP2_LIBRARY_DEBUG)
-    message(FATAL_ERROR "Failed to locate nghttp2 library.")
-endif()
-
-set(NGHTTP2_LIBRARY "${NGHTTP2_LIBRARY_RELEASE}")
-if(NOT NGHTTP2_LIBRARY)
-    set(NGHTTP2_LIBRARY "${NGHTTP2_LIBRARY_DEBUG}")
-endif()
-
-add_library(nghttp2::nghttp2 UNKNOWN IMPORTED)
-set_target_properties(
-    nghttp2::nghttp2 PROPERTIES
-    IMPORTED_LOCATION "${NGHTTP2_LIBRARY}"
-    INTERFACE_INCLUDE_DIRECTORIES "${NGHTTP2_INCLUDE_DIR}"
-)
-if(NGHTTP2_LIBRARY_RELEASE)
-    set_property(TARGET nghttp2::nghttp2 APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
-    set_target_properties(
-        nghttp2::nghttp2 PROPERTIES
-        IMPORTED_LOCATION_RELEASE "${NGHTTP2_LIBRARY_RELEASE}"
-    )
-endif()
-if(NGHTTP2_LIBRARY_DEBUG)
-    set_property(TARGET nghttp2::nghttp2 APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
-    set_target_properties(
-        nghttp2::nghttp2 PROPERTIES
-        IMPORTED_LOCATION_DEBUG "${NGHTTP2_LIBRARY_DEBUG}"
-    )
-endif()
-
-if(ENABLE_TESTING OR ENABLE_EXAMPLES)
-    find_package(asio CONFIG REQUIRED)
-endif()
-
-if(ENABLE_EXAMPLES)
-    find_package(OpenSSL REQUIRED)
-    find_package(msquic CONFIG REQUIRED)
-endif()
-
-if(ENABLE_TESTING)
-    include(CTest)
-    find_package(ut CONFIG REQUIRED)
-endif()
 
 add_library(${PROJECT_NAME} STATIC)
 target_sources(
@@ -112,41 +90,37 @@ target_sources(
     modules/caching.cppm
     modules/cookie.cppm
 )
-target_compile_definitions(
-    ${PROJECT_NAME} PUBLIC
-    NGHTTP2_STATICLIB
-    NGHTTP2_NO_SSIZE_T
-    NGHTTP3_STATICLIB
-)
-target_link_libraries(
-    ${PROJECT_NAME} PUBLIC
-    llhttp::llhttp_static
-    nghttp2::nghttp2
-    $<IF:$<TARGET_EXISTS:nghttp3::nghttp3>,nghttp3::nghttp3,nghttp3::nghttp3_static>
-    STDEXEC::stdexec
-    $<$<TARGET_EXISTS:clang-cxx-runtime>:clang-cxx-runtime>
-)
+target_link_libraries(${PROJECT_NAME} PUBLIC httpant-dependencies)
 
-if(ENABLE_TESTING)
+if(BUILD_TESTING OR ENABLE_EXAMPLES)
+    add_library(httpant-example-support STATIC)
+    target_sources(httpant-example-support PUBLIC FILE_SET CXX_MODULES FILES
+        modules/dependencies/asio.ixx
+        modules/dependencies/openssl.ixx
+        modules/dependencies/msquic.ixx
+        examples/asio_support.ixx
+        examples/quic_support.ixx
+    )
+    target_link_libraries(httpant-example-support PUBLIC
+        httpant ${HTTPANT_ASIO_TARGET} OpenSSL::SSL OpenSSL::Crypto ${HTTPANT_MSQUIC_TARGET}
+    )
+endif()
+
+if(BUILD_TESTING)
     file(GLOB_RECURSE TEST_FILES CONFIGURE_DEPENDS testing/*.cpp)
     add_executable(${PROJECT_NAME}-test ${TEST_FILES})
-    # Homebrew LLVM 22 modules × libc++ std::stop_callback workaround — see
-    # examples/stop_support.cpp. Test TUs that both import the httpant module
-    # and instantiate std::stop_callback do not emit the weak
-    # __atomic_unique_lock::__set_locked_bit definition; the anchor TU provides
-    # it for the whole test link.
-    target_sources(${PROJECT_NAME}-test PRIVATE examples/stop_support.cpp)
-    target_link_libraries(${PROJECT_NAME}-test PRIVATE
-        ${PROJECT_NAME}
-        Boost::ut
-        asio::asio
-        OpenSSL::SSL OpenSSL::Crypto
-        msquic
+    target_sources(${PROJECT_NAME}-test PRIVATE FILE_SET CXX_MODULES FILES
+        modules/dependencies/boost.ut.ixx
+        testing/test_support.ixx
     )
+    target_link_libraries(${PROJECT_NAME}-test PRIVATE httpant-example-support ${HTTPANT_UT_TARGET})
     add_test(NAME ${PROJECT_NAME}-test COMMAND ${PROJECT_NAME}-test)
     set_tests_properties(${PROJECT_NAME}-test PROPERTIES TIMEOUT 60)
 endif()
 
 if(ENABLE_EXAMPLES)
+    add_library(httpant-client-support STATIC)
+    target_sources(httpant-client-support PUBLIC FILE_SET CXX_MODULES FILES examples/client_support.ixx)
+    target_link_libraries(httpant-client-support PUBLIC httpant)
     add_subdirectory(examples)
 endif()

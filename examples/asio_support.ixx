@@ -1,24 +1,10 @@
-#pragma once
+export module httpant.examples.asio;
 
-#include <asio.hpp>
-#include <asio/ssl.hpp>
+import httpant.dependencies.asio;
+import std;
+import httpant;
 
-#include <coroutine>
-#include <cstddef>
-#include <exception>
-#include <functional>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <span>
-#include <stop_token>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-
-namespace httpant::examples {
+export namespace httpant::examples {
 
 using tcp = asio::ip::tcp;
 

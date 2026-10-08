@@ -1,28 +1,7 @@
-module;
-
-#include <nghttp3/nghttp3.h>
-
-#include <algorithm>
-#include <array>
-#include <cassert>
-#include <cstddef>
-#include <cstdint>
-#include <deque>
-#include <exception>
-#include <format>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <utility>
-#include <vector>
-
 export module httpant:parse.nghttp3;
 
+import httpant.dependencies.nghttp3;
+import std;
 import :trait;
 import :message;
 import :error;
@@ -82,12 +61,13 @@ inline auto try_decode_varint(std::span<const std::byte> src, std::size_t& consu
     auto length = nghttp3_get_uvarintlen(&first);
     if (src.size() < length) return false;
 
-    auto raw = reinterpret_cast<const uint8_t*>(src.data());
+    auto raw = reinterpret_cast<const std::uint8_t*>(src.data());
     std::uint64_t decoded = 0;
     const auto* end = nghttp3_get_uvarint(&decoded, raw);
     // The getters read exactly |length| bytes (RFC 9000 §16), so the returned
     // end pointer lands past the encoded integer.
-    assert(end == raw + length);
+    if (end != raw + length)
+        throw std::logic_error("http/3: inconsistent decoded variable integer length");
     value = decoded;
     consumed = length;
     return true;
@@ -150,7 +130,7 @@ inline auto forward_stream_input(conn_context& ctx, nghttp3_conn* conn, std::int
     auto consumed = nghttp3_conn_read_stream(
         conn,
         stream_id,
-        reinterpret_cast<const uint8_t*>(bytes.data()),
+        reinterpret_cast<const std::uint8_t*>(bytes.data()),
         bytes.size(),
         fin ? 1 : 0);
     if (consumed < 0) {
@@ -668,7 +648,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
     };
 
     cbs.recv_data = [](nghttp3_conn*, std::int64_t stream_id,
-                       const uint8_t* data, std::size_t len,
+                       const std::uint8_t* data, std::size_t len,
                        void* ud, void*) -> int {
         auto& ctx = *static_cast<conn_context*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {

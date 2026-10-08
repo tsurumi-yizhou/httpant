@@ -1,11 +1,5 @@
-#include <boost/ut.hpp>
-
-#include <cstdint>
-#include <stdexcept>
-#include <string_view>
-#include <type_traits>
-#include <variant>
-
+import httpant.dependencies.boost.ut;
+import std;
 import httpant;
 
 namespace httpant::testing {

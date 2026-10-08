@@ -1,6 +1,7 @@
-#include <boost/ut.hpp>
-
-#include "test_support.hpp"
+import std;
+import httpant.dependencies.boost.ut;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing {
 
@@ -490,8 +491,6 @@ static suite<"semantics"> semantics_suite = [] {
         }
         expect(threw);
     };
-
-
 
     // Internal machinery test: cancellation of a suspended header-phase read
     // is not HTTP RFC behavior. The transport delivers cancellation by

@@ -1,20 +1,6 @@
-module;
-
-#include <algorithm>
-#include <charconv>
-#include <chrono>
-#include <cstdint>
-#include <expected>
-#include <functional>
-#include <limits>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:caching;
 
+import std;
 import :message;
 
 namespace http::detail {
@@ -226,7 +212,7 @@ namespace http::detail {
     // or if any of its subsequent calculations overflows, the cache MUST
     // consider the value to be 2147483648 (2^31) or the greatest positive
     // integer it can conveniently represent." — a fully numeric value beyond
-    // uint32_t clamps to its maximum instead of being dropped as malformed.
+    // std::uint32_t clamps to its maximum instead of being dropped as malformed.
     if (error == std::errc::result_out_of_range &&
         end == value.data() + value.size())
         return std::chrono::seconds{std::numeric_limits<std::uint32_t>::max()};

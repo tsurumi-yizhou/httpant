@@ -1,14 +1,6 @@
-module;
-
-#include <cstdint>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <utility>
-#include <variant>
-
 export module httpant:error;
 
+import std;
 import :message;
 
 export namespace http {

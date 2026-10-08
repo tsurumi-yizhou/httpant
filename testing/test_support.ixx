@@ -1,39 +1,13 @@
-#pragma once
+export module httpant.testing;
 
-#include <boost/ut.hpp>
-
-#include <asio.hpp>
-#include <asio/ssl.hpp>
-#include <openssl/ssl.h>
-
-extern "C" {
-#include <msquic.h>
-}
-
-#include <algorithm>
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <exception>
-#include <optional>
-#include <span>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <stdexcept>
-#include <system_error>
-#include <type_traits>
-#include <deque>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
+import httpant.dependencies.boost.ut;
+import httpant.dependencies.asio;
+import httpant.dependencies.openssl;
+import httpant.dependencies.msquic;
+import std;
 import httpant;
 
-namespace httpant::testing {
+export namespace httpant::testing {
 
 using namespace std::literals;
 

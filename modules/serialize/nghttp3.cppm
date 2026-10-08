@@ -1,21 +1,7 @@
-module;
-
-#include <nghttp3/nghttp3.h>
-
-#include <cassert>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <vector>
-
 export module httpant:serialize.nghttp3;
 
+import httpant.dependencies.nghttp3;
+import std;
 import :trait;
 import :message;
 import :session.nghttp3;
@@ -39,17 +25,15 @@ struct nv_block {
         // would dangle each previously stored pointer. The reserve(count*2) /
         // reserve(count) at construction is therefore a hard bound, not a
         // hint; one push beyond it is a caller bug.
-        assert(storage.size() + 2 <= storage.capacity() &&
-               "http/3: nv_block storage grew past its reservation");
-        assert(fields.size() + 1 <= fields.capacity() &&
-               "http/3: nv_block fields grew past their reservation");
+        if (storage.size() + 2 > storage.capacity() || fields.size() + 1 > fields.capacity())
+            throw std::logic_error("http/3: nv_block grew past its reservation");
         storage.emplace_back(name);
         storage.emplace_back(value);
         auto& sn = storage[storage.size() - 2];
         auto& sv = storage[storage.size() - 1];
         fields.push_back({
-            .name = reinterpret_cast<const uint8_t*>(sn.data()),
-            .value = reinterpret_cast<const uint8_t*>(sv.data()),
+            .name = reinterpret_cast<const std::uint8_t*>(sn.data()),
+            .value = reinterpret_cast<const std::uint8_t*>(sv.data()),
             .namelen = sn.size(),
             .valuelen = sv.size(),
             // RFC 9204 §4.5.4/§4.5.6 — the 'N' bit of a literal field line
@@ -174,7 +158,7 @@ inline auto read_outbound_body(
         if (state->offered)
             return NGHTTP3_ERR_WOULDBLOCK;
 
-        vec[0].base = reinterpret_cast<uint8_t*>(state->data.data());
+        vec[0].base = reinterpret_cast<std::uint8_t*>(state->data.data());
         vec[0].len = state->data.size();
         state->offered = true;
         if (state->eof)

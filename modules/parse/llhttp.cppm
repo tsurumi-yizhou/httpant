@@ -1,26 +1,7 @@
-module;
-
-#include <llhttp.h>
-
-#include <algorithm>
-#include <array>
-#include <climits>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:parse.llhttp;
 
+import httpant.dependencies.llhttp;
+import std;
 import :trait;
 import :message;
 import :error;
@@ -119,7 +100,7 @@ inline auto make_settings() -> llhttp_settings_t {
         st->req_method = from_llhttp_method(static_cast<llhttp_method_t>(p->method));
         st->keep_alive = llhttp_should_keep_alive(p) != 0;
         st->upgraded = llhttp_get_upgrade(p) != 0;
-        st->content_length = (p->content_length == ULLONG_MAX) ? 0 : p->content_length;
+        st->content_length = (p->content_length == std::numeric_limits<unsigned long long>::max()) ? 0 : p->content_length;
         st->chunked = (p->flags & F_CHUNKED) != 0;
         if constexpr (Type == HTTP_REQUEST) {
             // RFC 9112 §3 — "HTTP-version = HTTP-name \"/\" DIGIT \".\" DIGIT";
@@ -134,7 +115,7 @@ inline auto make_settings() -> llhttp_settings_t {
             // request MUST be ignored.
             bool http_1_0 = st->http_major == 1 && st->http_minor == 0;
             bool content_follows = (p->flags & F_CHUNKED) != 0 ||
-                (p->content_length != ULLONG_MAX && p->content_length > 0);
+                (p->content_length != std::numeric_limits<unsigned long long>::max() && p->content_length > 0);
             if (!http_1_0 && content_follows && expects_continue(st->fields))
                 st->expect_continue = true;
         }

@@ -1,7 +1,8 @@
-#include <boost/ut.hpp>
-
-#include "test_support.hpp"
-#include "../examples/quic_support.hpp"
+import std;
+import httpant.dependencies.boost.ut;
+import httpant;
+import httpant.testing;
+import httpant.examples.quic;
 
 namespace httpant::testing {
 

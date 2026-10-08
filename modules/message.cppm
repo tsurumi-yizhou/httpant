@@ -1,17 +1,6 @@
-module;
-
-#include <algorithm>
-#include <cctype>
-#include <charconv>
-#include <cstdint>
-#include <expected>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:message;
+
+import std;
 
 export namespace http {
 
@@ -397,7 +386,6 @@ struct parsed_target {
     }
     return true;
 }
-
 
 // RFC 9112 §3.2.3 — "authority-form = uri-host ":" port"; "It consists of only the uri-host
 // and port number of the tunnel destination, separated by a colon (":")." — the host must be

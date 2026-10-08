@@ -1,27 +1,7 @@
-module;
-
-#include <nghttp2/nghttp2.h>
-
-#include <algorithm>
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <format>
-#include <memory>
-#include <optional>
-#include <ranges>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:endpoint.nghttp2;
 
+import httpant.dependencies.nghttp2;
+import std;
 import :session.nghttp2;
 import :parse.nghttp2;
 import :serialize.nghttp2;
@@ -89,7 +69,7 @@ inline auto create_session(
 }
 
 inline void flush_output(nghttp2_session* session, session_context& ctx) {
-    const uint8_t* data = nullptr;
+    const std::uint8_t* data = nullptr;
     for (;;) {
         auto len = nghttp2_session_mem_send2(session, &data);
         if (len < 0) throw make_error("mem_send", static_cast<int>(len));

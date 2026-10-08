@@ -1,23 +1,6 @@
-module;
-
-#include <array>
-#include <charconv>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <format>
-#include <iterator>
-#include <ranges>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:serialize.llhttp;
 
+import std;
 import :trait;
 import :message;
 import :validate.llhttp;

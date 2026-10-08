@@ -1,20 +1,7 @@
-module;
-
-#include <llhttp.h>
-
-#include <cstddef>
-#include <coroutine>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:server.llhttp;
 
+import httpant.dependencies.llhttp;
+import std;
 import :trait;
 import :message;
 import :role;

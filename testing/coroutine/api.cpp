@@ -1,11 +1,7 @@
-#include <boost/ut.hpp>
-
-#include <coroutine>
-#include <string>
-#include <string_view>
-#include <utility>
-
-#include "../test_support.hpp"
+import httpant.dependencies.boost.ut;
+import std;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing::coroutine {
 

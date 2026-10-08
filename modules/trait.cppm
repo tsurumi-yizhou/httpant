@@ -1,22 +1,7 @@
-module;
-
-#include <algorithm>
-#include <concepts>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <type_traits>
-#include <utility>
-#include <vector>
-
-#include <stdexec/execution.hpp>
-
 export module httpant:trait;
+
+import httpant.dependencies.stdexec;
+import std;
 
 export namespace http {
 

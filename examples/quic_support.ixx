@@ -1,31 +1,11 @@
-#pragma once
+export module httpant.examples.quic;
 
-#include <asio.hpp>
-#include <msquic.hpp>
+import httpant.dependencies.asio;
+import httpant.dependencies.msquic;
+import std;
+import httpant;
 
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <deque>
-#include <exception>
-#include <format>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <system_error>
-#include <unordered_map>
-#include <utility>
-#include <variant>
-#include <vector>
-
-namespace httpant::examples {
+export namespace httpant::examples {
 
 [[nodiscard]] inline auto quic_address_to_string(const QUIC_ADDR& address) -> std::string;
 
@@ -34,7 +14,7 @@ namespace httpant::examples {
 }
 
 inline void check_quic_status(QUIC_STATUS status, std::string_view what) {
-    if (QUIC_FAILED(status))
+    if (httpant::dependencies::quic_failed(status))
         throw std::runtime_error(quic_error_message(what, status));
 }
 
@@ -565,7 +545,7 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
         try {
             switch (event->Type) {
                 case QUIC_STREAM_EVENT_START_COMPLETE:
-                    if (QUIC_FAILED(event->START_COMPLETE.Status)) {
+                    if (httpant::dependencies::quic_failed(event->START_COMPLETE.Status)) {
                         state->fail(std::make_exception_ptr(
                             std::runtime_error(quic_error_message("quic stream start", event->START_COMPLETE.Status))));
                     }
@@ -575,7 +555,7 @@ struct quic_stream_state : std::enable_shared_from_this<quic_stream_state> {
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_SEND_COMPLETE:
                     state->complete_send(event->SEND_COMPLETE.ClientContext,
-                                         event->SEND_COMPLETE.Canceled != FALSE);
+                                         event->SEND_COMPLETE.Canceled != 0);
                     return QUIC_STATUS_SUCCESS;
                 case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
                     state->note_peer_fin();
@@ -744,7 +724,7 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
             throw std::runtime_error(quic_error_message("msquic connection open", state->connection->GetInitStatus()));
 
         auto status = state->connection->Start(state->configuration->native(), state->server_name.c_str(), state->port);
-        if (QUIC_FAILED(status))
+        if (httpant::dependencies::quic_failed(status))
             throw std::runtime_error(quic_error_message("msquic connection start", status));
 
         return quic_connection_transport{std::move(state)};
@@ -762,7 +742,7 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
         if (!state->connection || !state->connection->IsValid())
             throw std::runtime_error(quic_error_message("msquic accepted connection", state->connection->GetInitStatus()));
         auto status = state->connection->SetConfiguration(state->configuration->native());
-        if (QUIC_FAILED(status))
+        if (httpant::dependencies::quic_failed(status))
             throw std::runtime_error(quic_error_message("msquic connection configuration", status));
         return state;
     }
@@ -823,7 +803,7 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
         stream_state->stream = std::move(stream);
 
         auto status = stream_state->stream->Start(QUIC_STREAM_START_FLAG_IMMEDIATE);
-        if (QUIC_FAILED(status))
+        if (httpant::dependencies::quic_failed(status))
             throw std::runtime_error(quic_error_message("msquic stream start", status));
 
         {
@@ -863,7 +843,7 @@ struct quic_connection_state : std::enable_shared_from_this<quic_connection_stat
 
     void note_connected(MsQuicConnection& connection_handle) {
         QuicAddr address;
-        if (QUIC_SUCCEEDED(connection_handle.GetRemoteAddr(address))) {
+        if (httpant::dependencies::quic_succeeded(connection_handle.GetRemoteAddr(address))) {
             std::lock_guard lock(mutex);
             remote_address_text = quic_address_to_string(address.SockAddr);
         }
@@ -984,7 +964,7 @@ private:
                 throw std::runtime_error(quic_error_message("msquic listener open", listener->GetInitStatus()));
 
             auto status = listener->Start(MsQuicAlpn{"h3"}, address);
-            if (QUIC_FAILED(status))
+            if (httpant::dependencies::quic_failed(status))
                 throw std::runtime_error(quic_error_message("msquic listener start", status));
         }
 
@@ -1120,7 +1100,7 @@ struct quic_stream::write_operation {
         auto flags = fin ? QUIC_SEND_FLAG_FIN : QUIC_SEND_FLAG_NONE;
         auto* context = new std::shared_ptr<quic_stream_state::write_state>(wstate);
         auto status = state->stream->Send(&buffer, 1, flags, context);
-        if (QUIC_FAILED(status)) {
+        if (httpant::dependencies::quic_failed(status)) {
             delete context;
             wstate->record_error(std::make_exception_ptr(
                 std::runtime_error(quic_error_message("quic stream send", status))));
@@ -1242,7 +1222,7 @@ inline auto quic_connection_transport::remote_address() const -> std::string {
 [[nodiscard]] inline auto endpoint_to_quic_address(const asio::ip::tcp::endpoint& endpoint) -> QuicAddr {
     auto family = endpoint.address().is_v4() ? QUIC_ADDRESS_FAMILY_INET : QUIC_ADDRESS_FAMILY_INET6;
     QuicAddr address{static_cast<QUIC_ADDRESS_FAMILY>(family)};
-    address.SetPort(endpoint.port());
+    httpant::dependencies::set_quic_address_port(address, endpoint.port());
 
     if (endpoint.address().is_v4()) {
         auto bytes = endpoint.address().to_v4().to_bytes();

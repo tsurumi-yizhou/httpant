@@ -1,25 +1,7 @@
-module;
-
-#include <nghttp2/nghttp2.h>
-
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <functional>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:parse.nghttp2;
 
+import httpant.dependencies.nghttp2;
+import std;
 import :session.nghttp2;
 import :trait;
 import :message;
@@ -38,9 +20,9 @@ inline auto create_callbacks() -> callbacks_handle {
 
     nghttp2_session_callbacks_set_on_header_callback(cbs,
         [](nghttp2_session* session, const nghttp2_frame* frame,
-           const uint8_t* name, std::size_t namelen,
-           const uint8_t* value, std::size_t valuelen,
-           uint8_t, void* ud) -> int {
+           const std::uint8_t* name, std::size_t namelen,
+           const std::uint8_t* value, std::size_t valuelen,
+           std::uint8_t, void* ud) -> int {
             auto& ctx = *static_cast<session_context*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
@@ -339,8 +321,8 @@ inline auto create_callbacks() -> callbacks_handle {
     // itself before this callback). Returning NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE keeps the
     // default stream-error treatment.
     nghttp2_session_callbacks_set_on_invalid_header_callback(cbs,
-        [](nghttp2_session*, const nghttp2_frame*, const uint8_t*, std::size_t,
-           const uint8_t*, std::size_t, uint8_t, void*) noexcept -> int {
+        [](nghttp2_session*, const nghttp2_frame*, const std::uint8_t*, std::size_t,
+           const std::uint8_t*, std::size_t, std::uint8_t, void*) noexcept -> int {
             return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
         });
 
@@ -351,8 +333,8 @@ inline auto create_callbacks() -> callbacks_handle {
     // grow the staging buffer without bound. Push bodies are delivered
     // atomically by design, so their credit returns immediately.
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs,
-        [](nghttp2_session* session, uint8_t, std::int32_t stream_id,
-           const uint8_t* data, std::size_t len, void* ud) -> int {
+        [](nghttp2_session* session, std::uint8_t, std::int32_t stream_id,
+           const std::uint8_t* data, std::size_t len, void* ud) -> int {
             auto& ctx = *static_cast<session_context*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (auto push_it = ctx.pushed_streams.find(stream_id);

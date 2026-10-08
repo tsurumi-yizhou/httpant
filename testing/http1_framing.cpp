@@ -1,13 +1,14 @@
-#include <boost/ut.hpp>
-
-#include "test_support.hpp"
+import std;
+import httpant.dependencies.boost.ut;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing {
 
 using namespace boost::ut;
 using namespace std::literals;
 
-static suite<"wire"> wire_suite = [] {
+static suite<"http1 framing"> http1_framing_suite = [] {
     // RFC 9112 §3.2.1 — "origin-form = absolute-path [ "?" query ]"; a client
     // sends the absolute path as the request-target. RFC 9112 §3.2 — "A client
     // MUST send a Host header field (Section 7.2 of [HTTP]) in all HTTP/1.1
@@ -553,8 +554,8 @@ static suite<"wire"> wire_suite = [] {
 
         run_sync(http::coroutine::respond(server, std::move(request.token), http::response{
             .status = 200, .reason = {}, .fields = {}}));
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.contains("connection: close\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.contains("connection: close\r\n"sv));
         expect(server.should_close());
 
         auto threw = false;
@@ -663,7 +664,7 @@ static suite<"wire"> wire_suite = [] {
 
     // RFC 9110 §9.3.2 — "The server SHOULD send the same header fields in
     // response to a HEAD request as it would have sent if the request method
-    // had been GET." — the Content-Length is preserved on the wire while the
+    // had been GET." — the Content-Length is preserved in the response while the
     // content itself is suppressed.
     "http1_server_head_response_preserves_content_length"_test = [] {
         pipe c2s, s2c;
@@ -772,7 +773,7 @@ static suite<"wire"> wire_suite = [] {
 
     // RFC 9110 §15 — "All valid status codes are within the range of 100 to
     // 599, inclusive." A response outside that range must be rejected before
-    // it reaches the wire.
+    // it is serialized.
     "http1_send_rejects_response_status_outside_100_to_599"_test = [] {
         http::response res{
             .status = 600,
@@ -788,8 +789,6 @@ static suite<"wire"> wire_suite = [] {
         expect(threw);
     };
 
-
-
     // RFC 9112 §6.3 item 5 — "If a message is received without Transfer-Encoding
     // and with an invalid Content-Length header field, then the message framing
     // is invalid and the recipient MUST treat it as an unrecoverable error,
@@ -797,9 +796,8 @@ static suite<"wire"> wire_suite = [] {
     // list (Section 5.6.1 of [HTTP]), all values in the list are valid, and all
     // values in the list are the same (in which case, the message is processed
     // with that single value used as the Content-Length field value)."
-    // Deliberate boundary: the identical-list exception is NOT salvaged — wire
-    // parsing is delegated to llhttp, which rejects a comma-list Content-Length
-    // outright (PROBLEMS.md). The message is treated as the unrecoverable error
+    // llhttp rejects a comma-separated Content-Length even when every value
+    // is identical. The message is treated as the unrecoverable error
     // the MUST names: 400 and connection close (RFC 9112 §6.3 item 5 — "If the
     // unrecoverable error is in a request message, the server MUST respond
     // with a 400 (Bad Request) status code and then close the connection").
@@ -823,8 +821,8 @@ static suite<"wire"> wire_suite = [] {
             threw = std::holds_alternative<http::send_response>(failure.action());
         }
         expect(threw);
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
     };
 
     // RFC 9110 §5.3 — "A recipient MAY combine multiple field lines ... that
@@ -854,8 +852,8 @@ static suite<"wire"> wire_suite = [] {
             threw = std::holds_alternative<http::send_response>(failure.action());
         }
         expect(threw);
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
     };
 
     // RFC 9112 §6.3 item 5 — differing comma-list values are NOT all the same,
@@ -884,8 +882,8 @@ static suite<"wire"> wire_suite = [] {
             threw = std::holds_alternative<http::send_response>(failure.action());
         }
         expect(threw);
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
     };
 
     // RFC 9112 §6.3 item 4 — "If a Transfer-Encoding header field is present
@@ -896,7 +894,7 @@ static suite<"wire"> wire_suite = [] {
     // RFC 9112 §11.2) would be decoded by llhttp as chunked with gzip bytes
     // delivered as the body; this library decodes no transfer coding other
     // than chunked, so the receive side rejects it exactly like the send side.
-    // The wire shape below has "chunked" as the final coding of the list —
+    // The request below has "chunked" as the final coding of the list —
     // what makes it invalid is the non-chunked member, not the final position.
     "http1_request_with_non_chunked_transfer_encoding_is_rejected_with_400"_test = [] {
         pipe c2s, s2c;
@@ -918,8 +916,8 @@ static suite<"wire"> wire_suite = [] {
             threw = std::holds_alternative<http::send_response>(failure.action());
         }
         expect(threw);
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
     };
 
     // RFC 9112 §7.1.2 — "A recipient MUST NOT merge a received trailer field
@@ -1037,8 +1035,8 @@ static suite<"wire"> wire_suite = [] {
             .fields = {},
         }, body));
 
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.ends_with("streamed-body"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.ends_with("streamed-body"sv));
         expect(server.should_close());
     };
 
@@ -1117,8 +1115,8 @@ static suite<"wire"> wire_suite = [] {
             threw = std::holds_alternative<http::send_response>(failure.action());
         }
         expect(threw);
-        auto wire = bytes_to_string(s2c.buffer);
-        expect(wire.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
+        auto serialized_message = bytes_to_string(s2c.buffer);
+        expect(serialized_message.starts_with("HTTP/1.1 400 Bad Request\r\n"sv));
     };
 
     // RFC 9110 §5.5 — "Field values containing CR, LF, or NUL characters are
@@ -1433,7 +1431,7 @@ static suite<"wire"> wire_suite = [] {
     };
 
     // RFC 9110 §9.3.8 — "A client MUST NOT send content in a TRACE request." A
-    // Content-Length of 0 declares no content and is acceptable on the wire.
+    // Content-Length of 0 declares no content and is valid in this request.
     "http1_send_allows_trace_with_zero_content_length"_test = [] {
         http::request req{
             .method = http::method::TRACE,
@@ -1482,10 +1480,10 @@ static suite<"wire"> wire_suite = [] {
             .fields = {{"host", "example.com"}, {"content-length", "0"}},
         }));
         expect(received.head.status == 204_u);
-        auto wire = bytes_to_string(c2s.buffer);
-        expect(wire.starts_with("TRACE /trace HTTP/1.1\r\n"sv));
-        expect(wire.contains("content-length: 0\r\n"sv));
-        expect(wire.ends_with("\r\n\r\n"sv));
+        auto serialized_message = bytes_to_string(c2s.buffer);
+        expect(serialized_message.starts_with("TRACE /trace HTTP/1.1\r\n"sv));
+        expect(serialized_message.contains("content-length: 0\r\n"sv));
+        expect(serialized_message.ends_with("\r\n\r\n"sv));
     };
 
 };

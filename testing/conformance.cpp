@@ -1,18 +1,6 @@
-#include <boost/ut.hpp>
-
-#include <array>
-#include <cstddef>
-#include <cstdint>
-#include <initializer_list>
-#include <span>
-#include <string>
-#include <string_view>
-#include <utility>
-#include <variant>
-#include <vector>
-
-#include "test_support.hpp"
-
+import httpant.dependencies.boost.ut;
+import std;
+import httpant.testing;
 import httpant;
 
 namespace httpant::testing {
@@ -3117,9 +3105,6 @@ static suite<"conformance"> conformance_suite = [] {
         expect(transport.shutdowns.front().stream_id == 0_i);
         expect(transport.shutdowns.front().error.value == h3_message_error);
     };
-
-
-
 
     // RFC 9114 §7.1 — "When a stream terminates cleanly, if the last frame on
     // the stream was truncated, this MUST be treated as a connection error of

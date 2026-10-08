@@ -1,20 +1,7 @@
-module;
-
-#include <nghttp2/nghttp2.h>
-
-#include <cstddef>
-#include <cstdint>
-#include <functional>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <string_view>
-#include <utility>
-#include <vector>
-
 export module httpant:serialize.nghttp2;
 
+import httpant.dependencies.nghttp2;
+import std;
 import :session.nghttp2;
 import :trait;
 import :message;
@@ -40,9 +27,9 @@ inline auto make_settings(std::span<const setting> settings)
 inline auto read_outbound_body(
     nghttp2_session*,
     std::int32_t,
-    uint8_t* buf,
+    std::uint8_t* buf,
     std::size_t length,
-    uint32_t* flags,
+    std::uint32_t* flags,
     nghttp2_data_source* src,
     void*) -> nghttp2_ssize
 {
@@ -100,8 +87,8 @@ inline auto make_nv(std::string_view name, std::string_view value) -> nghttp2_nv
     // / nghttp2_submit_response2 document that the nv arrays may be freed once
     // the call returns); the non-const pointer is a C API artifact.
     return {
-        .name = reinterpret_cast<uint8_t*>(const_cast<char*>(name.data())),
-        .value = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data())),
+        .name = reinterpret_cast<std::uint8_t*>(const_cast<char*>(name.data())),
+        .value = reinterpret_cast<std::uint8_t*>(const_cast<char*>(value.data())),
         .namelen = name.size(),
         .valuelen = value.size(),
         // RFC 7541 §7.1.3 — sensitive fields can use the literal never-indexed

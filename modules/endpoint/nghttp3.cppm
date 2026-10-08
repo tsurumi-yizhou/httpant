@@ -1,29 +1,7 @@
-module;
-
-#include <nghttp3/nghttp3.h>
-
-#include <algorithm>
-#include <array>
-#include <coroutine>
-#include <cstddef>
-#include <cstdint>
-#include <deque>
-#include <exception>
-#include <format>
-#include <memory>
-#include <optional>
-#include <span>
-#include <stdexcept>
-#include <stop_token>
-#include <string>
-#include <string_view>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
 export module httpant:endpoint.nghttp3;
 
+import httpant.dependencies.nghttp3;
+import std;
 import :trait;
 import :error;
 import :session.nghttp3;

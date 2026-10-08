@@ -1,16 +1,8 @@
-#include <boost/ut.hpp>
-
-#include <stdexec/execution.hpp>
-
-#include <stop_token>
-#include <stdexcept>
-#include <string>
-#include <tuple>
-#include <type_traits>
-#include <utility>
-#include <variant>
-
-#include "../test_support.hpp"
+import httpant.dependencies.boost.ut;
+import httpant.dependencies.stdexec;
+import std;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing::execution {
 

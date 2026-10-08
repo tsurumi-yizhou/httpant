@@ -1,18 +1,6 @@
-module;
-
-#include <cstdint>
-#include <exception>
-#include <memory>
-#include <optional>
-#include <string>
-#include <string_view>
-#include <type_traits>
-#include <unordered_map>
-#include <utility>
-#include <vector>
-
 export module httpant:session.core;
 
+import std;
 import :trait;
 import :message;
 import :error;

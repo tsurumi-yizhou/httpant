@@ -1,6 +1,7 @@
-#include <boost/ut.hpp>
-
-#include "test_support.hpp"
+import std;
+import httpant.dependencies.boost.ut;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing {
 
@@ -591,7 +592,7 @@ static suite<"caching"> caching_suite = [] {
         // represent, or if any of its subsequent calculations overflows, the
         // cache MUST consider the value to be 2147483648 (2^31) or the greatest
         // positive integer it can conveniently represent." — the parser's
-        // conveniently representable maximum is uint32_t; an all-digit value
+        // conveniently representable maximum is std::uint32_t; an all-digit value
         // beyond it clamps instead of dropping the directive.
         http::headers overflow{{"cache-control", "max-age=99999999999"}};
         expect(http::parse_request_cache_control(overflow).max_age ==

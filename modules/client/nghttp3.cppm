@@ -1,20 +1,7 @@
-module;
-
-#include <nghttp3/nghttp3.h>
-
-#include <cstddef>
-#include <cstdint>
-#include <exception>
-#include <format>
-#include <memory>
-#include <optional>
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
-
 export module httpant:client.nghttp3;
 
+import httpant.dependencies.nghttp3;
+import std;
 import :trait;
 import :message;
 import :error;

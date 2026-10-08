@@ -1,14 +1,9 @@
-#include <boost/ut.hpp>
-
-#include <asio.hpp>
-
-#include <array>
-#include <cstddef>
-#include <stop_token>
-#include <system_error>
-
-#include "../examples/asio_support.hpp"
-#include "test_support.hpp"
+import httpant.dependencies.boost.ut;
+import httpant.dependencies.asio;
+import std;
+import httpant.examples.asio;
+import httpant;
+import httpant.testing;
 
 namespace httpant::testing {
 

@@ -1,12 +1,6 @@
-module;
-
-#include <stdexcept>
-#include <string>
-#include <string_view>
-#include <utility>
-
 export module httpant:role;
 
+import std;
 import :message;
 
 // Version-free server-role machinery shared by the HTTP/1.1 (llhttp), HTTP/2
