@@ -11,6 +11,73 @@ import :coroutine;
 
 export namespace http {
 
+// ─── Where a request goes ────────────────────────────────────
+
+// The scheme's default port (RFC 9110 §4.2.1 and §4.2.2).
+constexpr auto default_port(std::string_view scheme) -> std::optional<std::uint16_t> {
+    auto equals = [](std::string_view a, std::string_view b) {
+        return std::ranges::equal(a, b, [](char x, char y) {
+            return (x >= 'A' && x <= 'Z' ? char(x + 32) : x) == y;
+        });
+    };
+    if (equals(scheme, "https")) return 443;
+    if (equals(scheme, "http")) return 80;
+    return std::nullopt;
+}
+
+// The host and port to connect to for a request.
+struct origin {
+    std::string host{};      // without the brackets of an IPv6 literal
+    std::uint16_t port{0};
+};
+
+// Derive the origin from the request alone: the authority (an :authority, an
+// absolute-form target, or a Host field, in that order of precedence) gives
+// host and optional port, and the request's scheme gives the default port.
+// RFC 3986 §3.2: a userinfo component is ignored, an IPv6 literal is
+// bracketed. Returns nullopt when the request names no host, the port is not a
+// number, or there is neither a port nor a scheme to take one from.
+[[nodiscard]] inline auto request_origin(const request& req) -> std::optional<origin> {
+    auto authority = request_authority(req);
+    if (!authority) return std::nullopt;
+    std::string_view rest = *authority;
+    if (auto at = rest.rfind('@'); at != std::string_view::npos)
+        rest.remove_prefix(at + 1);
+
+    std::string_view host = rest;
+    std::string_view port_text;
+    if (!rest.empty() && rest.front() == '[') {
+        auto close = rest.find(']');
+        if (close == std::string_view::npos) return std::nullopt;
+        host = rest.substr(1, close - 1);
+        auto tail = rest.substr(close + 1);
+        if (!tail.empty()) {
+            if (tail.front() != ':') return std::nullopt;
+            port_text = tail.substr(1);
+        }
+    } else if (auto colon = rest.rfind(':'); colon != std::string_view::npos) {
+        host = rest.substr(0, colon);
+        port_text = rest.substr(colon + 1);
+    }
+    if (host.empty()) return std::nullopt;
+
+    origin result{.host = std::string{host}};
+    if (!port_text.empty()) {
+        unsigned value = 0;
+        auto [end, ec] = std::from_chars(port_text.data(), port_text.data() + port_text.size(), value);
+        if (ec != std::errc{} || end != port_text.data() + port_text.size() || value > 65535)
+            return std::nullopt;
+        result.port = static_cast<std::uint16_t>(value);
+        return result;
+    }
+    auto scheme = request_scheme(req);
+    if (!scheme) return std::nullopt;
+    auto port = default_port(*scheme);
+    if (!port) return std::nullopt;
+    result.port = *port;
+    return result;
+}
+
 // ─── Version selection ───────────────────────────────────────
 
 // The ALPN protocol identifier a TLS connection offers for a version (RFC 7301;

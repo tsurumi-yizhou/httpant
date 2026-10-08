@@ -29,6 +29,42 @@ void push_final_h2_response(async_pipe& s2c) {
 } // namespace
 
 static suite<"fetch"> fetch_suite = [] {
+    // RFC 3986 §3.2 / RFC 9110 §4.2 — where a request goes comes from the
+    // request itself: authority (or Host, or an absolute-form target) for the
+    // host and optional port, and the scheme for the default port.
+    "request_origin_comes_from_the_request"_test = [] {
+        auto origin_of = [](http::request req) { return http::request_origin(req); };
+
+        auto https = origin_of({.target = "/x", .scheme = "https", .authority = "example.com"});
+        expect(https.has_value() && https->host == "example.com"sv && https->port == 443_u);
+
+        auto explicit_port = origin_of({.target = "/x", .scheme = "http", .authority = "example.com:8080"});
+        expect(explicit_port.has_value() && explicit_port->port == 8080_u);
+
+        auto ipv6 = origin_of({.target = "/x", .scheme = "https", .authority = "[::1]:8443"});
+        expect(ipv6.has_value() && ipv6->host == "::1"sv && ipv6->port == 8443_u);
+
+        auto ipv6_default = origin_of({.target = "/x", .scheme = "http", .authority = "[2001:db8::1]"});
+        expect(ipv6_default.has_value() && ipv6_default->host == "2001:db8::1"sv && ipv6_default->port == 80_u);
+
+        auto userinfo = origin_of({.target = "/x", .scheme = "https", .authority = "user:pw@example.com"});
+        expect(userinfo.has_value() && userinfo->host == "example.com"sv && userinfo->port == 443_u);
+
+        auto absolute = origin_of({.target = "http://example.org/path"});
+        expect(absolute.has_value() && absolute->host == "example.org"sv && absolute->port == 80_u);
+
+        auto from_host_field = origin_of(
+            {.target = "/x", .scheme = "https", .fields = {{"host", "example.net:9000"}}});
+        expect(from_host_field.has_value() && from_host_field->port == 9000_u);
+
+        expect(!origin_of({.target = "/x", .scheme = "https"}).has_value());                     // no host
+        expect(!origin_of({.target = "/x", .authority = "example.com"}).has_value());            // no port, no scheme
+        expect(!origin_of({.target = "/x", .scheme = "ftp", .authority = "example.com"}).has_value());
+        expect(!origin_of({.target = "/x", .scheme = "https", .authority = "example.com:abc"}).has_value());
+        expect(!origin_of({.target = "/x", .scheme = "https", .authority = "example.com:70000"}).has_value());
+        expect(!origin_of({.target = "/x", .scheme = "https", .authority = "[::1"}).has_value());
+    };
+
     "alpn_identifiers"_test = [] {
         expect(http::alpn(http::protocol_version::http1).empty());
         expect(http::alpn(http::protocol_version::http2) == "h2"sv);
