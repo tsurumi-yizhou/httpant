@@ -37,10 +37,10 @@ include(cmake/Dependencies.cmake)
 
 add_library(httpant-dependencies STATIC)
 target_sources(httpant-dependencies PUBLIC FILE_SET CXX_MODULES FILES
-    modules/dependencies/llhttp.ixx
-    modules/dependencies/nghttp2.ixx
-    modules/dependencies/nghttp3.ixx
-    modules/dependencies/stdexec.ixx
+    import/llhttp.ixx
+    import/nghttp2.ixx
+    import/nghttp3.ixx
+    import/stdexec.ixx
 )
 target_compile_definitions(httpant-dependencies PRIVATE NGHTTP2_NO_SSIZE_T)
 get_target_property(HTTPANT_NGHTTP2_TYPE ${HTTPANT_NGHTTP2_TARGET} TYPE)
@@ -96,9 +96,9 @@ target_link_libraries(${PROJECT_NAME} PUBLIC httpant-dependencies)
 if(BUILD_TESTING OR ENABLE_EXAMPLES)
     add_library(httpant-example-support STATIC)
     target_sources(httpant-example-support PUBLIC FILE_SET CXX_MODULES FILES
-        modules/dependencies/asio.ixx
-        modules/dependencies/openssl.ixx
-        modules/dependencies/msquic.ixx
+        import/asio.ixx
+        import/openssl.ixx
+        import/msquic.ixx
         examples/asio_support.ixx
         examples/quic_support.ixx
     )
@@ -111,7 +111,7 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE TEST_FILES CONFIGURE_DEPENDS testing/*.cpp)
     add_executable(${PROJECT_NAME}-test ${TEST_FILES})
     target_sources(${PROJECT_NAME}-test PRIVATE FILE_SET CXX_MODULES FILES
-        modules/dependencies/boost.ut.ixx
+        import/boost.ut.ixx
         testing/test_support.ixx
     )
     target_link_libraries(${PROJECT_NAME}-test PRIVATE httpant-example-support ${HTTPANT_UT_TARGET})

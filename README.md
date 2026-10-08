@@ -79,7 +79,7 @@ triplet that also chain-loads xclang, so the dependencies use the same
 compiler, ABI, and sysroot as Httpant. All module targets must agree on the
 C++ language standard and extension settings (`CMAKE_CXX_EXTENSIONS=OFF`).
 
-Httpant owns the `.ixx` wrappers in `modules/dependencies`. They expose the
+Httpant owns the `.ixx` wrappers in `import/`. They expose the
 API needed by Httpant under `httpant.dependencies.*` module names and do not
 replace upstream dependency targets. Applications can continue using those
 targets and upstream headers themselves; the wrappers are not a complete
