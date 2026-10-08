@@ -94,6 +94,50 @@ static suite<"fetch"> fetch_suite = [] {
         expect(result.body.empty());
     };
 
+    // RFC 9110 §7.8 — a 101 switches the connection to the requested protocol;
+    // the bytes the server sent after the head already belong to it.
+    "upgrade_reports_the_switch_and_the_bytes_after_the_head"_test = [] {
+        pipe c2s, s2c;
+        push_text(s2c,
+                  "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                  "Connection: Upgrade\r\nX-Probe: 1\r\n\r\nFIRST-BYTES");
+        mock_stream transport{.input = s2c, .output = c2s};
+
+        http::request head{.method = http::method::GET,
+                           .target = "/ws",
+                           .scheme = "https",
+                           .authority = "example.com",
+                           .fields = {{"upgrade", "websocket"}, {"connection", "Upgrade"}}};
+        auto result = run_sync(http::coroutine::upgrade(transport, std::move(head)));
+
+        expect(result.switched);
+        expect(result.head.status == 101_u);
+        expect(http::find_header(result.head.fields, "x-probe").value_or("") == "1"sv);
+        expect(bytes_to_string(result.pending) == "FIRST-BYTES"sv);
+        auto sent = bytes_to_string(c2s.buffer);
+        expect(sent.starts_with("GET /ws HTTP/1.1\r\n"));
+        expect(sent.find("example.com") != std::string::npos);
+    };
+
+    // A server that answers with a plain response did not switch: the head
+    // says what it answered and no bytes are handed over.
+    "upgrade_refused_is_not_a_switch"_test = [] {
+        pipe c2s, s2c;
+        push_text(s2c, "HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n");
+        mock_stream transport{.input = s2c, .output = c2s};
+
+        http::request head{.method = http::method::GET,
+                           .target = "/ws",
+                           .scheme = "https",
+                           .authority = "example.com",
+                           .fields = {{"upgrade", "websocket"}, {"connection", "Upgrade"}}};
+        auto result = run_sync(http::coroutine::upgrade(transport, std::move(head)));
+
+        expect(!result.switched);
+        expect(result.head.status == 426_u);
+        expect(result.pending.empty());
+    };
+
     // The application destroys the client from the continuation of its own
     // request, which the HTTP/2 reader has just woken.
     "http2_client_destroyed_by_the_coroutine_the_reader_woke"_test = [] {
