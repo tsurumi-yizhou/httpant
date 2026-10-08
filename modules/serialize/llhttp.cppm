@@ -23,6 +23,11 @@ namespace detail {
            s.find('\0') != std::string_view::npos;
 }
 
+inline void append_text(std::vector<std::byte>& out, std::string_view text) {
+    auto bytes = std::as_bytes(std::span{text});
+    out.insert(out.end(), bytes.begin(), bytes.end());
+}
+
 inline void validate_outbound_fields(const headers& fields) {
     for (const auto& h : fields) {
         if (has_crlf_nul(h.name) || has_crlf_nul(h.value))
@@ -52,7 +57,7 @@ inline auto serialize_head(const request& req) -> std::vector<std::byte> {
     // authority component — RFC 9112 §3.2 — "If the authority component is
     // missing or undefined for the target URI, then a client MUST send a Host
     // header field with an empty field value").
-    if (find_all_headers(req.fields, "host").size() != 1)
+    if (count_headers(req.fields, "host") != 1)
         throw std::runtime_error(
             "http/1.1: request must carry exactly one Host header field");
     // RFC 9112 §3.2 — "No whitespace is allowed in the request-target."
@@ -82,20 +87,28 @@ inline auto serialize_head(const request& req) -> std::vector<std::byte> {
         throw std::runtime_error("http/1.1: ALPN header in non-CONNECT request");
     detail::validate_outbound_fields(req.fields);
 
-    std::string raw;
     // RFC 9112 §3 — request-line = method SP request-target SP HTTP-version.
-    raw += std::string(to_string(req.method));
-    raw += ' ';
-    raw += req.target;
-    raw += " HTTP/1.1\r\n";
+    // Built once, at its final size.
+    constexpr std::string_view version_and_crlf = " HTTP/1.1\r\n";
+    auto method_token = to_string(req.method);
+    std::size_t size = method_token.size() + 1 + req.target.size() + version_and_crlf.size() + 2;
+    for (auto& h : req.fields)
+        size += h.name.size() + 2 + h.value.size() + 2;
+
+    std::vector<std::byte> raw;
+    raw.reserve(size);
+    detail::append_text(raw, method_token);
+    detail::append_text(raw, " ");
+    detail::append_text(raw, req.target);
+    detail::append_text(raw, version_and_crlf);
     for (auto& h : req.fields) {
-        raw += h.name;
-        raw += ": ";
-        raw += h.value;
-        raw += "\r\n";
+        detail::append_text(raw, h.name);
+        detail::append_text(raw, ": ");
+        detail::append_text(raw, h.value);
+        detail::append_text(raw, "\r\n");
     }
-    raw += "\r\n";
-    return std::as_bytes(std::span{raw}) | std::ranges::to<std::vector<std::byte>>();
+    detail::append_text(raw, "\r\n");
+    return raw;
 }
 
 inline auto serialize_head(const response& res) -> std::vector<std::byte> {
@@ -110,19 +123,27 @@ inline auto serialize_head(const response& res) -> std::vector<std::byte> {
         throw std::runtime_error("http/1.1: response status outside 100-599");
     detail::validate_outbound_fields(res.fields);
 
-    std::string raw;
     // RFC 9112 §4 — status-line = HTTP-version SP status-code SP reason-phrase.
-    std::format_to(std::back_inserter(raw), "HTTP/1.1 {} ", res.status);
-    raw += res.reason.empty() ? default_reason_phrase(res.status) : res.reason;
-    raw += "\r\n";
+    auto reason = res.reason.empty() ? std::string_view{default_reason_phrase(res.status)}
+                                     : std::string_view{res.reason};
+    std::vector<std::byte> raw;
+    std::size_t size = 9 + 3 + 1 + reason.size() + 2 + 2;
+    for (auto& h : res.fields)
+        size += h.name.size() + 2 + h.value.size() + 2;
+    raw.reserve(size);
+    detail::append_text(raw, "HTTP/1.1 ");
+    detail::append_text(raw, std::format("{}", res.status));
+    detail::append_text(raw, " ");
+    detail::append_text(raw, reason);
+    detail::append_text(raw, "\r\n");
     for (auto& h : res.fields) {
-        raw += h.name;
-        raw += ": ";
-        raw += h.value;
-        raw += "\r\n";
+        detail::append_text(raw, h.name);
+        detail::append_text(raw, ": ");
+        detail::append_text(raw, h.value);
+        detail::append_text(raw, "\r\n");
     }
-    raw += "\r\n";
-    return std::as_bytes(std::span{raw}) | std::ranges::to<std::vector<std::byte>>();
+    detail::append_text(raw, "\r\n");
+    return raw;
 }
 
 namespace detail {
@@ -223,7 +244,7 @@ inline auto stream_body(S& transport, Body& body, framing f, std::uint64_t conte
         // Consume the body so the caller's body lifecycle completes; no bytes
         // are emitted (the status terminates the message at the header
         // section).
-        std::array<std::byte, io_buffer_size> scratch;
+        std::array<std::byte, 512> scratch;
         while (co_await body.async_read(scratch, stop) != 0) {}
         co_return;
     }
@@ -313,8 +334,8 @@ inline auto write_request(S& transport, const request& head, Body& body,
         // retroactively add the header after the head is written, so a
         // non-empty body is refused before anything goes out — it would
         // otherwise be silently dropped from the wire.
-        std::array<std::byte, io_buffer_size> scratch;
-        if (co_await body.async_read(scratch, stop) != 0)
+        std::array<std::byte, 1> probe;  // one byte shows whether a body exists
+        if (co_await body.async_read(probe, stop) != 0)
             throw std::runtime_error(
                 "http/1.1: request body present without Content-Length or Transfer-Encoding");
     }

@@ -240,6 +240,13 @@ inline auto find_header(const headers& hdrs, std::string_view name)
     return it->value;
 }
 
+// How many field lines carry `name`, without collecting them.
+[[nodiscard]] inline auto count_headers(const headers& hdrs, std::string_view name) -> std::size_t
+{
+    return static_cast<std::size_t>(std::ranges::count_if(
+        hdrs, [name](const header& h) { return iequal(h.name, name); }));
+}
+
 inline auto find_all_headers(const headers& hdrs, std::string_view name)
     -> std::vector<std::string_view>
 {

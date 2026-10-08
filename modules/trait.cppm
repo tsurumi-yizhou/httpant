@@ -19,7 +19,93 @@ struct task_final_awaiter {
     void await_resume() const noexcept {}
 };
 
+// Coroutine frames come from a per-thread pool of size classes, so a protocol
+// operation that builds a chain of tasks allocates from the heap only until
+// the pool has warmed up. A frame freed on another thread joins that thread's
+// pool; each class keeps a bounded number of blocks and returns the rest.
+class frame_pool {
+public:
+    static auto allocate(std::size_t size) -> void* {
+        auto index = class_of(size);
+        if (index == classes) return ::operator new(size);
+        // Blocks are always a whole size class, so any pool can reuse them.
+        if (auto* pool = local()) {
+            auto& list = pool->free_[index];
+            if (list.count != 0) {
+                auto* block = list.head;
+                list.head = block->next;
+                --list.count;
+                return block;
+            }
+        }
+        return ::operator new(class_size(index));
+    }
+
+    static void deallocate(void* frame, std::size_t size) noexcept {
+        auto index = class_of(size);
+        auto* pool = index == classes ? nullptr : local();
+        if (pool == nullptr || pool->free_[index].count >= max_cached)
+            return ::operator delete(frame);
+        auto& list = pool->free_[index];
+        auto* block = static_cast<block_node*>(frame);
+        block->next = list.head;
+        list.head = block;
+        ++list.count;
+    }
+
+private:
+    struct block_node {
+        block_node* next;
+    };
+    struct free_list {
+        block_node* head{nullptr};
+        std::size_t count{0};
+    };
+
+    // 64 B, 128 B, ... 32 KiB; larger frames use the heap directly.
+    static constexpr std::size_t first_class = 64;
+    static constexpr std::size_t classes = 10;
+    static constexpr std::size_t max_cached = 32;
+
+    static constexpr auto class_size(std::size_t index) -> std::size_t { return first_class << index; }
+    static constexpr auto class_of(std::size_t size) -> std::size_t {
+        std::size_t index = 0;
+        while (index < classes && class_size(index) < size) ++index;
+        return index;
+    }
+
+    explicit frame_pool(bool* destroyed) noexcept : destroyed_(destroyed) {}
+    ~frame_pool() {
+        *destroyed_ = true;
+        for (auto& list : free_)
+            for (auto* block = list.head; block != nullptr;) {
+                auto* next = block->next;
+                ::operator delete(block);
+                block = next;
+            }
+    }
+    frame_pool(const frame_pool&) = delete;
+    auto operator=(const frame_pool&) -> frame_pool& = delete;
+
+    // The calling thread's pool, or null once thread teardown has destroyed
+    // it: a frame freed that late goes straight back to the heap. The flag is
+    // trivially destructible, so it stays readable after the pool is gone.
+    static auto local() -> frame_pool* {
+        static thread_local bool destroyed = false;
+        static thread_local frame_pool pool{&destroyed};
+        return destroyed ? nullptr : &pool;
+    }
+
+    bool* destroyed_;
+    free_list free_[classes]{};
+};
+
 struct task_promise_base {
+    static auto operator new(std::size_t size) -> void* { return frame_pool::allocate(size); }
+    static void operator delete(void* frame, std::size_t size) noexcept {
+        frame_pool::deallocate(frame, size);
+    }
+
     std::exception_ptr exception_;
     std::coroutine_handle<> continuation_;
     void* operation_{};

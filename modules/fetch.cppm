@@ -208,9 +208,19 @@ auto fetch(Connection& connection, http::request head, Body& body, std::stop_tok
     return detail::fetch_streaming<Version>(connection, std::move(head), body, stop);
 }
 
+// A request without a body.
 template <protocol_version Version, typename Connection>
     requires has_client<Connection, Version>
-auto fetch(Connection& connection, http::request head, std::span<const std::byte> body = {},
+auto fetch(Connection& connection, http::request head, std::stop_token stop = {})
+    -> task<fetched> {
+    detail::complete_request<Version>(head, std::nullopt);
+    http::buffer_body no_body;
+    co_return co_await detail::fetch_streaming<Version>(connection, std::move(head), no_body, stop);
+}
+
+template <protocol_version Version, typename Connection>
+    requires has_client<Connection, Version>
+auto fetch(Connection& connection, http::request head, std::span<const std::byte> body,
            std::stop_token stop = {}) -> task<fetched> {
     return detail::fetch_owned<Version>(
         connection, std::move(head), std::vector<std::byte>{body.begin(), body.end()}, stop);

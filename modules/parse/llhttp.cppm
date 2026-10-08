@@ -232,6 +232,9 @@ public:
     // connection-scoped persistence flags and pending bytes.
     void begin_message() {
         state_ = {};
+        // A typical header section fits; one allocation instead of one per
+        // doubling (1, 2, 4, 8, 16 fields).
+        state_.fields.reserve(16);
         llhttp_reset(&parser_);
     }
 
