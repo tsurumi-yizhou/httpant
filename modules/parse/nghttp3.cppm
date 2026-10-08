@@ -221,7 +221,7 @@ inline auto process_control_stream(conn_context& ctx, nghttp3_conn* conn, std::i
             case goaway_frame_type: {
                 auto id = decode_exact_varint(ctx, conn, span_bytes(frame.payload), "GOAWAY payload");
                 // RFC 9114 §5.2 — "Receiving a GOAWAY containing a larger identifier than previously received MUST be treated as a connection error of type H3_ID_ERROR."
-                if (ctx.core.goaway_id && id > *ctx.core.goaway_id)
+                if (ctx.core.goaway_id && id > static_cast<std::uint64_t>(*ctx.core.goaway_id))
                     throw make_frame_error(ctx, conn, NGHTTP3_H3_ID_ERROR, "GOAWAY identifier increased");
                 append_bytes(forward, frame.raw);
                 break;
@@ -504,7 +504,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             ctx.core.goaway_received = true;
             auto identifier = static_cast<std::uint64_t>(id);
-            if (!ctx.core.goaway_id || identifier < *ctx.core.goaway_id)
+            if (!ctx.core.goaway_id || identifier < static_cast<std::uint64_t>(*ctx.core.goaway_id))
                 ctx.core.goaway_id = identifier;
             // RFC 9114 §5.2 — "Upon receipt of a GOAWAY frame, if the client
             // has already sent requests with a stream ID greater than or equal
@@ -516,7 +516,8 @@ inline auto make_callbacks() -> nghttp3_callbacks {
             // rejection instead of hanging until the connection fails
             // (mirrors v2's notify_waiters after each driver cycle).
             for (auto& [stream_id, stream] : ctx.core.streams)
-                if (static_cast<std::uint64_t>(stream_id) >= *ctx.core.goaway_id)
+                if (static_cast<std::uint64_t>(stream_id) >=
+                    static_cast<std::uint64_t>(*ctx.core.goaway_id))
                     stream->core.resume_waiter();
         });
     };

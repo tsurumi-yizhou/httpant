@@ -101,7 +101,8 @@ private:
         // the driver's own transport reads; it does not resume this wait.
         while (!sd->core.headers_done && !sd->core.aborted) {
             if (ctx_.core.goaway_received && ctx_.core.goaway_id &&
-                static_cast<std::uint64_t>(stream_id) >= *ctx_.core.goaway_id)
+                static_cast<std::uint64_t>(stream_id) >=
+                    static_cast<std::uint64_t>(*ctx_.core.goaway_id))
                 throw detail::make_goaway_rejection(
                     static_cast<std::uint64_t>(stream_id));
             co_await detail::headers_awaiter{sd};
