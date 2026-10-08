@@ -272,6 +272,28 @@ inline auto find_all_headers(const headers& hdrs, std::string_view name)
     return combined;
 }
 
+// RFC 9110 §5.6.1 — a list-valued field is a comma-separated list, possibly
+// spread over several field lines; each member is trimmed of optional
+// whitespace and tokens compare case-insensitively (RFC 9110 §5.6.2). True when
+// any line of `name` lists `token`.
+[[nodiscard]] inline auto field_contains_token(const headers& fields, std::string_view name,
+                                               std::string_view token) -> bool
+{
+    for (auto line : find_all_headers(fields, name)) {
+        while (!line.empty()) {
+            auto comma = line.find(',');
+            auto member = line.substr(0, comma);
+            line = comma == std::string_view::npos ? std::string_view{} : line.substr(comma + 1);
+            while (!member.empty() && (member.front() == ' ' || member.front() == '\t'))
+                member.remove_prefix(1);
+            while (!member.empty() && (member.back() == ' ' || member.back() == '\t'))
+                member.remove_suffix(1);
+            if (iequal(member, token)) return true;
+        }
+    }
+    return false;
+}
+
 // ─── Messages (RFC 9110 §6) ─────────────────────────────────
 
 struct request {

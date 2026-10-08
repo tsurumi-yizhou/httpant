@@ -65,6 +65,18 @@ static suite<"fetch"> fetch_suite = [] {
         expect(!origin_of({.target = "/x", .scheme = "https", .authority = "[::1"}).has_value());
     };
 
+    // RFC 9110 §5.6.1 — list members across field lines, trimmed, case-insensitive.
+    "field_contains_token_reads_lists"_test = [] {
+        http::headers fields{{"Connection", "keep-alive, Upgrade"}, {"connection", "\tTE "}, {"x", "upgrade"}};
+        expect(http::field_contains_token(fields, "connection", "upgrade"));
+        expect(http::field_contains_token(fields, "CONNECTION", "te"));
+        expect(http::field_contains_token(fields, "connection", "keep-alive"));
+        expect(!http::field_contains_token(fields, "connection", "close"));
+        expect(!http::field_contains_token(fields, "connection", "upgrad"));
+        expect(!http::field_contains_token(fields, "missing", "upgrade"));
+        expect(!http::field_contains_token(http::headers{{"connection", ""}}, "connection", ""));
+    };
+
     "alpn_identifiers"_test = [] {
         expect(http::alpn(http::protocol_version::http1).empty());
         expect(http::alpn(http::protocol_version::http2) == "h2"sv);
