@@ -297,6 +297,7 @@ public:
     }
 
     void stop() noexcept {
+        *alive_ = false;
         stop_source_.request_stop();
         driver_ = {};
     }
@@ -330,10 +331,15 @@ private:
                         "http/2: connection closed by peer"};
                 }
 
-                auto result = nghttp2_session_mem_recv2(
-                    session_.get(),
-                    reinterpret_cast<const std::uint8_t*>(buffer.data()),
-                    size);
+                // Callbacks wake parked coroutines; they are queued and resumed
+                // below, once this driver has suspended (see wake_scope).
+                auto result = [&] {
+                    http::detail::wake_scope scope{wakeups_};
+                    return nghttp2_session_mem_recv2(
+                        session_.get(),
+                        reinterpret_cast<const std::uint8_t*>(buffer.data()),
+                        size);
+                }();
                 if (context_.core.pending_callback_failure)
                     std::rethrow_exception(
                         std::exchange(context_.core.pending_callback_failure, {}));
@@ -357,7 +363,11 @@ private:
                         std::format("http/2: mem_recv failed ({})", result));
                 }
                 co_await flush();
-                notify_waiters(context_);
+                {
+                    http::detail::wake_scope scope{wakeups_};
+                    notify_waiters(context_);
+                }
+                co_await http::detail::dispatch_wakeups{wakeups_, alive_};
                 if (!nghttp2_session_want_read(session_.get())) {
                     // nghttp2 terminates the session itself — answering with
                     // GOAWAY — when the peer commits a connection error (e.g.
@@ -383,15 +393,19 @@ private:
         } catch (...) {
             if (!stop_source_.stop_requested()) {
                 context_.core.connection_error = std::current_exception();
+                http::detail::wake_scope scope{wakeups_};
                 notify_waiters(context_);
             }
         }
+        co_await http::detail::dispatch_wakeups{wakeups_, alive_};
     }
 
     S& transport_;
     session_handle& session_;
     session_context& context_;
     std::stop_source stop_source_{};
+    http::detail::wake_queue wakeups_{};
+    std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
     task<void> driver_{};
     bool started_{false};
 };

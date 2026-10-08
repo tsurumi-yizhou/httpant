@@ -87,6 +87,7 @@ target_sources(
     modules/server/nghttp3.cppm
     modules/coroutine.cppm
     modules/execution.cppm
+    modules/fetch.cppm
     modules/caching.cppm
     modules/cookie.cppm
 )

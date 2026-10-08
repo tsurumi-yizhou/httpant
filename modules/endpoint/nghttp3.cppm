@@ -320,6 +320,7 @@ public:
     }
 
     void stop() noexcept {
+        *alive_ = false;
         stop_source_.request_stop();
         readers_.clear();
         driver_ = {};
@@ -454,20 +455,36 @@ private:
             // flag passed to process_input is exactly "no bytes this read"; a
             // partial frame left at fin therefore accumulated from earlier
             // reads and is the stream's truncated last frame (RFC 9114 §7.1).
-            auto consumed = process_input(
-                context_, connection_, stream_id, unidirectional,
-                std::span<const std::byte>{buffer.data(), static_cast<std::size_t>(size)},
-                size == 0);
-            stream->consume(static_cast<std::size_t>(consumed));
-            for (auto it = context_.deferred_consumption.begin();
-                 it != context_.deferred_consumption.end();) {
-                if (auto handle = streams_.find(it->first); handle != streams_.end())
-                    handle->second->consume(it->second);
-                it = context_.deferred_consumption.erase(it);
+            // nghttp3's callbacks wake parked coroutines; they are queued and
+            // resumed below, once this reader has suspended, so they may
+            // destroy the client (see wake_scope). A failure is rethrown only
+            // after the wake-ups queued before it have been dispatched.
+            std::exception_ptr input_failure;
+            try {
+                http::detail::wake_scope scope{wakeups_};
+                auto consumed = process_input(
+                    context_, connection_, stream_id, unidirectional,
+                    std::span<const std::byte>{buffer.data(), static_cast<std::size_t>(size)},
+                    size == 0);
+                stream->consume(static_cast<std::size_t>(consumed));
+                for (auto it = context_.deferred_consumption.begin();
+                     it != context_.deferred_consumption.end();) {
+                    if (auto handle = streams_.find(it->first); handle != streams_.end())
+                        handle->second->consume(it->second);
+                    it = context_.deferred_consumption.erase(it);
+                }
+                if (size == 0) {
+                    if (auto it = context_.core.streams.find(stream_id);
+                        it != context_.core.streams.end())
+                        it->second->core.resume_waiter();
+                }
+            } catch (...) {
+                input_failure = std::current_exception();
             }
+            co_await http::detail::dispatch_wakeups{wakeups_, alive_};
+            if (input_failure)
+                std::rethrow_exception(input_failure);
             if (size == 0) {
-                if (auto it = context_.core.streams.find(stream_id); it != context_.core.streams.end())
-                    it->second->core.resume_waiter();
                 // RFC 9114 §4.1 — "If a client-initiated stream terminates
                 // without enough of the HTTP message to provide a complete
                 // response, the server SHOULD abort its response stream with
@@ -520,6 +537,8 @@ private:
     std::stop_source stop_source_{};
     std::optional<std::stop_callback<stop_forward>> external_stop_{};
     flush_gate flush_gate_{};
+    http::detail::wake_queue wakeups_{};
+    std::shared_ptr<bool> alive_{std::make_shared<bool>(true)};
     task<void> driver_{};
     std::vector<task<void>> readers_{};
     bool started_{false};

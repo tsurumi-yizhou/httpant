@@ -315,6 +315,67 @@ struct received {
 
 namespace detail {
 
+// ─── Deferred wake-ups ───────────────────────────────────────
+//
+// A connection driver (the HTTP/2 reader, an HTTP/3 stream reader) wakes the
+// coroutines parked on its streams while it processes input. Resuming them
+// inline would run application code on the driver's own stack, and that code
+// may destroy the very client whose driver is still executing beneath it.
+//
+// While a wake_scope is active on a thread, wake() therefore queues the
+// handle instead of resuming it. The driver leaves the scope, then awaits
+// dispatch_wakeups, which resumes the queued coroutines once the driver has
+// itself suspended. `alive` is cleared by the runtime's destructor: if a woken
+// coroutine destroyed the runtime, the driver frame is gone and must not be
+// touched, so dispatch ends without resuming it.
+using wake_queue = std::vector<std::coroutine_handle<>>;
+
+inline thread_local wake_queue* active_wake_queue = nullptr;
+
+class wake_scope {
+public:
+    explicit wake_scope(wake_queue& queue) noexcept
+        : previous_(std::exchange(active_wake_queue, &queue)) {}
+    wake_scope(const wake_scope&) = delete;
+    auto operator=(const wake_scope&) -> wake_scope& = delete;
+    ~wake_scope() { active_wake_queue = previous_; }
+
+private:
+    wake_queue* previous_;
+};
+
+// Resume a parked coroutine now, or queue it when a wake_scope is active.
+inline void wake(std::coroutine_handle<> handle) noexcept {
+    if (active_wake_queue != nullptr)
+        active_wake_queue->push_back(handle);
+    else
+        handle.resume();
+}
+
+struct dispatch_wakeups {
+    wake_queue& queue;
+    std::shared_ptr<bool> alive;
+
+    [[nodiscard]] auto await_ready() const noexcept -> bool { return queue.empty(); }
+
+    auto await_suspend(std::coroutine_handle<> driver) noexcept -> std::coroutine_handle<> {
+        // Locals only from here on: the first resumed coroutine may destroy the
+        // frame this awaiter lives in.
+        auto alive_flag = alive;
+        auto* pending = &queue;
+        wake_queue batch;
+        batch.swap(*pending);
+        for (auto handle : batch) {
+            handle.resume();
+            if (!*alive_flag)
+                return std::noop_coroutine();
+        }
+        return driver;
+    }
+
+    void await_resume() const noexcept {}
+};
+
 // A single-slot coroutine waiter: at most one coroutine may park on a slot at
 // a time (a second park throws std::logic_error, since it would silently
 // overwrite the first handle and hang it), and a wakeup is claimed with
@@ -340,7 +401,7 @@ public:
     // value (whether a coroutine was resumed) is informational.
     auto resume() noexcept -> bool {
         if (!handle_) return false;
-        std::exchange(handle_, {}).resume();
+        wake(std::exchange(handle_, {}));
         return true;
     }
 

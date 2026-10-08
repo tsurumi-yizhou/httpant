@@ -24,5 +24,6 @@ export import :client.nghttp3;
 export import :server.nghttp3;
 export import :coroutine;
 export import :execution;
+export import :fetch;
 export import :caching;
 export import :cookie;
