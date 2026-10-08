@@ -145,6 +145,30 @@ scope, retryability, and optional exchange identity; its `protocol_action` separ
 the RFC-required response, stream reset, connection close, or `no_action`. Backend diagnostic
 codes are never treated as HTTP wire codes.
 
+## One-shot requests
+
+For a single request on a connection you already have, `fetch` creates the client, runs the exchange, reads the whole response, and destroys the client. The connection stays yours.
+
+```cpp
+http::request request{.method = http::method::POST, .target = "/orders",
+                      .scheme = "https", .authority = "api.example.com"};
+
+// The connection kind and the namespace name the version; no template argument.
+auto response = co_await http::v1::fetch(tls, request, "a=b"sv);   // byte stream: HTTP/1.1
+auto response = co_await http::v2::fetch(tls, request);             // byte stream: HTTP/2
+auto response = co_await http::v3::fetch(quic, request);            // stream factory: HTTP/3
+
+// or pick the version generically:
+auto response = co_await http::coroutine::fetch<http::protocol_version::http2>(tls, request);
+
+response.head.status;   // http::response
+response.text();        // the body, read to its end
+```
+
+The request is the same for every version. Give it a scheme and an authority (or a `Host` field); `fetch` adds what the version needs, such as the `Host` field for HTTP/1.1 and a `Content-Length` for a body of known size. A body can be a span or string of bytes (copied when you call `fetch`, so your buffer need not outlive it) or any `body_stream`, which you frame yourself with `Content-Length` or `Transfer-Encoding`. `http::execution::fetch<Version>(...)` returns the same operation as a P2300 sender, and every form takes an optional `std::stop_token` that cancels the response reads.
+
+Around it: `http::client_for<Connection, Version>` names the client type for a connection kind and version, `http::alpn(version)` is the ALPN identifier to offer (`"h2"`, `"h3"`, none for HTTP/1.1), `http::request_origin(request)` gives the host and port to connect to, and `http::coroutine::upgrade(stream, request)` performs an HTTP/1.1 protocol switch (for example to WebSocket) and hands you the connection with the bytes the server already sent after its `101`.
+
 ## Streaming bodies
 
 `http::request`/`http::response` carry only metadata (method, target, status, fields, ...) — never a buffered body. Message bodies are asynchronous byte streams:

@@ -1,4 +1,5 @@
 import httpant.dependencies.boost.ut;
+import httpant.dependencies.stdexec;
 import std;
 import httpant.testing;
 import httpant;
@@ -75,6 +76,45 @@ static suite<"fetch"> fetch_suite = [] {
         expect(!http::field_contains_token(fields, "connection", "upgrad"));
         expect(!http::field_contains_token(fields, "missing", "upgrade"));
         expect(!http::field_contains_token(http::headers{{"connection", ""}}, "connection", ""));
+    };
+
+    // The surfaces and entry points of the library's conventions: a per-version
+    // namespace function (no template argument), string bodies, and the P2300
+    // surface; all reach the same exchange.
+    "fetch_per_version_entry_points_and_sender_surface"_test = [] {
+        auto serve = [](pipe& s2c) {
+            push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        };
+        auto request = [] { return request_for("/v1"); };
+
+        {
+            pipe c2s, s2c;
+            serve(s2c);
+            mock_stream transport{.input = s2c, .output = c2s};
+            auto result = run_sync(http::v1::fetch(transport, request(), "text body"sv));
+            expect(result.text() == "ok"sv);
+            expect(bytes_to_string(c2s.buffer).ends_with("\r\n\r\ntext body"));
+        }
+        {
+            pipe c2s, s2c;
+            serve(s2c);
+            mock_stream transport{.input = s2c, .output = c2s};
+            http::buffer_body streamed{std::vector<std::byte>{std::byte{'x'}, std::byte{'y'}}};
+            auto head = request();
+            head.fields.push_back({"content-length", "2"});
+            auto result = run_sync(http::v1::fetch(transport, std::move(head), streamed));
+            expect(result.text() == "ok"sv);
+            expect(bytes_to_string(c2s.buffer).ends_with("\r\n\r\nxy"));
+        }
+        {
+            pipe c2s, s2c;
+            serve(s2c);
+            mock_stream transport{.input = s2c, .output = c2s};
+            auto outcome = stdexec::sync_wait(
+                http::execution::fetch<http::protocol_version::http1>(transport, request()));
+            expect(outcome.has_value());
+            expect(std::get<0>(*outcome).text() == "ok"sv);
+        }
     };
 
     "alpn_identifiers"_test = [] {

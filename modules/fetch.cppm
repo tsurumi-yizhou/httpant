@@ -136,16 +136,41 @@ namespace detail {
 
 // What a request needs besides what the caller set: HTTP/1.1 requires exactly
 // one Host field, derived here from the authority (HTTP/2 and HTTP/3 take
-// :authority from the same place), and a non-empty body needs its length.
+// :authority from the same place), and a body of known size needs its length.
 template <protocol_version Version>
-void complete_request(request& head, std::size_t body_size) {
+void complete_request(request& head, std::optional<std::size_t> body_size) {
     if constexpr (Version == protocol_version::http1) {
         if (!find_header(head.fields, "host"))
             if (auto authority = request_authority(head))
                 head.fields.push_back({"host", std::string{*authority}});
     }
-    if (body_size != 0 && !find_header(head.fields, "content-length"))
-        head.fields.push_back({"content-length", std::to_string(body_size)});
+    if (body_size && *body_size != 0 && !find_header(head.fields, "content-length"))
+        head.fields.push_back({"content-length", std::to_string(*body_size)});
+}
+
+template <protocol_version Version, typename Connection, body_stream Body>
+auto fetch_streaming(Connection& connection, request head, Body& body, std::stop_token stop)
+    -> task<fetched> {
+    client_t<Connection, Version> client{connection};
+    co_await operation_start(client);
+    auto received = co_await operation_request(client, std::move(head), body);
+
+    fetched result;
+    result.head = std::move(received.head);
+    std::array<std::byte, 4096> buffer;
+    while (auto n = co_await received.body.async_read(buffer, stop))
+        result.body.insert(result.body.end(), buffer.data(), buffer.data() + n);
+    co_return result;
+}
+
+// The task is lazy, so a body given as a span or string is copied when fetch is
+// called and owned by the task: the caller's buffer need not outlive the call.
+template <protocol_version Version, typename Connection>
+auto fetch_owned(Connection& connection, request head, std::vector<std::byte> body,
+                 std::stop_token stop) -> task<fetched> {
+    complete_request<Version>(head, body.size());
+    http::buffer_body request_body{std::move(body)};
+    co_return co_await fetch_streaming<Version>(connection, std::move(head), request_body, stop);
 }
 
 } // namespace detail
@@ -162,41 +187,48 @@ struct upgraded {
     std::vector<std::byte> pending{};
 };
 
+// ─── fetch: one request, one buffered response ───────────────
+//
+// The connection stays the caller's (a byte stream for HTTP/1.1 and HTTP/2, a
+// stream factory for HTTP/3) and is not closed. The request is the same for
+// every version: give it a scheme and an authority (or a Host field). fetch
+// adds what the version needs (see detail::complete_request), runs the
+// exchange on a client it creates and destroys, and reads the response body to
+// its end. The body argument is a span or string of bytes (Content-Length is
+// added), or any body_stream (the caller frames it, with Content-Length or
+// Transfer-Encoding). `stop` cancels the response body reads.
+
 namespace coroutine {
 
-// One request/response exchange on an established connection, over whichever
-// version the connection type and `Version` select. The request is the same
-// for every version: give it a scheme and an authority (or a Host field).
-// fetch adds what the version needs (see detail::complete_request). The
-// response body is read to its end. Nothing is reused afterwards: the client,
-// and with it the connection's protocol state, is destroyed when fetch
-// returns.
-template <protocol_version Version, typename Connection>
+template <protocol_version Version, typename Connection, body_stream Body>
     requires has_client<Connection, Version>
-auto fetch(Connection& connection, http::request head, std::span<const std::byte> body = {})
+auto fetch(Connection& connection, http::request head, Body& body, std::stop_token stop = {})
     -> task<fetched> {
-    detail::complete_request<Version>(head, body.size());
-
-    client_t<Connection, Version> client{connection};
-    co_await start(client);
-
-    http::buffer_body request_body{std::vector<std::byte>{body.begin(), body.end()}};
-    auto received = co_await request(client, std::move(head), request_body);
-
-    fetched result;
-    result.head = std::move(received.head);
-    std::array<std::byte, 4096> buffer;
-    while (auto n = co_await received.body.async_read(buffer, std::stop_token{}))
-        result.body.insert(result.body.end(), buffer.data(), buffer.data() + n);
-    co_return result;
+    detail::complete_request<Version>(head, std::nullopt);
+    return detail::fetch_streaming<Version>(connection, std::move(head), body, stop);
 }
 
-// RFC 9110 §7.8: send an HTTP/1.1 request with an Upgrade field (the
-// caller supplies Upgrade, Connection and any protocol-specific fields) and
-// report whether the server switched protocols. On a switch, the connection
-// belongs to the new protocol from here on and `pending` holds the bytes the
-// server already sent after its 101. The HTTP client is gone when upgrade
-// returns, so nothing of HTTP/1.1 framing remains on the connection.
+template <protocol_version Version, typename Connection>
+    requires has_client<Connection, Version>
+auto fetch(Connection& connection, http::request head, std::span<const std::byte> body = {},
+           std::stop_token stop = {}) -> task<fetched> {
+    return detail::fetch_owned<Version>(
+        connection, std::move(head), std::vector<std::byte>{body.begin(), body.end()}, stop);
+}
+
+template <protocol_version Version, typename Connection>
+    requires has_client<Connection, Version>
+auto fetch(Connection& connection, http::request head, std::string_view body,
+           std::stop_token stop = {}) -> task<fetched> {
+    return fetch<Version>(connection, std::move(head), std::as_bytes(std::span{body}), stop);
+}
+
+// RFC 9110 §7.8: send an HTTP/1.1 request with an Upgrade field (the caller
+// supplies Upgrade, Connection and any protocol-specific fields) and report
+// whether the server switched protocols. On a switch, the connection belongs
+// to the new protocol from here on and `pending` holds the bytes the server
+// already sent after its 101. The HTTP client is gone when upgrade returns, so
+// nothing of HTTP/1.1 framing remains on the connection.
 template <byte_stream Connection>
 auto upgrade(Connection& connection, http::request head) -> task<upgraded> {
     detail::complete_request<protocol_version::http1>(head, 0);
@@ -216,5 +248,50 @@ auto upgrade(Connection& connection, http::request head) -> task<upgraded> {
 }
 
 } // namespace coroutine
+
+// The same operations on the P2300 surface: the returned task is a sender.
+namespace execution {
+
+template <protocol_version Version, typename Connection, typename... Rest>
+    requires requires(Connection& c, http::request h, Rest&&... rest) {
+        coroutine::fetch<Version>(c, std::move(h), std::forward<Rest>(rest)...);
+    }
+auto fetch(Connection& connection, http::request head, Rest&&... rest) -> task<fetched> {
+    return coroutine::fetch<Version>(connection, std::move(head), std::forward<Rest>(rest)...);
+}
+
+template <byte_stream Connection>
+auto upgrade(Connection& connection, http::request head) -> task<upgraded> {
+    return coroutine::upgrade(connection, std::move(head));
+}
+
+} // namespace execution
+
+// Per-version entry points: the connection kind and the namespace name the
+// version, so no template argument is needed.
+namespace v1 {
+template <byte_stream S, typename... Rest>
+auto fetch(S& stream, http::request head, Rest&&... rest) {
+    return coroutine::fetch<protocol_version::http1>(stream, std::move(head), std::forward<Rest>(rest)...);
+}
+template <byte_stream S>
+auto upgrade(S& stream, http::request head) {
+    return coroutine::upgrade(stream, std::move(head));
+}
+} // namespace v1
+
+namespace v2 {
+template <byte_stream S, typename... Rest>
+auto fetch(S& stream, http::request head, Rest&&... rest) {
+    return coroutine::fetch<protocol_version::http2>(stream, std::move(head), std::forward<Rest>(rest)...);
+}
+} // namespace v2
+
+namespace v3 {
+template <stream_factory F, typename... Rest>
+auto fetch(F& factory, http::request head, Rest&&... rest) {
+    return coroutine::fetch<protocol_version::http3>(factory, std::move(head), std::forward<Rest>(rest)...);
+}
+} // namespace v3
 
 } // namespace http
