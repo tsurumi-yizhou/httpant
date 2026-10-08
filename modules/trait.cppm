@@ -89,7 +89,7 @@ struct task_completion<void> {
 // with .start() or co_await, or connect() it as a P2300 sender. T = void
 // shares this exact implementation through detail::task_result.
 template <typename T = void>
-class task {
+class [[clang::coro_await_elidable]] task {
 public:
     struct promise_type : detail::task_promise_base, detail::task_result<T> {
         auto get_return_object() -> task {
