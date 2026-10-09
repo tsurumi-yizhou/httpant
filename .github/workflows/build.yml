@@ -46,11 +46,24 @@ jobs:
           "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
 
+      - name: Create xclang triplet
+        run: |
+          mkdir -p "$RUNNER_TEMP/triplets"
+          cat > "$RUNNER_TEMP/triplets/x64-linux-xclang.cmake" <<'TRIPLET'
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_CMAKE_SYSTEM_NAME Linux)
+          set(VCPKG_ENV_PASSTHROUGH XCLANG_ROOT)
+          set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "$ENV{XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")
+          TRIPLET
+          sed -i 's/^          //' "$RUNNER_TEMP/triplets/x64-linux-xclang.cmake"
+
       - name: Cache vcpkg binaries
         uses: actions/cache@v6
         with:
           path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', '.github/workflows/build.yml') }}
           restore-keys: vcpkg-${{ runner.os }}-
 
       - name: Configure
@@ -58,6 +71,8 @@ jobs:
           cmake -S . -B build -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-linux-xclang
+          -DVCPKG_OVERLAY_TRIPLETS="$RUNNER_TEMP/triplets"
           -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$XCLANG_ROOT/lib/cmake/xclang/toolchain.cmake"
 
       - name: Build
