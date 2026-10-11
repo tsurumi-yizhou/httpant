@@ -1,0 +1,85 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  XCLANG_VERSION: 23.1.2.10
+  XCLANG_TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          pip install --user 'cmake>=4.0'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install xclang
+        run: |
+          base=https://github.com/clice-io/xclang/releases/download/${XCLANG_VERSION}
+          archive=xclang-${XCLANG_VERSION}-${XCLANG_TARGET}.tar.xz
+          curl -fsSL --retry 5 -O "$base/$archive" -O "$base/SHA256SUMS"
+          grep " $archive\$" SHA256SUMS | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/xclang"
+          tar -xJf "$archive" -C "$RUNNER_TEMP/xclang" --strip-components=1
+          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
+
+      - name: Set up vcpkg
+        run: |
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          git -C "$RUNNER_TEMP/vcpkg" checkout "$(jq -r '."builtin-baseline"' vcpkg.json)"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
+
+      - name: Create xclang triplet
+        run: |
+          mkdir -p "$RUNNER_TEMP/triplets"
+          cat > "$RUNNER_TEMP/triplets/x64-linux-xclang.cmake" <<'TRIPLET'
+          set(VCPKG_TARGET_ARCHITECTURE x64)
+          set(VCPKG_CRT_LINKAGE dynamic)
+          set(VCPKG_LIBRARY_LINKAGE static)
+          set(VCPKG_CMAKE_SYSTEM_NAME Linux)
+          set(VCPKG_ENV_PASSTHROUGH XCLANG_ROOT)
+          # xclang does not set the processor; msquic requires it. Keep ports away
+          # from the host's libatomic/libnuma, which need a newer glibc than
+          # xclang's sysroot.
+          set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DATOMIC=OFF -DNUMA=OFF)
+          set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "$ENV{XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")
+          TRIPLET
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/vcpkg/archives
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', '.github/workflows/build.yml') }}
+          restore-keys: vcpkg-${{ runner.os }}-
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-linux-xclang
+          -DVCPKG_OVERLAY_TRIPLETS="$RUNNER_TEMP/triplets"
+          -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$XCLANG_ROOT/lib/cmake/xclang/toolchain.cmake"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
