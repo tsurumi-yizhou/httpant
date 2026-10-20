@@ -34,6 +34,9 @@ if(WIN32 AND (BUILD_TESTING OR ENABLE_EXAMPLES))
 endif()
 
 include(cmake/Dependencies.cmake)
+if(BUILD_TESTING OR ENABLE_EXAMPLES)
+    include(cmake/Dependencies-development.cmake)
+endif()
 
 # The library reaches three C libraries and the standard async model through
 # module wrappers (import/*.ixx). They cannot live in the same target as the

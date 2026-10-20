@@ -1,3 +1,8 @@
+# The dependencies every consumer needs. Development-only ones (asio, OpenSSL,
+# msquic, Boost.UT) live in Dependencies-development.cmake and are never reached
+# from the installed package: an installed config must not re-run them, and a
+# consumer that happens to set BUILD_TESTING must not make them appear.
+#
 # Reuse targets supplied by the parent project (including FetchContent),
 # and only search for installed packages when none of their targets exist.
 function(httpant_find_dependency output package)
@@ -83,17 +88,6 @@ if(NOT HTTPANT_NGHTTP2_TARGET)
         )
     endif()
     set(HTTPANT_NGHTTP2_TARGET nghttp2::nghttp2)
-endif()
-
-if(BUILD_TESTING OR ENABLE_EXAMPLES)
-    httpant_find_dependency(HTTPANT_ASIO_TARGET asio asio::asio asio)
-    if(NOT TARGET OpenSSL::SSL OR NOT TARGET OpenSSL::Crypto)
-        find_package(OpenSSL REQUIRED)
-    endif()
-    httpant_find_dependency(HTTPANT_MSQUIC_TARGET msquic msquic)
-endif()
-if(BUILD_TESTING)
-    httpant_find_dependency(HTTPANT_UT_TARGET ut Boost::ut)
 endif()
 
 # liburing's vcpkg port ships headers and archives without a CMake package, so
