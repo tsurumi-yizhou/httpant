@@ -121,6 +121,7 @@ function(httpant_find_liburing output)
             add_library(httpant-uring STATIC IMPORTED GLOBAL)
             set_target_properties(httpant-uring PROPERTIES
                 INTERFACE_INCLUDE_DIRECTORIES "${prefix}/include"
+                IMPORTED_LOCATION "${uring_release}"
                 IMPORTED_LOCATION_DEBUG "${uring_debug}"
                 IMPORTED_LOCATION_RELEASE "${uring_release}"
                 IMPORTED_LOCATION_RELWITHDEBINFO "${uring_release}"
@@ -130,7 +131,7 @@ function(httpant_find_liburing output)
         endif()
     endif()
     find_library(uring_system NAMES uring REQUIRED)
-    add_library(httpant-uring SYSTEM STATIC IMPORTED GLOBAL)
+    add_library(httpant-uring STATIC IMPORTED GLOBAL)
     set_target_properties(httpant-uring PROPERTIES IMPORTED_LOCATION "${uring_system}")
     set(${output} httpant-uring PARENT_SCOPE)
 endfunction()

@@ -2,35 +2,49 @@
 
 A modern C++ library with no I/O and pure protocols.
 
-## Native I/O engine (`httpant.io`)
+## Native I/O engine (`httpant.io`) — opt-in
 
-`modules/io/` adds a completion-based I/O engine behind one interface, in the
+`modules/io/` holds a completion-based I/O engine behind one interface, in the
 `httpant.io` module: `open_socket`, `listen`, `connect_datagram`, `open_file`,
 `read_at`/`write_at`, `readable`, `timer`, and a `request`/`engine` pair that
 submits them. The mechanism is chosen per platform — io_uring on Linux, IORing
 on Windows, kqueue on macOS and the BSDs — and `native_io::engine::name()`
 reports which one is running.
 
-It is a separate target, `httpant-io`, because it depends on nothing but the
-standard library and the platform API: a consumer that only wants the protocol
-code never links liburing. On Linux, `httpant_find_liburing` accepts a target
-from the parent project, a CMake package, the vcpkg archive layout, or a system
-library, in that order.
+It is **off by default**. httpant's default identity is the sans-I/O protocol
+library: it parses bytes and produces bytes, and opens nothing. Turn the engine
+on when you want it:
 
-```cmake
-target_link_libraries(your-target PRIVATE httpant-io)
+```sh
+cmake -B build -DHTTPANT_ENABLE_IO=ON
+ctest --test-dir build -R httpant-io
 ```
 
 ```cpp
-import httpant.io;
+import httpant;     // protocol
+import httpant.io;  // engine
 ```
 
-The engine's tests are their own executable (`httpant-io-test`), because they
-need a writable scratch directory and no protocol dependencies:
-
-```sh
-ctest -R httpant-io
+```cmake
+target_link_libraries(your-target PRIVATE httpant::httpant httpant::io)
 ```
+
+Three targets, and two of them are optional in practice:
+
+| Target | Module | What it is |
+| --- | --- | --- |
+| `httpant` | `httpant` | the protocol library |
+| `httpant::io` (`httpant::default-io`) | `httpant.io` | the engine, `HTTPANT_ENABLE_IO=ON` only |
+| `httpant-imports` | `llhttp`, `nghttp2`, `nghttp3`, `stdexec` | module wrappers over the C libraries; `httpant` links it publicly, consumers never import it |
+
+The wrappers are a separate target because CMake rejects a public module source
+that imports a module provided by a private source of the same target — folding
+them into `httpant` fails at generate time.
+
+The engine needs nothing but the standard library and the platform API: it links
+liburing on Linux and `ws2_32`/`kernel32` on Windows, and nothing elsewhere.
+`httpant_find_liburing` accepts a target from the parent project, a CMake
+package, the vcpkg archive layout, or a system library, in that order.
 
 ## Build
 
