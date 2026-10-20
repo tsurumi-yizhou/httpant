@@ -2,6 +2,36 @@
 
 A modern C++ library with no I/O and pure protocols.
 
+## Native I/O engine (`httpant.io`)
+
+`modules/io/` adds a completion-based I/O engine behind one interface, in the
+`httpant.io` module: `open_socket`, `listen`, `connect_datagram`, `open_file`,
+`read_at`/`write_at`, `readable`, `timer`, and a `request`/`engine` pair that
+submits them. The mechanism is chosen per platform — io_uring on Linux, IORing
+on Windows, kqueue on macOS and the BSDs — and `native_io::engine::name()`
+reports which one is running.
+
+It is a separate target, `httpant-io`, because it depends on nothing but the
+standard library and the platform API: a consumer that only wants the protocol
+code never links liburing. On Linux, `httpant_find_liburing` accepts a target
+from the parent project, a CMake package, the vcpkg archive layout, or a system
+library, in that order.
+
+```cmake
+target_link_libraries(your-target PRIVATE httpant-io)
+```
+
+```cpp
+import httpant.io;
+```
+
+The engine's tests are their own executable (`httpant-io-test`), because they
+need a writable scratch directory and no protocol dependencies:
+
+```sh
+ctest -R httpant-io
+```
+
 ## Build
 
 Requires CMake 4.0+, Ninja, C++23, and the
