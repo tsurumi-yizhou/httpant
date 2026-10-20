@@ -3,21 +3,27 @@ cmake_minimum_required(VERSION 4.0.0)
 # A standalone build owns its dependencies through the vcpkg manifest; a parent
 # project owns them for the whole tree. This has to be decided before project(),
 # because vcpkg reads VCPKG_MANIFEST_FEATURES during that call.
-set(HTTPANT_TOP_LEVEL OFF)
+set(httpant_top_level OFF)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    set(HTTPANT_TOP_LEVEL ON)
+    set(httpant_top_level ON)
 endif()
 
 # Off by default: the examples need OpenSSL and msquic, and a protocol library's
 # consumers should not have to fetch a QUIC stack to build it.
 option(ENABLE_EXAMPLES "Build the examples" OFF)
 
-if(HTTPANT_TOP_LEVEL)
+# The engine is opt-in too, and it is what asks vcpkg for liburing.
+option(HTTPANT_ENABLE_IO "Build the native I/O engine (module httpant.io)" OFF)
+
+if(httpant_top_level)
     if(NOT DEFINED BUILD_TESTING OR BUILD_TESTING)
         list(APPEND VCPKG_MANIFEST_FEATURES tests)
     endif()
     if(ENABLE_EXAMPLES)
         list(APPEND VCPKG_MANIFEST_FEATURES examples)
+    endif()
+    if(HTTPANT_ENABLE_IO)
+        list(APPEND VCPKG_MANIFEST_FEATURES io)
     endif()
 endif()
 
@@ -62,25 +68,25 @@ endif()
 # protocol modules: CMake rejects a public module source that imports a module
 # provided by a private source. So they are one small target of their own, and
 # the package publishes three names: httpant, httpant-io, httpant-imports.
-set(HTTPANT_IMPORTS
+set(httpant_imports
     import/llhttp.ixx
     import/nghttp2.ixx
     import/nghttp3.ixx
     import/stdexec.ixx
 )
-set(HTTPANT_DEPENDENCY_DEFINITIONS NGHTTP2_NO_SSIZE_T)
-get_target_property(HTTPANT_NGHTTP2_TYPE ${HTTPANT_NGHTTP2_TARGET} TYPE)
-if(HTTPANT_NGHTTP2_TYPE STREQUAL "STATIC_LIBRARY" OR HTTPANT_NGHTTP2_TYPE STREQUAL "UNKNOWN_LIBRARY")
-    list(APPEND HTTPANT_DEPENDENCY_DEFINITIONS NGHTTP2_STATICLIB)
+set(httpant_dependency_definitions NGHTTP2_NO_SSIZE_T)
+get_target_property(httpant_nghttp2_type ${HTTPANT_NGHTTP2_TARGET} TYPE)
+if(httpant_nghttp2_type STREQUAL "STATIC_LIBRARY" OR httpant_nghttp2_type STREQUAL "UNKNOWN_LIBRARY")
+    list(APPEND httpant_dependency_definitions NGHTTP2_STATICLIB)
 endif()
-get_target_property(HTTPANT_NGHTTP3_TYPE ${HTTPANT_NGHTTP3_TARGET} TYPE)
-if(HTTPANT_NGHTTP3_TYPE STREQUAL "STATIC_LIBRARY")
-    list(APPEND HTTPANT_DEPENDENCY_DEFINITIONS NGHTTP3_STATICLIB)
+get_target_property(httpant_nghttp3_type ${HTTPANT_NGHTTP3_TARGET} TYPE)
+if(httpant_nghttp3_type STREQUAL "STATIC_LIBRARY")
+    list(APPEND httpant_dependency_definitions NGHTTP3_STATICLIB)
 endif()
 
 add_library(httpant-imports STATIC)
-target_sources(httpant-imports PUBLIC FILE_SET CXX_MODULES FILES ${HTTPANT_IMPORTS})
-target_compile_definitions(httpant-imports PRIVATE ${HTTPANT_DEPENDENCY_DEFINITIONS})
+target_sources(httpant-imports PUBLIC FILE_SET CXX_MODULES FILES ${httpant_imports})
+target_compile_definitions(httpant-imports PRIVATE ${httpant_dependency_definitions})
 target_link_libraries(httpant-imports PUBLIC
     xclang::std
     ${HTTPANT_LLHTTP_TARGET}
@@ -96,7 +102,6 @@ add_library(httpant::imports ALIAS httpant-imports)
 # moves bytes for nobody and opens nothing. The engine depends on nothing but the
 # standard library and the platform API, so it is a separate target rather than a
 # partition of `httpant` — a consumer that only wants the protocol never links it.
-option(HTTPANT_ENABLE_IO "Build the native I/O engine (module httpant.io)" OFF)
 if(HTTPANT_ENABLE_IO)
     add_library(httpant-io STATIC)
     target_sources(httpant-io PUBLIC FILE_SET CXX_MODULES FILES
@@ -109,17 +114,17 @@ if(HTTPANT_ENABLE_IO)
 
     # One implementation unit per mechanism, and only the one this platform uses.
     if(WIN32)
-        set(HTTPANT_IO_MECHANISM modules/io/native/ioring.cppm)
+        set(httpant_io_mechanism modules/io/native/ioring.cppm)
         target_link_libraries(httpant-io PRIVATE ws2_32 kernel32)
     elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|OpenBSD|NetBSD|DragonFly)$")
-        set(HTTPANT_IO_MECHANISM modules/io/native/kqueue.cppm modules/io/native/posix.cppm)
+        set(httpant_io_mechanism modules/io/native/kqueue.cppm modules/io/native/posix.cppm)
     else()
-        httpant_find_liburing(HTTPANT_LIBURING_TARGET liburing::liburing uring::uring)
-        set(HTTPANT_IO_MECHANISM modules/io/native/uring.cppm modules/io/native/posix.cppm)
-        target_link_libraries(httpant-io PRIVATE ${HTTPANT_LIBURING_TARGET})
+        httpant_find_liburing(httpant_liburing_target liburing::liburing uring::uring)
+        set(httpant_io_mechanism modules/io/native/uring.cppm modules/io/native/posix.cppm)
+        target_link_libraries(httpant-io PRIVATE ${httpant_liburing_target})
     endif()
-    target_sources(httpant-io PRIVATE ${HTTPANT_IO_MECHANISM})
-    set_source_files_properties(${HTTPANT_IO_MECHANISM} PROPERTIES LANGUAGE CXX)
+    target_sources(httpant-io PRIVATE ${httpant_io_mechanism})
+    set_source_files_properties(${httpant_io_mechanism} PROPERTIES LANGUAGE CXX)
 
     # The two aliases are the published names; `default-io` says which mechanism the
     # platform picked without naming it.
@@ -214,22 +219,22 @@ endif()
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
-set(HTTPANT_INSTALL_SHARE "${CMAKE_INSTALL_DATADIR}/httpant")
-set(HTTPANT_MODULE_EXCLUDES)
+set(httpant_install_share "${CMAKE_INSTALL_DATADIR}/httpant")
+set(httpant_module_excludes)
 if(NOT HTTPANT_ENABLE_IO)
-    list(APPEND HTTPANT_MODULE_EXCLUDES PATTERN "io" EXCLUDE)
+    list(APPEND httpant_module_excludes PATTERN "io" EXCLUDE)
 endif()
-install(DIRECTORY modules/ DESTINATION "${HTTPANT_INSTALL_SHARE}/modules"
-    FILES_MATCHING PATTERN "*.cppm" ${HTTPANT_MODULE_EXCLUDES})
+install(DIRECTORY modules/ DESTINATION "${httpant_install_share}/modules"
+    FILES_MATCHING PATTERN "*.cppm" ${httpant_module_excludes})
 install(FILES import/llhttp.ixx import/nghttp2.ixx import/nghttp3.ixx import/stdexec.ixx
-    DESTINATION "${HTTPANT_INSTALL_SHARE}/import")
+    DESTINATION "${httpant_install_share}/import")
 install(FILES cmake/Dependencies.cmake
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/httpant")
 
 configure_package_config_file(cmake/httpant-config.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/httpant-config.cmake"
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/httpant"
-    PATH_VARS HTTPANT_INSTALL_SHARE)
+    PATH_VARS httpant_install_share)
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/httpant-config-version.cmake"
     VERSION "${PROJECT_VERSION}"
     COMPATIBILITY SameMajorVersion

@@ -26,7 +26,7 @@ find_dependency(xclang CONFIG)
 
 include("${CMAKE_CURRENT_LIST_DIR}/Dependencies.cmake")
 
-set(_httpant_share "@PACKAGE_HTTPANT_INSTALL_SHARE@")
+set(_httpant_share "@PACKAGE_httpant_install_share@")
 
 if(NOT TARGET httpant::httpant)
     file(GLOB_RECURSE _httpant_module_sources RELATIVE "${_httpant_share}"

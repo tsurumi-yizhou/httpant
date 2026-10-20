@@ -1,7 +1,7 @@
 {
     "name": "httpant",
     "version": "0.1.0",
-    "builtin-baseline": "818beed257310e1319826eb887651ba7ed61a29a",
+    "builtin-baseline": "65514b43a035548911e1789071785a9827470cdc",
     "dependencies": [
         "llhttp",
         "nghttp2",
@@ -24,6 +24,15 @@
                 "asio",
                 "openssl",
                 "msquic"
+            ]
+        },
+        "io": {
+            "description": "Build the native I/O engine (module httpant.io): io_uring on Linux, IORing on Windows, kqueue on macOS and the BSDs.",
+            "dependencies": [
+                {
+                    "name": "liburing",
+                    "platform": "linux"
+                }
             ]
         }
     }

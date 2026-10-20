@@ -1,7 +1,21 @@
-name: Build
+name: build
 
+# Two configurations, because they are two products:
+#
+#   protocol   the sans-I/O library and its test suite, on every platform
+#   io         the native engine (io_uring, kqueue, IORing)
+#
+# Both need an xclang tree (vars.XCLANG_URL) — C++23 modules are the whole point
+# of this library. The io job additionally needs the vcpkg triplets from
+# vcpkg-registry, because the dependencies have to be built by the same compiler
+# as the engine: liburing configured against a system compiler expects kernel
+# headers a sysrooted clang does not have.
+#
+#   vars.HTTPANT_TRIPLETS_URL    git URL of vcpkg-registry
+#   vars.HTTPANT_TRIPLETS_REF    optional: a commit of it
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -9,77 +23,175 @@ concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
-env:
-  XCLANG_VERSION: 23.1.2.10
-  XCLANG_TARGET: x86_64-unknown-linux-gnu
-
 jobs:
-  linux:
-    runs-on: ubuntu-latest
+  # Runs instead of the build until the two variables above are set, so a
+  # skipped build leaves a visible reason rather than a grey mark.
+  explain:
+    if: vars.XCLANG_URL == ''
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - run: echo "::notice::Set XCLANG_URL to enable this build; HTTPANT_TRIPLETS_URL adds the io engine."
 
-      - name: Install build tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build
-          pip install --user 'cmake>=4.0'
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+  protocol:
+    name: protocol ${{ matrix.name }}
+    if: vars.XCLANG_URL != ''
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: windows-x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+    env:
+      XCLANG_TARGET: ${{ matrix.target }}
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+    steps:
+      - uses: actions/checkout@v5
 
-      - name: Install xclang
+
+      - name: Fetch xclang
+        shell: bash
         run: |
-          base=https://github.com/clice-io/xclang/releases/download/${XCLANG_VERSION}
-          archive=xclang-${XCLANG_VERSION}-${XCLANG_TARGET}.tar.xz
-          curl -fsSL --retry 5 -O "$base/$archive" -O "$base/SHA256SUMS"
-          grep " $archive\$" SHA256SUMS | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/xclang"
-          tar -xJf "$archive" -C "$RUNNER_TEMP/xclang" --strip-components=1
+          set -euo pipefail
+          url="${{ vars.XCLANG_URL }}"
+          case "$url" in
+            *.tar.zst) curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar --use-compress-program=unzstd -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *.tar.xz)  curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *)         curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xzf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+          esac
           echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
 
-      - name: Set up vcpkg
+      - name: Install vcpkg (latest)
+        shell: bash
         run: |
-          git clone --filter=blob:none https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
-          git -C "$RUNNER_TEMP/vcpkg" checkout "$(jq -r '."builtin-baseline"' vcpkg.json)"
-          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
-          echo "VCPKG_ROOT=$RUNNER_TEMP/vcpkg" >> "$GITHUB_ENV"
-
-      - name: Create xclang triplet
-        run: |
-          mkdir -p "$RUNNER_TEMP/triplets"
-          cat > "$RUNNER_TEMP/triplets/x64-linux-xclang.cmake" <<'TRIPLET'
-          set(VCPKG_TARGET_ARCHITECTURE x64)
-          set(VCPKG_CRT_LINKAGE dynamic)
-          set(VCPKG_LIBRARY_LINKAGE static)
-          set(VCPKG_CMAKE_SYSTEM_NAME Linux)
-          set(VCPKG_ENV_PASSTHROUGH XCLANG_ROOT)
-          # xclang does not set the processor; msquic requires it. Keep ports away
-          # from the host's libatomic/libnuma, which need a newer glibc than
-          # xclang's sysroot.
-          set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DCMAKE_SYSTEM_PROCESSOR=x86_64 -DATOMIC=OFF -DNUMA=OFF)
-          set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "$ENV{XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")
-          TRIPLET
+          set -euo pipefail
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          if [ -f "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]; then
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          else
+            "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          fi
 
       - name: Cache vcpkg binaries
-        uses: actions/cache@v6
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/vcpkg/archives
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', '.github/workflows/build.yml') }}
-          restore-keys: vcpkg-${{ runner.os }}-
+          path: ${{ github.workspace }}/.vcpkg/downloads
+          key: vcpkg-protocol-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-protocol-${{ runner.os }}-
 
       - name: Configure
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=x64-linux-xclang
-          -DVCPKG_OVERLAY_TRIPLETS="$RUNNER_TEMP/triplets"
-          -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE="$XCLANG_ROOT/lib/cmake/xclang/toolchain.cmake"
+        shell: bash
+        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DHTTPANT_ENABLE_IO=OFF
 
       - name: Build
+        shell: bash
         run: cmake --build build
 
       - name: Test
+        shell: bash
         run: ctest --test-dir build --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-logs-${{ matrix.name }}
+          path: |
+            build/vcpkg-manifest-install.log
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  io:
+    name: io ${{ matrix.name }}
+    if: vars.XCLANG_URL != '' && vars.HTTPANT_TRIPLETS_URL != ''
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # IORing needs Windows 11 22H2's kernel, which a hosted runner may not
+          # have; the engine is compiled there and tested where the kernel allows.
+          - name: linux-x64
+            os: ubuntu-24.04
+            triplet: x64-linux-xclang
+            target: x86_64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-15
+            triplet: arm64-osx-xclang
+            target: aarch64-apple-darwin
+    env:
+      XCLANG_TARGET: ${{ matrix.target }}
+      VCPKG_TARGET_TRIPLET: ${{ matrix.triplet }}
+      VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fetch xclang
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ vars.XCLANG_URL }}"
+          case "$url" in
+            *.tar.zst) curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar --use-compress-program=unzstd -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *.tar.xz)  curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+            *)         curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xzf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
+          esac
+          echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
+
+      - name: Fetch the xclang triplets
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "${{ vars.HTTPANT_TRIPLETS_URL }}" "$RUNNER_TEMP/vcpkg-registry"
+          if [ -n "${{ vars.HTTPANT_TRIPLETS_REF }}" ]; then
+            git -C "$RUNNER_TEMP/vcpkg-registry" fetch --depth 1 origin "${{ vars.HTTPANT_TRIPLETS_REF }}"
+            git -C "$RUNNER_TEMP/vcpkg-registry" checkout -q FETCH_HEAD
+          fi
+          echo "VCPKG_OVERLAY_TRIPLETS=$RUNNER_TEMP/vcpkg-registry/triplets" >> "$GITHUB_ENV"
+
+      - name: Install vcpkg (latest)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$VCPKG_ROOT"
+          if [ -f "$VCPKG_ROOT/bootstrap-vcpkg.sh" ]; then
+            "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          else
+            "$VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+          fi
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.vcpkg/downloads
+          key: vcpkg-io-${{ runner.os }}-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-io-${{ runner.os }}-${{ matrix.triplet }}-
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DHTTPANT_ENABLE_IO=ON
+
+      - name: Build
+        shell: bash
+        run: cmake --build build
+
+      - name: Test
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: io-logs-${{ matrix.name }}
+          path: |
+            build/vcpkg-manifest-install.log
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
