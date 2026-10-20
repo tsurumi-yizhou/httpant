@@ -95,3 +95,42 @@ endif()
 if(BUILD_TESTING)
     httpant_find_dependency(HTTPANT_UT_TARGET ut Boost::ut)
 endif()
+
+# liburing's vcpkg port ships headers and archives without a CMake package, so
+# accept a target from the parent project first, then a package, then the
+# archive itself.
+function(httpant_find_liburing output)
+    foreach(candidate IN LISTS ARGN)
+        if(TARGET "${candidate}")
+            set(${output} "${candidate}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    find_package(unofficial-liburing CONFIG QUIET)
+    foreach(candidate IN ITEMS unofficial-liburing::uring liburing::liburing)
+        if(TARGET "${candidate}")
+            set(${output} "${candidate}" PARENT_SCOPE)
+            return()
+        endif()
+    endforeach()
+    if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+        set(prefix "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+        find_library(uring_release NAMES uring PATHS "${prefix}/lib" NO_DEFAULT_PATH)
+        find_library(uring_debug NAMES uring PATHS "${prefix}/debug/lib" NO_DEFAULT_PATH)
+        if(uring_release AND uring_debug)
+            add_library(httpant-uring STATIC IMPORTED GLOBAL)
+            set_target_properties(httpant-uring PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${prefix}/include"
+                IMPORTED_LOCATION_DEBUG "${uring_debug}"
+                IMPORTED_LOCATION_RELEASE "${uring_release}"
+                IMPORTED_LOCATION_RELWITHDEBINFO "${uring_release}"
+                IMPORTED_LOCATION_MINSIZEREL "${uring_release}")
+            set(${output} httpant-uring PARENT_SCOPE)
+            return()
+        endif()
+    endif()
+    find_library(uring_system NAMES uring REQUIRED)
+    add_library(httpant-uring SYSTEM STATIC IMPORTED GLOBAL)
+    set_target_properties(httpant-uring PROPERTIES IMPORTED_LOCATION "${uring_system}")
+    set(${output} httpant-uring PARENT_SCOPE)
+endfunction()

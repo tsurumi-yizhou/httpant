@@ -59,6 +59,32 @@ target_link_libraries(httpant-dependencies PUBLIC
     ${HTTPANT_STDEXEC_TARGET}
 )
 
+# Native I/O engine: io_uring, kqueue and IORing behind one completion interface,
+# in the httpant.io module. It depends on nothing but the standard library and
+# the platform's own API, so it is a separate target: a consumer that only wants
+# the protocol code never links it.
+add_library(httpant-io STATIC)
+target_sources(httpant-io PUBLIC FILE_SET CXX_MODULES FILES
+    modules/io/native.cppm
+)
+target_sources(httpant-io PRIVATE FILE_SET internal_modules TYPE CXX_MODULES FILES
+    modules/io/native/queue.cppm
+)
+target_link_libraries(httpant-io PUBLIC xclang::std)
+
+if(WIN32)
+    set(HTTPANT_IO_IMPLEMENTATIONS modules/io/native/ioring.cppm)
+    target_link_libraries(httpant-io PRIVATE ws2_32 kernel32)
+elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|OpenBSD|NetBSD|DragonFly)$")
+    set(HTTPANT_IO_IMPLEMENTATIONS modules/io/native/kqueue.cppm modules/io/native/posix.cppm)
+else()
+    httpant_find_liburing(HTTPANT_LIBURING_TARGET liburing::liburing uring::uring)
+    set(HTTPANT_IO_IMPLEMENTATIONS modules/io/native/uring.cppm modules/io/native/posix.cppm)
+    target_link_libraries(httpant-io PRIVATE ${HTTPANT_LIBURING_TARGET})
+endif()
+target_sources(httpant-io PRIVATE ${HTTPANT_IO_IMPLEMENTATIONS})
+set_source_files_properties(${HTTPANT_IO_IMPLEMENTATIONS} PROPERTIES LANGUAGE CXX)
+
 add_library(${PROJECT_NAME} STATIC)
 target_sources(
     ${PROJECT_NAME} PUBLIC FILE_SET CXX_MODULES FILES
@@ -117,6 +143,10 @@ if(BUILD_TESTING)
     target_link_libraries(${PROJECT_NAME}-test PRIVATE httpant-example-support ${HTTPANT_UT_TARGET})
     add_test(NAME ${PROJECT_NAME}-test COMMAND ${PROJECT_NAME}-test)
     set_tests_properties(${PROJECT_NAME}-test PROPERTIES TIMEOUT 60)
+
+    add_executable(httpant-io-test testing/native_io.cpp)
+    target_link_libraries(httpant-io-test PRIVATE httpant-io)
+    add_test(NAME httpant-io COMMAND httpant-io-test "${CMAKE_BINARY_DIR}")
 endif()
 
 if(ENABLE_EXAMPLES)
