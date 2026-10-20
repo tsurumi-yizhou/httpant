@@ -24,14 +24,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Runs instead of the build until the two variables above are set, so a
-  # skipped build leaves a visible reason rather than a grey mark.
-  explain:
-    if: vars.XCLANG_URL == ''
-    runs-on: ubuntu-24.04
-    steps:
-      - run: echo "::notice::Set XCLANG_URL to enable this build; HTTPANT_TRIPLETS_URL adds the io engine."
-
   protocol:
     name: protocol ${{ matrix.name }}
     if: vars.XCLANG_URL != ''

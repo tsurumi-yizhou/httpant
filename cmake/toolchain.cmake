@@ -9,8 +9,8 @@
 # find_package(httpant), and the vcpkg port builds with the triplet's toolchain.
 # These variables are read from the environment so a checkout stays portable
 # between machines, which is also how CI passes them.
-set(xclang_root "$ENV{XCLANG_ROOT}" CACHE PATH "xclang tree")
-set(vcpkg_root "$ENV{VCPKG_ROOT}" CACHE PATH "vcpkg checkout")
+set(XCLANG_ROOT "$ENV{XCLANG_ROOT}" CACHE PATH "xclang tree")
+set(VCPKG_ROOT "$ENV{VCPKG_ROOT}" CACHE PATH "vcpkg checkout")
 
 # Named as vcpkg and xclang read them, so they keep those spellings. The triplet
 # is optional: without one vcpkg uses its built-in default, and the xclang
@@ -38,20 +38,20 @@ if(HTTPANT_ENABLE_IO AND NOT VCPKG_TARGET_TRIPLET MATCHES "xclang")
     set(HTTPANT_ENABLE_IO OFF CACHE BOOL "" FORCE)
 endif()
 
-set(ENV{XCLANG_ROOT} "${xclang_root}")
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES vcpkg_root xclang_root XCLANG_TARGET VCPKG_TARGET_TRIPLET VCPKG_OVERLAY_TRIPLETS)
+set(ENV{XCLANG_ROOT} "${XCLANG_ROOT}")
+list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES VCPKG_ROOT XCLANG_ROOT XCLANG_TARGET VCPKG_TARGET_TRIPLET VCPKG_OVERLAY_TRIPLETS)
 
-if(NOT xclang_root)
+if(NOT XCLANG_ROOT)
     message(FATAL_ERROR "XCLANG_ROOT is not set: httpant needs an xclang tree to build C++23 modules")
 endif()
-if(NOT vcpkg_root)
+if(NOT VCPKG_ROOT)
     message(FATAL_ERROR "VCPKG_ROOT is not set: httpant's dependencies come from vcpkg")
 endif()
 
 # vcpkg chains to the xclang toolchain, which is the order that keeps both
 # generators happy: vcpkg owns the compiler and the target, xclang owns the module
 # scanning and the standard library module.
-set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${xclang_root}/lib/cmake/xclang/toolchain.cmake")
+set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${XCLANG_ROOT}/lib/cmake/xclang/toolchain.cmake")
 find_program(CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS NAMES clang-scan-deps
-    PATHS "${xclang_root}/bin" NO_DEFAULT_PATH NO_CACHE REQUIRED)
-include("${vcpkg_root}/scripts/buildsystems/vcpkg.cmake")
+    PATHS "${XCLANG_ROOT}/bin" NO_DEFAULT_PATH NO_CACHE REQUIRED)
+include("${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
