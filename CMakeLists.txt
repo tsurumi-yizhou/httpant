@@ -44,8 +44,17 @@ if(WIN32 AND (BUILD_TESTING OR ENABLE_EXAMPLES))
 endif()
 
 include(cmake/Dependencies.cmake)
+
+# Test and example dependencies. Never reached from the installed package: an
+# installed config must not re-run these, and a consumer that happens to set
+# BUILD_TESTING must not make them appear. Dependencies.cmake stays a file
+# because the installed httpant-config.cmake includes it.
 if(BUILD_TESTING OR ENABLE_EXAMPLES)
-    include(cmake/Dependencies-development.cmake)
+    httpant_find_dependency(HTTPANT_ASIO_TARGET asio asio::asio asio)
+    if(NOT TARGET OpenSSL::SSL OR NOT TARGET OpenSSL::Crypto)
+        find_package(OpenSSL REQUIRED)
+    endif()
+    httpant_find_dependency(HTTPANT_MSQUIC_TARGET msquic msquic)
 endif()
 
 # The library reaches three C libraries and the standard async model through
@@ -81,11 +90,41 @@ target_link_libraries(httpant-imports PUBLIC
 )
 add_library(httpant::imports ALIAS httpant-imports)
 
-# Native I/O engine (module httpant.io): opt-in, and its own file because it is
-# the only optional component this project builds.
+## Native I/O engine (module httpant.io)
+#
+# Opt-in: httpant's default identity is the sans-I/O protocol library, which
+# moves bytes for nobody and opens nothing. The engine depends on nothing but the
+# standard library and the platform API, so it is a separate target rather than a
+# partition of `httpant` — a consumer that only wants the protocol never links it.
 option(HTTPANT_ENABLE_IO "Build the native I/O engine (module httpant.io)" OFF)
 if(HTTPANT_ENABLE_IO)
-    include(cmake/io.cmake)
+    add_library(httpant-io STATIC)
+    target_sources(httpant-io PUBLIC FILE_SET CXX_MODULES FILES
+        modules/io/native.cppm
+    )
+    target_sources(httpant-io PRIVATE FILE_SET internal_modules TYPE CXX_MODULES FILES
+        modules/io/native/queue.cppm
+    )
+    target_link_libraries(httpant-io PUBLIC xclang::std)
+
+    # One implementation unit per mechanism, and only the one this platform uses.
+    if(WIN32)
+        set(HTTPANT_IO_MECHANISM modules/io/native/ioring.cppm)
+        target_link_libraries(httpant-io PRIVATE ws2_32 kernel32)
+    elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|OpenBSD|NetBSD|DragonFly)$")
+        set(HTTPANT_IO_MECHANISM modules/io/native/kqueue.cppm modules/io/native/posix.cppm)
+    else()
+        httpant_find_liburing(HTTPANT_LIBURING_TARGET liburing::liburing uring::uring)
+        set(HTTPANT_IO_MECHANISM modules/io/native/uring.cppm modules/io/native/posix.cppm)
+        target_link_libraries(httpant-io PRIVATE ${HTTPANT_LIBURING_TARGET})
+    endif()
+    target_sources(httpant-io PRIVATE ${HTTPANT_IO_MECHANISM})
+    set_source_files_properties(${HTTPANT_IO_MECHANISM} PROPERTIES LANGUAGE CXX)
+
+    # The two aliases are the published names; `default-io` says which mechanism the
+    # platform picked without naming it.
+    add_library(httpant::io ALIAS httpant-io)
+    add_library(httpant::default-io ALIAS httpant-io)
 endif()
 
 add_library(${PROJECT_NAME} STATIC)
