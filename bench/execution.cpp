@@ -30,30 +30,30 @@ namespace {
 using http::operator co_await;
 std::size_t consumed = 0;
 struct inline_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t(int)>;
     template <typename R> struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         R receiver;
         void start() noexcept { stdexec::set_value(std::move(receiver), 42); }
     };
     template <typename R> auto connect(R r) && -> operation<R> { return {std::move(r)}; }
 };
 struct stop_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t(), stdexec::set_stopped_t()>;
     template <typename R> struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         R receiver;
         void start() noexcept { stdexec::set_stopped(std::move(receiver)); }
     };
     template <typename R> auto connect(R r) && -> operation<R> { return {std::move(r)}; }
 };
 struct pending_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t(int), stdexec::set_stopped_t()>;
     template <typename R> struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         struct cancel {
             operation* self;
             void operator()() const noexcept { stdexec::set_stopped(std::move(self->receiver)); }
@@ -83,6 +83,11 @@ template <typename Token> struct receiver {
     void set_value(http::fetched&& result) noexcept {
         if (result.head.status != 200 || result.text() != "hello") std::abort();
         consumed += result.text().size();
+    }
+    template <http::body_stream Body>
+    void set_value(http::received<http::response, Body>&& result) noexcept {
+        if (result.head.status != 200) std::abort();
+        ++consumed;
     }
     void set_error(std::exception_ptr) noexcept { std::abort(); }
     void set_stopped() noexcept { ++consumed; }
@@ -116,11 +121,45 @@ struct memory_stream {
 };
 void http1() {
     memory_stream stream;
-    auto operation = stdexec::connect(http::execution::fetch<http::protocol_version::http1>(
-        stream, http::request{.target = "/", .scheme = "http", .authority = "localhost"}),
+    http::v1::client client{stream};
+    auto operation = stdexec::connect(http::execution::fetch(
+        client, http::request{.target = "/", .scheme = "http", .authority = "localhost"}),
         receiver<std::stop_token>{});
     stdexec::start(operation);
 }
+template <bool Facade> void request_http1() {
+    memory_stream stream;
+    stream.input = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+    http::v1::client client{stream};
+    http::buffer_body body;
+    auto operation = stdexec::connect(http::defer([&] {
+        auto head = http::request{.target = "/", .fields = {{"host", "localhost"}}};
+        if constexpr (Facade)
+            return http::coroutine::request(client, std::move(head), body);
+        else
+            return client.request(std::move(head), body);
+    }), receiver<std::stop_token>{});
+    stdexec::start(operation);
+}
+
+// A forwarding coroutine is the control for the frame-adopting facade.
+template <typename Client>
+auto forwarded_fetch(Client& client, http::request head) -> http::task<http::fetched> {
+    co_return co_await http::coroutine::fetch(client, std::move(head));
+}
+template <bool Forwarding> void coroutine_http1() {
+    memory_stream stream;
+    http::v1::client client{stream};
+    auto operation = stdexec::connect(http::defer([&] {
+        auto head = http::request{.target = "/", .scheme = "http", .authority = "localhost"};
+        if constexpr (Forwarding)
+            return forwarded_fetch(client, std::move(head));
+        else
+            return http::coroutine::fetch(client, std::move(head));
+    }), receiver<std::stop_token>{});
+    stdexec::start(operation);
+}
+
 template <typename F> void measure(std::string_view mode, std::size_t n, F operation) {
     auto cold_calls = calls.load(), cold_bytes = requested_bytes.load(), cold_live = live_bytes.load();
     auto begin = std::chrono::steady_clock::now();
@@ -145,7 +184,12 @@ int main(int argc, char** argv) {
     std::string_view mode = argc > 1 ? argv[1] : "await";
     std::size_t n = argc > 2 ? std::stoul(argv[2]) : 100000;
     if (mode == "http1") measure(mode, n, [] { http1(); });
+    else if (mode == "request-facade") measure(mode, n, [] { request_http1<true>(); });
+    else if (mode == "request-member") measure(mode, n, [] { request_http1<false>(); });
+    else if (mode == "http1-coroutine") measure(mode, n, [] { coroutine_http1<false>(); });
+    else if (mode == "http1-forwarded") measure(mode, n, [] { coroutine_http1<true>(); });
     else if (mode == "await") measure(mode, n, [] { invoke(std::stop_token{}, normal); });
+    else if (mode == "inplace-empty") measure(mode, n, [] { invoke(stdexec::inplace_stop_token{}, normal); });
     else if (mode == "std") {
         std::stop_source source;
         measure(mode, n, [&] { invoke(source.get_token(), normal); });
