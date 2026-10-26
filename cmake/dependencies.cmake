@@ -15,13 +15,17 @@ find_package(nghttp3 CONFIG REQUIRED)
 # package, so their targets are built by hand. IMPORTED_LOCATION is the
 # single-config default and the per-config entries are what multi-config
 # generators read; setting only one of them breaks a configure that has no
-# CMAKE_BUILD_TYPE.
+# CMAKE_BUILD_TYPE. A release-only triplet has no debug archive, so Debug links
+# the release one.
 function(httpant_import_library TARGET LIBRARY)
   set(PREFIX "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
   find_library(RELEASE_LIBRARY NAMES "${LIBRARY}" PATHS "${PREFIX}/lib"
     NO_DEFAULT_PATH NO_CACHE REQUIRED)
   find_library(DEBUG_LIBRARY NAMES "${LIBRARY}" PATHS "${PREFIX}/debug/lib"
-    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+    NO_DEFAULT_PATH NO_CACHE)
+  if(NOT DEBUG_LIBRARY)
+    set(DEBUG_LIBRARY "${RELEASE_LIBRARY}")
+  endif()
   add_library(${TARGET} STATIC IMPORTED GLOBAL)
   set_target_properties(${TARGET} PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${PREFIX}/include"
