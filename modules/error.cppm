@@ -5,16 +5,10 @@ import :message;
 
 export namespace http {
 
-enum class protocol_version : std::uint8_t {
-    http1 = 1,
-    http2 = 2,
-    http3 = 3,
-};
-
 // RFC 9113 §5.4 — "HTTP/2 framing permits two classes of errors" —
 // connection errors and errors in an individual stream are represented
 // separately; message and implementation scopes cover library-side failures
-// that do not themselves define an HTTP/2 or HTTP/3 wire action.
+// that do not themselves define a protocol action.
 enum class error_scope : std::uint8_t {
     message,
     stream,
@@ -34,47 +28,39 @@ enum class error_condition : std::uint16_t {
     library_failure,
 };
 
+// RFC 9114 §8.1 — "The following error codes are defined for use when abruptly
+// terminating streams, aborting reading of streams, or immediately closing
+// HTTP/3 connections"; the codes live in one 62-bit space (Section 11.2.3).
+// That space is the library's only error-code space: an engine submits the low
+// bits its own frame format defines (RST_STREAM and GOAWAY take 32 of them), and
+// nothing re-checks a code against a protocol — the engine's type already says
+// which protocol it is. HTTP/1.1 has no integer error code at all.
+using error_code = std::uint64_t;
+
 // error_info describes what happened. The wire action the RFCs require is a
 // separate concept (protocol_action) so a protocol error never has to guess
 // its protocol's error semantics from a raw integer.
 struct error_info {
-    protocol_version version;
+    // Written by protocol_error's constructor when the action implies a scope,
+    // and kept as given when the failure has no protocol action of its own.
     error_scope scope;
     error_condition condition;
     std::optional<std::uint64_t> exchange_identity;
     // Backend library return codes are diagnostic values in the separate
     // library_code field and must never be reinterpreted as wire codes.
     std::optional<int> library_code;
-    bool retryable;
 };
 
-// RFC 9113 §7 — "Error codes are 32-bit fields that are used in RST_STREAM and
-// GOAWAY frames to convey the reasons for the stream or connection error."
-// HTTP/2 wire error codes live in their own 32-bit space.
-namespace v2 {
-
-struct error_code {
-    std::uint32_t value;
-};
-
-} // namespace v2
-
-// RFC 9114 §8.1 — "The following error codes are defined for use when abruptly
-// terminating streams, aborting reading of streams, or immediately closing
-// HTTP/3 connections." HTTP/3 application error codes live in the 62-bit
-// registry managed by Section 11.2.3.
-namespace v3 {
-
-struct error_code {
-    std::uint64_t value;
-};
-
-} // namespace v3
-
-// The protocol code algebra is type-safe: HTTP/2 and HTTP/3 codes belong to
-// different spaces and cannot be interchanged, and HTTP/1.1 has no integer
-// error code at all, so no protocol_code exists for it.
-using protocol_code = std::variant<v2::error_code, v3::error_code>;
+// Whether repeating the request on a new exchange can succeed. RFC 9114
+// §4.1.1 — a request whose stream was reset "MAY be retried... on a new
+// stream"; RFC 9113 §6.8 — a stream above the peer's GOAWAY last-stream-id was
+// not processed. Whether a retry is appropriate for a non-idempotent request
+// is the caller's decision; this only reports what the protocol said about the
+// exchange.
+[[nodiscard]] constexpr auto retryable(const error_info& info) noexcept -> bool {
+    return info.condition == error_condition::goaway_rejected ||
+           info.condition == error_condition::stream_reset;
+}
 
 // ─── RFC-required wire actions ──────────────────────────────
 
@@ -84,84 +70,51 @@ struct no_action {};
 
 // RFC 9113 §5.4.2 — "An endpoint that detects a stream error sends a RST_STREAM
 // frame (Section 6.4) that contains the stream identifier of the stream where
-// the error occurred" — and RFC 9114 §8 — "QUIC allows the application to
-// abruptly terminate (reset) that stream and communicate a reason." The code
-// must belong to the protocol's own error space.
+// the error occurred" — and RFC 9114 §4.1.2 — a reset terminates one stream and
+// "communicates a reason" as an application error code. A reset is stream
+// scoped by definition.
 struct reset_stream {
-    protocol_code code;
+    error_code code;
 };
 
 // RFC 9113 §5.4.1 — "An endpoint that encounters a connection error SHOULD
-// first send a GOAWAY frame ... with an error code (Section 7)"; RFC 9114 §8 —
+// first send a GOAWAY frame ... with an error code (Section 7)"; RFC 9114 §5.2 —
 // "terminate the QUIC connection ... using an error code from Section 8.1";
 // RFC 9112 §6.3 — an incomplete message requires closing the connection, and
 // RFC 9112 §3.2 / §6.3 — after a malformed request the server answers 400
 // (which the HTTP/1.1 server writes itself) and then closes the connection.
-// HTTP/1.1 has no integer error code, so code is empty for it.
+// HTTP/1.1 has no integer error code, so code is empty for it. A close is
+// connection scoped by definition.
 struct close_connection {
-    std::optional<protocol_code> code;
+    std::optional<error_code> code;
 };
 
 using protocol_action = std::variant<no_action, reset_stream, close_connection>;
 
-namespace detail {
-
-template <typename... Ts>
-struct overloaded : Ts... {
-    using Ts::operator()...;
-};
-template <typename... Ts>
-overloaded(Ts...) -> overloaded<Ts...>;
-
-// Construction-time invariants, enforced in one place so protocol
-// implementations cannot attach a mismatched version, scope, or code.
-inline void validate_action(const error_info& info, const protocol_action& action) {
-    // An HTTP/2 code is only meaningful for an HTTP/2 failure and an HTTP/3
-    // code only for an HTTP/3 failure; HTTP/1.1 has no integer error code.
-    auto require_code_version = [&](const protocol_code& code) {
-        std::visit(overloaded{
-            [&](const v2::error_code&) {
-                if (info.version != protocol_version::http2)
-                    throw std::invalid_argument("v2::error_code requires protocol_version::http2");
-            },
-            [&](const v3::error_code&) {
-                if (info.version != protocol_version::http3)
-                    throw std::invalid_argument("v3::error_code requires protocol_version::http3");
-            },
-        }, code);
-    };
-    std::visit(overloaded{
-        [&](const no_action&) {},
-        [&](const reset_stream& reset) {
-            // RFC 9113 §5.4.2 / RFC 9114 §8 — a stream reset terminates one
-            // stream; it is only meaningful at stream scope.
-            if (info.scope != error_scope::stream)
-                throw std::invalid_argument("reset_stream requires stream scope");
-            require_code_version(reset.code);
-        },
-        [&](const close_connection& close) {
-            // RFC 9113 §5.4.1 / RFC 9114 §8 — closing the connection is only
-            // meaningful at connection scope; a message or stream failure
-            // has its own narrower action.
-            if (info.scope != error_scope::connection)
-                throw std::invalid_argument("close_connection requires connection scope");
-            if (close.code)
-                require_code_version(*close.code);
-            else if (info.version != protocol_version::http1)
-                throw std::invalid_argument("http2/http3 connection close requires a protocol code");
-        },
-    }, action);
-}
-
-} // namespace detail
-
 class protocol_error final : public std::runtime_error {
 public:
-    protocol_error(error_info info, protocol_action action, std::string message)
+    // The action decides the scope, so no construction site can hand a stream
+    // reset a connection scope (or the reverse): the type of the action is the
+    // invariant. no_action keeps the scope the failure names, since a failure
+    // with no protocol action still knows whether it affected one message, one
+    // stream or the connection.
+    protocol_error(error_info info, no_action, std::string message)
         : std::runtime_error(std::move(message)),
-          info_(std::move(info)),
-          action_(std::move(action)) {
-        detail::validate_action(info_, action_);
+          info_(info),
+          action_(no_action{}) {}
+
+    protocol_error(error_info info, reset_stream action, std::string message)
+        : std::runtime_error(std::move(message)),
+          info_(info),
+          action_(action) {
+        info_.scope = error_scope::stream;
+    }
+
+    protocol_error(error_info info, close_connection action, std::string message)
+        : std::runtime_error(std::move(message)),
+          info_(info),
+          action_(action) {
+        info_.scope = error_scope::connection;
     }
 
     [[nodiscard]] auto info() const noexcept -> const error_info& {

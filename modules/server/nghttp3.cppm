@@ -13,9 +13,13 @@ import :endpoint.nghttp3;
 
 export namespace http::v3 {
 
-template <stream_factory S>
+template <stream_factory S, template <class> class Queue = http::queues::local>
 class server {
 public:
+    // The prefix every local-misuse message of this engine starts with; the
+    // exchange token reads it from the server type that minted it.
+    static constexpr std::string_view message_prefix = error_prefix.view();
+
     explicit server(S& transport, configuration config = {})
         : transport_(transport),
           conn_(detail::create_connection(
@@ -27,21 +31,21 @@ public:
 
     // The token's engine payload: the request stream record. The shared core
     // has the owning-server pointer, so a token minted by one connection
-    // cannot be used to respond on another (checked in operation_respond).
+    // cannot be used to respond on another (checked in respond).
     using exchange_token =
-        http::detail::exchange_token<server, std::shared_ptr<detail::stream_data>>;
-    using incoming_request = http::detail::incoming_request<body_reader<S>, exchange_token>;
+        http::detail::exchange_token<server, std::shared_ptr<detail::stream_data<Queue>>>;
+    using incoming_request = http::detail::incoming_request<body_reader<S, Queue>, exchange_token>;
 
     // RFC 9114 §6.2.1 — "Each side MUST initiate a single control stream at
     // the beginning of the connection and send its SETTINGS frame as the first
     // frame on this stream." See client::start for the stream-factory
     // driven creation of the control/QPACK unidirectional streams.
-private:
+public:
     // RFC 9114 §4.1 — "A server sends ... responses on the same stream as the
     // request"; the opaque move-only token holds that association atomically
     // with the completed request. Suspends until the endpoint driver has
     // completed the next request stream (headers + request body + FIN).
-    auto operation_receive() -> http::task<incoming_request> {
+    auto receive() -> http::detail::operation<incoming_request> {
         for (;;) {
             // RFC 9114 §8 — once the connection has failed, every server
             // operation surfaces the typed connection error instead of
@@ -70,22 +74,19 @@ private:
         ctx_.core.receive_queue_pop();
         // A stream reset between header completion and delivery must not be
         // handed to the application as if it were live: fail it exactly like
-        // the client-side aborted-stream path in operation_request.
+        // the client-side aborted-stream path in request.
         if (stream->core.aborted) {
             if (stream->close_error_code != 0) {
                 // RFC 9114 §8 — "QUIC allows the application to abruptly
                 // terminate (reset) that stream and communicate a reason."
                 throw protocol_error{
                     error_info{
-                        .version = protocol_version::http3,
-                        .scope = error_scope::stream,
                         .condition = error_condition::stream_reset,
                         .exchange_identity =
                             static_cast<std::uint64_t>(stream->core.id),
                         .library_code = std::nullopt,
-                        .retryable = false,
                     },
-                    reset_stream{error_code{stream->close_error_code}},
+                    reset_stream{stream->close_error_code},
                     std::format("http/3: request stream aborted (0x{:x})",
                                 stream->close_error_code)};
             }
@@ -99,7 +100,10 @@ private:
             throw std::logic_error(
                 "http/3: completed request stream has no transport handle");
         auto head = http::request{
-            .method = *http::method::parse(stream->core.decoded.method_token),
+            // The parse layer admits a request stream into the receive queue
+            // only after it saw a representable :method (see decoded_fields),
+            // so the delivered method is already validated.
+            .method = *stream->core.decoded.method,
             .target = std::move(stream->core.decoded.path),
             .scheme = std::move(stream->core.decoded.scheme),
             .authority = std::move(stream->core.decoded.authority),
@@ -107,32 +111,24 @@ private:
         };
         co_return incoming_request{
             .head = std::move(head),
-            .body = body_reader<S>{
+            .body = body_reader<S, Queue>{
                 stream, transport->second, ctx_},
             .token = exchange_token{*this, stream},
         };
     }
 
     template <body_stream Body>
-    auto operation_respond(
+    auto respond(
         exchange_token token,
         http::response res,
-        Body& body) -> task<void> {
+        Body& body) -> http::detail::operation<void> {
         if (!token.valid())
             throw usage_error("http/3: invalid exchange token");
         // A token minted by another server must not respond on this
         // connection; responding consumes the token (the stream handle moves
         // out), so a second respond with the same token fails the check above.
-        token.check_owner(*this, "http/3: ");
+        token.check_owner(*this);
         auto stream = token.take_handle();
-        // RFC 9110 §15 — "All valid status codes are within the range of 100
-        // to 599, inclusive." — an out-of-range status would be emitted as an
-        // invalid ':status' value (RFC 9114 §4.3.2 — "This pseudo-header
-        // field MUST be included in all responses ... otherwise, the response
-        // is malformed"), so the send path rejects it locally before any
-        // frame is submitted, mirroring the inbound parse_status check.
-        if (res.status < 100 || res.status > 599)
-            throw usage_error("http/3: response status outside 100-599");
         if (ctx_.core.connection_error)
             std::rethrow_exception(ctx_.core.connection_error);
         auto stream_id = stream->core.id;
@@ -146,29 +142,34 @@ private:
         // DATA frames, so such a response ends at the header section: the
         // body is dropped and the outbound body is already at eof, which
         // submits no data reader and emits no DATA frames.
-        auto request_method = *http::method::parse(stream->core.decoded.method_token);
+        auto request_method = *stream->core.decoded.method;
         auto allows_body = http::response_has_body(request_method, res.status);
 
-        auto nva = detail::nv_block{res.fields.size() + 1};
-        nva.push(":status", std::to_string(res.status));
-        for (auto& h : res.fields) nva.push(h.name, h.value);
+        std::array<char, 3> status;
+        auto* status_end = std::to_chars(status.data(), status.data() + status.size(), res.status.code()).ptr;
+        std::vector<nghttp3_nv> nva;
+        nva.reserve(res.fields.size() + 1);
+        nva.push_back(detail::make_nv(":status", {status.data(), status_end}));
+        for (const auto& field : res.fields) nva.push_back(detail::make_nv(field.name, field.value));
         detail::check_outbound_field_section(ctx_, nva);
 
-        auto outbound_body = std::make_shared<detail::outbound_body_state>();
+        auto outbound_body = std::make_shared<detail::outbound_body_state<Queue>>();
         // Only the outbound-body registration is new here: the stream state
         // belongs to the received exchange, so the guard must not touch it.
-        detail::exchange_registration<typename detail::endpoint_runtime<S>::stream_map>
+        detail::exchange_registration<typename detail::endpoint_runtime<S, Queue>::stream_map, Queue>
             guard{ctx_, conn_.get(), stream_id};
         if (allows_body)
             co_await detail::fill_outbound_body(body, *outbound_body);
         else
             outbound_body->eof = true;
-        nghttp3_data_reader reader{.read_data = &detail::read_outbound_body};
+        nghttp3_data_reader reader{.read_data = &detail::read_outbound_body<Queue>};
         detail::check(nghttp3_conn_submit_response(conn_.get(), stream_id,
-            nva.fields.data(), nva.fields.size(),
+            nva.data(), nva.size(),
             outbound_body->eof ? nullptr : &reader), "submit_response");
+        // Registered even without content: the FIN acknowledgement and the
+        // stream's end reach the exchange through it.
+        ctx_.core.outbound_bodies[stream_id] = outbound_body;
         if (!outbound_body->eof) {
-            ctx_.core.outbound_bodies[stream_id] = outbound_body;
             // RFC 9114 §4.1 — response content is sent as DATA frames on the
             // request stream; nghttp3's data callback therefore needs the body
             // state bound to that exact stream.
@@ -177,34 +178,28 @@ private:
         }
         co_await detail::pump_outbound_body(
             body, *outbound_body, stream_id, conn_.get(), runtime_);
+        // The response is out once the peer acknowledges its FIN: closing
+        // the connection earlier would discard what the peer has not received.
+        // A stream or connection that ends first ends the exchange too; the
+        // peer may well have read the response before closing.
+        co_await http::detail::park_until{outbound_body->ack_waiter, [this, &outbound_body] {
+            return outbound_body->finished || ctx_.core.connection_error;
+        }};
         ctx_.core.outbound_bodies.erase(stream_id);
         guard.disarm();
     }
 
-    friend auto operation_start(server& endpoint) -> task<void> {
-        return endpoint.runtime_.start();
+    auto start() -> http::detail::operation<void> {
+        return runtime_.start();
     }
 
-    friend auto operation_close(server& endpoint) -> task<void> {
-        return endpoint.runtime_.close();
-    }
-
-    friend auto operation_receive(server& endpoint) -> task<incoming_request> {
-        return endpoint.operation_receive();
-    }
-
-    template <body_stream Body>
-    friend auto operation_respond(
-        server& endpoint,
-        exchange_token token,
-        http::response head,
-        Body& body) -> task<void> {
-        return endpoint.operation_respond(std::move(token), std::move(head), body);
+    auto close() -> http::detail::operation<void> {
+        return runtime_.close();
     }
 
 public:
-    auto shutdown() -> task<void> {
-        co_await runtime_.shutdown();
+    auto shutdown() -> http::detail::operation<void> {
+        return runtime_.shutdown();
     }
 
     [[nodiscard]] auto goaway_received() const -> bool { return ctx_.core.goaway_received; }
@@ -215,10 +210,10 @@ public:
 
 private:
     S& transport_;
-    detail::conn_context ctx_{};
+    detail::conn_context<Queue> ctx_{};
     detail::connection_handle conn_{};
-    typename detail::endpoint_runtime<S>::stream_map open_streams_{};
-    detail::endpoint_runtime<S> runtime_;
+    typename detail::endpoint_runtime<S, Queue>::stream_map open_streams_{};
+    detail::endpoint_runtime<S, Queue> runtime_;
 };
 
 } // namespace http::v3

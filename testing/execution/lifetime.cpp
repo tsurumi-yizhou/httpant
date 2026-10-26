@@ -17,12 +17,12 @@ struct failing_open_factory : recording_stream_factory {
 };
 struct failing_scoped_endpoint {
     int closes{0};
-    friend auto operation_start(failing_scoped_endpoint&) -> http::task<void> {
+    auto start() -> http::task<void> {
         throw std::runtime_error("start failed");
         co_return;
     }
-    friend auto operation_close(failing_scoped_endpoint& e) -> http::task<void> {
-        ++e.closes;
+    auto close() -> http::task<void> {
+        ++closes;
         co_return;
     }
 };

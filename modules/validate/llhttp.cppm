@@ -7,6 +7,9 @@ import :error;
 
 export namespace http::v1 {
 
+// The engine's diagnostic prefix: the one place the string lives.
+inline constexpr literal error_prefix{"http/1.1: "};
+
 namespace detail {
 
 // Transport reads and body staging use one fixed buffer size per parser /
@@ -73,10 +76,15 @@ struct parser_state {
     // (RFC 9110 §9.3.8).
     std::uint64_t content_length{0};
     bool chunked{false};
-    http::status status_code{0};
+    http::status status_code{};
+    // llhttp frames any three-digit status; one outside the RFC 9110 §15 range
+    // is recorded here instead of in the typed field, which cannot hold it.
+    bool status_overflow{false};
     http::method req_method{method::GET};
     headers fields{};
     http::detail::byte_cursor body{};
+    std::span<std::byte> body_output{};
+    std::size_t body_written{0};
 };
 
 // RFC 9110 §5.5 — "A field value might be preceded and/or followed by
@@ -89,8 +97,8 @@ struct parser_state {
     return token;
 }
 
-// The 100-599 status bound lives in :message (http::detail::is_valid_status),
-// shared by all three protocol versions' send and receive paths.
+// The 100-599 status bound is http::status itself (see :message): a status
+// value cannot exist outside it, so no path here re-checks the range.
 
 // RFC 9110 §10.1.1 — "The only expectation defined by this specification is
 // \"100-continue\" (with no defined parameters)." Returns whether an Expect
@@ -150,12 +158,10 @@ inline void validate_transfer_encoding(const headers& fields) {
 inline auto protocol_violation(std::string message) -> protocol_error {
     return protocol_error{
         error_info{
-            .version = protocol_version::http1,
             .scope = error_scope::message,
             .condition = error_condition::malformed_message,
             .exchange_identity = std::nullopt,
             .library_code = std::nullopt,
-            .retryable = false,
         },
         no_action{},
         std::move(message)};

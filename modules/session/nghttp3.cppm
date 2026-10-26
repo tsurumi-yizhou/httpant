@@ -9,6 +9,10 @@ import :session.core;
 
 export namespace http::v3 {
 
+// The engine's diagnostic prefix: the one place the string lives. The builders
+// below take it as a template argument, so no call can pass the wrong one.
+inline constexpr literal error_prefix{"http/3: "};
+
 // RFC 9000 §16 — QUIC variable-length integers encode at most 62 bits.
 inline constexpr std::uint64_t maximum_varint =
     (std::uint64_t{1} << 62) - 1;
@@ -67,12 +71,10 @@ enum class stream_kind {
 inline auto make_error(std::string_view op, int rc) -> protocol_error {
     return protocol_error{
         error_info{
-            .version = protocol_version::http3,
             .scope = error_scope::implementation,
             .condition = error_condition::library_failure,
             .exchange_identity = std::nullopt,
             .library_code = rc,
-            .retryable = false,
         },
         no_action{},
         std::format("http/3: {} failed ({})", op, rc)};
@@ -82,21 +84,26 @@ inline void check(int rc, std::string_view op) {
     if (rc != 0) throw make_error(op, rc);
 }
 
+template <template <class> class Queue = http::queues::local>
 struct stream_data {
-    http::detail::stream_state_core<std::int64_t> core{};
-    std::deque<std::vector<std::byte>> body{};
+    http::detail::stream_state_core<std::int64_t, Queue> core{};
+    http::queues::buffer<std::vector<std::byte>, Queue> body{};
     std::size_t body_offset{0};
     std::size_t buffered_body_size{0};
     std::uint64_t field_section_size{0};
     std::uint64_t close_error_code{0};
 };
 
+template <template <class> class Queue = http::queues::local>
 struct outbound_body_state {
     std::vector<std::byte> data{};
     std::size_t acknowledged{0};
     bool offered{false};
     bool eof{false};
-    http::detail::waiter_slot ack_waiter{};
+    // The sending side is over: the peer acknowledged the FIN, or the
+    // stream or connection ended first.
+    bool finished{false};
+    http::detail::waiter_slot<Queue> ack_waiter{};
 
     void resume_ack_waiter() noexcept {
         ack_waiter.resume();
@@ -105,7 +112,7 @@ struct outbound_body_state {
 
 // serialize/nghttp3.cppm's outbound pump takes endpoint_runtime<S>&; the
 // definition lives in endpoint/nghttp3.cppm, which imports this partition.
-template <stream_factory S>
+template <stream_factory S, template <class> class Queue = http::queues::local>
 class endpoint_runtime;
 
 struct stream_input_state {
@@ -115,15 +122,18 @@ struct stream_input_state {
     std::uint64_t stream_type{0};
     std::vector<std::byte> buffer{};
     bool closed{false};
+    bool fin_acknowledged{false};
+    bool finished{false};
 };
 
+template <template <class> class Queue = http::queues::local>
 struct conn_context {
-    http::detail::connection_core<std::int64_t, stream_data, outbound_body_state> core{};
+    http::detail::connection_core<std::int64_t, stream_data<Queue>, outbound_body_state<Queue>, Queue> core{};
     // RFC 9114 §8 — stream-scoped failures of server request streams (e.g. a
     // malformed request, H3_MESSAGE_ERROR) are delivered to receive() one at
     // a time instead of failing the connection; the connection and its other
     // exchanges keep running.
-    std::deque<std::exception_ptr> server_stream_failures{};
+    http::queues::buffer<std::exception_ptr, Queue> server_stream_failures{};
 
     bool is_client{false};
     std::int64_t local_control_stream_id{-1};
@@ -161,9 +171,10 @@ struct conn_context {
 // nghttp3_conn_shutdown requires the control stream to be bound first
 // (asserted inside the library), so it is only invoked once handshake has
 // bound it.
-inline void record_connection_error(conn_context& ctx, nghttp3_conn* conn, std::uint64_t wire_code) {
+template <template <class> class Queue>
+inline void record_connection_error(conn_context<Queue>& ctx, nghttp3_conn* conn, std::uint64_t code) {
     if (ctx.connection_error_code == 0)
-        ctx.connection_error_code = wire_code;
+        ctx.connection_error_code = code;
     if (conn != nullptr && ctx.local_control_stream_id >= 0)
         static_cast<void>(nghttp3_conn_shutdown(conn));
 }
@@ -173,11 +184,12 @@ inline void record_connection_error(conn_context& ctx, nghttp3_conn* conn, std::
 // reason ... This is referred to as a 'stream error'." Stream errors are
 // signaled with the QUIC stream reset with the H3 error code from
 // Section 8.1; nghttp3 models this as nghttp3_conn_close_stream.
-inline void record_stream_error(conn_context& ctx, nghttp3_conn* conn, std::int64_t stream_id, std::uint64_t wire_code) {
+template <template <class> class Queue>
+inline void record_stream_error(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t stream_id, std::uint64_t code) {
     if (auto it = ctx.core.streams.find(stream_id); it != ctx.core.streams.end())
-        it->second->close_error_code = wire_code;
+        it->second->close_error_code = code;
     if (conn != nullptr)
-        static_cast<void>(nghttp3_conn_close_stream(conn, stream_id, wire_code));
+        static_cast<void>(nghttp3_conn_close_stream(conn, stream_id, code));
 }
 
 // Marks an outbound body terminal and wakes its ACK waiter. A
@@ -186,18 +198,21 @@ inline void record_stream_error(conn_context& ctx, nghttp3_conn* conn, std::int6
 // flush_output) so it co_returns instead of re-parking on a state the map no
 // longer holds, which nothing would ever resume again. The caller then
 // surfaces the stream/connection error as it already does.
-inline void terminate_outbound_body(outbound_body_state& body) {
+template <template <class> class Queue>
+inline void terminate_outbound_body(outbound_body_state<Queue>& body) {
     body.data.clear();
     body.acknowledged = 0;
     body.offered = false;
     body.eof = true;
+    body.finished = true;
     body.resume_ack_waiter();
 }
 
 // Marks a stream terminal and wakes its waiters. Used for streams the peer
 // reset before nghttp3 ever saw them, where nghttp3_conn_close_stream cannot
 // deliver the stream_close callback.
-inline void mark_stream_closed(conn_context& ctx, std::int64_t stream_id, std::uint64_t app_error_code) {
+template <template <class> class Queue>
+inline void mark_stream_closed(conn_context<Queue>& ctx, std::int64_t stream_id, std::uint64_t app_error_code) {
     if (auto it = ctx.core.streams.find(stream_id); it != ctx.core.streams.end()) {
         auto& stream = *it->second;
         stream.close_error_code = app_error_code;
@@ -206,7 +221,7 @@ inline void mark_stream_closed(conn_context& ctx, std::int64_t stream_id, std::u
         // completion that raced a close wins (end_stream is the message's
         // final signal).
         stream.core.aborted = !stream.core.complete;
-        http::detail::wake_stream_conditions(stream.core, false, false, false);
+        http::detail::wake_stream_conditions(stream.core, false, false, false, false);
     }
     if (auto it = ctx.core.outbound_bodies.find(stream_id); it != ctx.core.outbound_bodies.end()) {
         // Erase before resuming: terminate_outbound_body resumes the
@@ -228,9 +243,9 @@ inline void mark_stream_closed(conn_context& ctx, std::int64_t stream_id, std::u
 // closes it at the sole protocol owner (mirroring the reset paths, RFC 9114
 // §8) so a late peer frame cannot recreate the erased state through
 // begin_headers. The original exception propagates unchanged.
-template <typename StreamMap>
+template <typename StreamMap, template <class> class Queue>
 struct exchange_registration {
-    conn_context& ctx;
+    conn_context<Queue>& ctx;
     nghttp3_conn* conn;
     StreamMap* open_streams{nullptr};
     std::int64_t stream_id{0};
@@ -238,7 +253,7 @@ struct exchange_registration {
     bool armed{true};
 
     explicit exchange_registration(
-        conn_context& context,
+        conn_context<Queue>& context,
         nghttp3_conn* connection,
         std::int64_t id,
         StreamMap* streams = nullptr)
@@ -268,19 +283,16 @@ struct exchange_registration {
 // same code. Because the library performs no I/O, the actual QUIC close is the
 // transport's job; the action is delivered to the caller through the typed
 // exception instead of a polled accessor.
-inline auto make_frame_error(conn_context& ctx, nghttp3_conn* conn, std::uint64_t wire_code, std::string_view detail) -> protocol_error {
-    record_connection_error(ctx, conn, wire_code);
-    return http::detail::make_protocol_error(
+template <template <class> class Queue>
+inline auto make_frame_error(conn_context<Queue>& ctx, nghttp3_conn* conn, std::uint64_t code, std::string_view detail) -> protocol_error {
+    record_connection_error(ctx, conn, code);
+    return http::detail::make_protocol_error<error_prefix>(
         error_info{
-            .version = protocol_version::http3,
-            .scope = error_scope::connection,
             .condition = error_condition::malformed_frame,
             .exchange_identity = std::nullopt,
             .library_code = std::nullopt,
-            .retryable = false,
         },
-        close_connection{error_code{wire_code}},
-        "http/3: ",
+        close_connection{code},
         detail);
 }
 
@@ -290,8 +302,7 @@ inline auto make_frame_error(conn_context& ctx, nghttp3_conn* conn, std::uint64_
 inline auto make_goaway_rejection(std::optional<std::uint64_t> exchange)
     -> protocol_error
 {
-    return http::detail::make_goaway_rejection(
-        protocol_version::http3, exchange, "http/3: ");
+    return http::detail::make_goaway_rejection<error_prefix>(exchange);
 }
 
 // The peer closed a stream cleanly before its message was complete; the
@@ -301,12 +312,10 @@ inline auto make_incomplete_close(std::int64_t stream_id, std::string message)
 {
     return protocol_error{
         error_info{
-            .version = protocol_version::http3,
             .scope = error_scope::stream,
             .condition = error_condition::peer_closed,
             .exchange_identity = static_cast<std::uint64_t>(stream_id),
             .library_code = std::nullopt,
-            .retryable = false,
         },
         no_action{},
         std::move(message)};
@@ -321,7 +330,8 @@ inline auto make_incomplete_close(std::int64_t stream_id, std::string message)
 // receive-only stream has a unidirectional stream header (RFC 9114 §6.2);
 // a bidirectional stream is a request stream, which only a server may receive.
 // An accepted send-only stream violates the stream_accepting contract.
-inline auto accepted_stream_is_unidirectional(conn_context& ctx, nghttp3_conn* conn, stream_access access) -> bool {
+template <template <class> class Queue>
+inline auto accepted_stream_is_unidirectional(conn_context<Queue>& ctx, nghttp3_conn* conn, stream_access access) -> bool {
     switch (access) {
         case stream_access::receive_only:
             return true;
@@ -338,29 +348,26 @@ inline auto accepted_stream_is_unidirectional(conn_context& ctx, nghttp3_conn* c
 // RFC 9114 §4.1.2 — "Malformed requests or responses that are detected MUST
 // be treated as a stream error of type H3_MESSAGE_ERROR." Records the stream
 // error (reset at the sole nghttp3 owner) and returns the typed stream-scoped
-// failure. |wire_code| is the H3 application error code the stream is reset
+// failure. |code| is the H3 application error code the stream is reset
 // with — H3_MESSAGE_ERROR for malformed messages, H3_REQUEST_INCOMPLETE for a
 // request stream that terminated without a complete request (RFC 9114 §4.1).
 // |liberr| is the nghttp3 library code when the malformed message was
 // detected by nghttp3 itself, and nullopt when the library's own validation
 // (RFC 9110 §15 status range, local frame truncation) rejected the message.
-inline auto make_stream_message_error(conn_context& ctx, nghttp3_conn* conn,
+template <template <class> class Queue>
+inline auto make_stream_message_error(conn_context<Queue>& ctx, nghttp3_conn* conn,
                                       std::int64_t stream_id,
-                                      std::uint64_t wire_code,
+                                      std::uint64_t code,
                                       std::optional<int> liberr,
                                       std::string_view detail) -> protocol_error {
-    record_stream_error(ctx, conn, stream_id, wire_code);
-    return http::detail::make_protocol_error(
+    record_stream_error(ctx, conn, stream_id, code);
+    return http::detail::make_protocol_error<error_prefix>(
         error_info{
-            .version = protocol_version::http3,
-            .scope = error_scope::stream,
             .condition = error_condition::malformed_message,
             .exchange_identity = static_cast<std::uint64_t>(stream_id),
             .library_code = liberr,
-            .retryable = false,
         },
-        reset_stream{error_code{wire_code}},
-        "http/3: ",
+        reset_stream{code},
         detail);
 }
 
@@ -378,7 +385,8 @@ inline auto make_stream_message_error(conn_context& ctx, nghttp3_conn* conn,
 // H3_FRAME_ERROR" — makes a connection error; see process_request_stream.
 // nghttp3 reports the frame-boundary case as H3_FRAME_UNEXPECTED (FIN before
 // any frame starts) and the truncated-frame case as H3_FRAME_ERROR.
-inline auto make_incomplete_message_error(conn_context& ctx, nghttp3_conn* conn,
+template <template <class> class Queue>
+inline auto make_incomplete_message_error(conn_context<Queue>& ctx, nghttp3_conn* conn,
                                           std::int64_t stream_id,
                                           int liberr) -> protocol_error {
     return make_stream_message_error(
@@ -392,7 +400,8 @@ inline auto make_incomplete_message_error(conn_context& ctx, nghttp3_conn* conn,
 // Marks every in-flight stream aborted, records the failure, and wakes all
 // waiters so no operation hangs once the driver has stopped. The stream_factory
 // concept requires driver and reader completions to resume serially.
-inline void fail_connection(conn_context& ctx, std::exception_ptr failure) {
+template <template <class> class Queue>
+inline void fail_connection(conn_context<Queue>& ctx, std::exception_ptr failure) {
     if (ctx.core.connection_error)
         return;
     for (auto& [_, stream] : ctx.core.streams)
@@ -415,10 +424,7 @@ inline void fail_connection(conn_context& ctx, std::exception_ptr failure) {
     } catch (const protocol_error& error) {
         if (!std::holds_alternative<reset_stream>(error.action()))
             return std::nullopt;
-        const auto& reset = std::get<reset_stream>(error.action());
-        if (!std::holds_alternative<error_code>(reset.code))
-            return std::nullopt;
-        return std::get<error_code>(reset.code).value;
+        return std::get<reset_stream>(error.action()).code;
     } catch (...) {
         return std::nullopt;
     }
@@ -434,19 +440,22 @@ inline void fail_connection(conn_context& ctx, std::exception_ptr failure) {
 // The waits of an HTTP/3 exchange, parked until the driver makes the
 // condition true; a stop request on the waiting chain (or, for a body read,
 // on the token the read was given) resumes them with http::stopped.
-inline auto body_data(const std::shared_ptr<stream_data>& stream, const std::stop_token& stop) {
+template <template <class> class Queue>
+inline auto body_data(const std::shared_ptr<stream_data<Queue>>& stream, const std::stop_token& stop) {
     return http::detail::park_until{stream->core.body_waiter, [&stream] {
         return !stream->body.empty() || stream->core.complete || stream->core.aborted;
     }, stop};
 }
 
-inline auto response_headers(const std::shared_ptr<stream_data>& stream) {
+template <template <class> class Queue>
+inline auto response_headers(const std::shared_ptr<stream_data<Queue>>& stream) {
     return http::detail::park_until{stream->core.headers_waiter, [&stream] {
         return stream->core.headers_done || stream->core.aborted;
     }};
 }
 
-inline auto body_capacity(const std::shared_ptr<stream_data>& stream) {
+template <template <class> class Queue>
+inline auto body_capacity(const std::shared_ptr<stream_data<Queue>>& stream) {
     return http::detail::park_until{stream->core.capacity_waiter, [&stream] {
         return stream->buffered_body_size < body_buffer_limit ||
                stream->core.complete || stream->core.aborted;

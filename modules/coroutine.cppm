@@ -4,50 +4,28 @@ import std;
 import :trait;
 import :message;
 
-export namespace http::detail {
-
-// Awaits work(), then cleanup() however the work ended (returned, threw or was
-// stopped). The work's failure wins over the cleanup's; otherwise the
-// cleanup's failure, then the work's value, is the outcome. Both callables
-// live in this frame, so a coroutine lambda's captures outlive its await.
-template <typename Work, typename Cleanup>
-auto finally(Work work, Cleanup cleanup) -> task<typename std::invoke_result_t<Work&>::value_type> {
-    using value = typename std::invoke_result_t<Work&>::value_type;
-    std::conditional_t<std::is_void_v<value>, bool, std::optional<value>> result{};
-    std::exception_ptr failure;
-    try {
-        if constexpr (std::is_void_v<value>)
-            co_await work();
-        else
-            result.emplace(co_await work());
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    try {
-        co_await cleanup();
-    } catch (...) {
-        if (!failure)
-            failure = std::current_exception();
-    }
-    if (failure)
-        std::rethrow_exception(failure);
-    if constexpr (!std::is_void_v<value>)
-        co_return std::move(*result);
-}
-
-} // namespace http::detail
-
 // The coroutine stack: every operation is an http::task, run by resumption.
 // Awaiting it from another task hands down that task's stop token, so a stop
 // request reaches every transport and body operation beneath it.
 export namespace http::coroutine {
 
+namespace detail {
+// A borrowed message requires storage through completion of the member task.
+template <typename T, typename Function>
+auto invoke_owned(Function function) -> task<T> {
+    co_return co_await function();
+}
+} // namespace detail
+
 template <typename Endpoint>
     requires requires(Endpoint& endpoint) {
-        { operation_start(endpoint) } -> std::same_as<task<void>>;
+        { endpoint.start() } -> http::detail::awaitable;
     }
 auto start(Endpoint& endpoint) -> task<void> {
-    return operation_start(endpoint);
+    if constexpr (std::convertible_to<decltype(endpoint.start()), task<void>>)
+        return endpoint.start();
+    else
+        return detail::invoke_owned<void>([&endpoint] { return endpoint.start(); });
 }
 
 // Stops what the endpoint runs beside the application (the HTTP/2 and HTTP/3
@@ -55,10 +33,13 @@ auto start(Endpoint& endpoint) -> task<void> {
 // closed before it is destroyed.
 template <typename Endpoint>
     requires requires(Endpoint& endpoint) {
-        { operation_close(endpoint) } -> std::same_as<task<void>>;
+        { endpoint.close() } -> http::detail::awaitable;
     }
 auto close(Endpoint& endpoint) -> task<void> {
-    return operation_close(endpoint);
+    if constexpr (std::convertible_to<decltype(endpoint.close()), task<void>>)
+        return endpoint.close();
+    else
+        return detail::invoke_owned<void>([&endpoint] { return endpoint.close(); });
 }
 
 // Runs body(endpoint) between start and close, so whatever the endpoint runs
@@ -109,52 +90,83 @@ auto with_scope(Body body)
 
 template <typename Client, http::body_stream Body>
     requires requires(Client& client, http::request head, Body& body) {
-        { operation_request(client, std::move(head), body) } -> http::detail::awaitable;
+        { client.request(std::move(head), body) } -> http::detail::awaitable;
     }
 auto request(Client& client, http::request head, Body& body)
-    -> decltype(operation_request(client, std::move(head), body)) {
-    return operation_request(client, std::move(head), body);
+    -> task<typename decltype(client.request(std::move(head), body))::value_type> {
+    using operation = decltype(client.request(std::move(head), body));
+    using value = typename operation::value_type;
+    if constexpr (std::convertible_to<operation, task<value>> && requires {
+        static_cast<operation (Client::*)(http::request, Body&)>(&Client::request);
+    }) {
+        constexpr auto member = static_cast<operation (Client::*)(http::request, Body&)>(&Client::request);
+        return (client.*member)(std::move(head), body);
+    } else {
+        return detail::invoke_owned<value>([&client, &body, head = std::move(head)]() mutable {
+            return client.request(std::move(head), body);
+        });
+    }
 }
 
 // A request without content: the empty body lives in this coroutine's frame.
 template <typename Client>
     requires requires(Client& client, http::request head, http::buffer_body& body) {
-        { operation_request(client, std::move(head), body) } -> http::detail::awaitable;
+        { client.request(std::move(head), body) } -> http::detail::awaitable;
     }
 auto request(Client& client, http::request head)
-    -> decltype(operation_request(
-        client, std::move(head), std::declval<http::buffer_body&>())) {
+    -> task<typename decltype(client.request(
+        std::move(head), std::declval<http::buffer_body&>()))::value_type> {
     http::buffer_body empty;
-    co_return co_await operation_request(client, std::move(head), empty);
+    co_return co_await client.request(std::move(head), empty);
 }
 
 template <typename Server>
     requires requires(Server& server) {
-        { operation_receive(server) } -> http::detail::awaitable;
+        { server.receive() } -> http::detail::awaitable;
     }
-auto receive(Server& server) -> decltype(operation_receive(server)) {
-    return operation_receive(server);
+auto receive(Server& server) -> task<typename decltype(server.receive())::value_type> {
+    using operation = decltype(server.receive());
+    using value = typename operation::value_type;
+    if constexpr (std::convertible_to<operation, task<value>>)
+        return server.receive();
+    else
+        return detail::invoke_owned<value>([&server] { return server.receive(); });
 }
 
 template <typename Server, typename Token, http::body_stream Body>
     requires requires(Server& server, Token token, http::response head, Body& body) {
-        { operation_respond(server, std::move(token), std::move(head), body) }
+        { server.respond(std::move(token), std::move(head), body) }
             -> http::detail::awaitable;
     }
 auto respond(Server& server, Token token, http::response head, Body& body)
-    -> decltype(operation_respond(server, std::move(token), std::move(head), body)) {
-    return operation_respond(server, std::move(token), std::move(head), body);
+    -> task<void> {
+    using operation = decltype(server.respond(std::move(token), std::move(head), body));
+    if constexpr (std::convertible_to<operation, task<void>> && requires {
+        static_cast<operation (Server::*)(Token, http::response, Body&)>(&Server::respond);
+    }) {
+        constexpr auto member = static_cast<operation (Server::*)(Token, http::response, Body&)>(&Server::respond);
+        return (server.*member)(std::move(token), std::move(head), body);
+    } else {
+        return detail::invoke_owned<void>([&server, &body, token = std::move(token), head = std::move(head)]() mutable {
+            return server.respond(std::move(token), std::move(head), body);
+        });
+    }
 }
 
 template <typename Server, typename Token>
     requires requires(
         Server& server, Token token, http::response head, http::buffer_body& body) {
-        { operation_respond(server, std::move(token), std::move(head), body) }
+        { server.respond(std::move(token), std::move(head), body) }
             -> http::detail::awaitable;
     }
 auto respond(Server& server, Token token, http::response head) -> task<void> {
     http::buffer_body empty;
-    co_await operation_respond(server, std::move(token), std::move(head), empty);
+    co_await server.respond(std::move(token), std::move(head), empty);
+}
+
+template <http::body_stream Body>
+auto read(Body& body, std::span<std::byte> buffer) -> task<std::size_t> {
+    co_return co_await body.async_read(buffer, co_await current_stop_token());
 }
 
 } // namespace http::coroutine

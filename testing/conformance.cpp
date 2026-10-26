@@ -216,7 +216,7 @@ struct measured_body {
 
 using h2_server = http::v2::server<async_mock_stream>;
 using h2_req = h2_server::incoming_request;
-using h2_res = http::received<http::response, http::v2::body_reader>;
+using h2_res = http::received<http::response, http::v2::body_reader<>>;
 
 // Drives |operation| and expects it to surface a recorded H3 connection
 // failure as a protocol_error whose action closes the connection with
@@ -230,8 +230,7 @@ void expect_h3_connection_close(Operation&& operation, std::uint64_t expected_co
         expect(std::holds_alternative<http::close_connection>(failure.action()));
         const auto& close = std::get<http::close_connection>(failure.action());
         expect(close.code.has_value());
-        expect(std::holds_alternative<http::v3::error_code>(*close.code));
-        expect(std::get<http::v3::error_code>(*close.code).value == expected_code);
+        expect(*close.code == expected_code);
         threw = true;
     }
     expect(threw);
@@ -411,7 +410,7 @@ static suite<"conformance"> conformance_suite = [] {
             static_cast<void>(run_sync(http::coroutine::request(client, basic_get("/after-goaway"))));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::goaway_rejected);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             expect(!failure.info().exchange_identity.has_value());
             expect(std::holds_alternative<http::no_action>(failure.action()));
             threw = true;
@@ -493,7 +492,7 @@ static suite<"conformance"> conformance_suite = [] {
             static_cast<void>(run_sync(std::move(client_request)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::goaway_rejected);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             threw = true;
         }
         expect(threw);
@@ -598,6 +597,98 @@ static suite<"conformance"> conformance_suite = [] {
     // The peer's batching strategy is its own business, so the client advertises a
     // 10-octet initial window (RFC 9113 §6.5.2 SETTINGS_INITIAL_WINDOW_SIZE): a
     // 5-octet read must then free half the window and surface as WINDOW_UPDATE.
+    "http2_preserves_eof_when_the_last_byte_exhausts_the_window"_test = [] {
+        async_pipe c2s{}, s2c{};
+        async_mock_stream transport{.input = s2c, .output = c2s};
+        http::v2::client client{transport};
+        push_http2_setting_frame(s2c, 0x04, 16);
+        run_sync(http::coroutine::start(client));
+        std::optional<http::buffer_body> body{std::in_place, std::vector<std::byte>(16, std::byte{'b'})};
+        auto pending = http::coroutine::request(client,
+            http::request{.method = http::method::POST, .target = "/eof", .scheme = "https", .authority = "example.com"}, *body);
+        pending.start();
+        bool ended_before_credit = false;
+        for (const auto& frame : parse_h2_client_output(c2s.buffer))
+            ended_before_credit = ended_before_credit || (frame.stream_id == 1 && (frame.flags & 0x01) != 0);
+        expect(!ended_before_credit);
+        const std::array final_head{std::byte{0x88}};
+        push_http2_frame(s2c, 0x01, 0x05, 1, final_head);
+        expect(pending.done());
+        auto response = run_sync(std::move(pending));
+        expect(response.head.status == 200_u);
+        body.reset();
+        const std::array credit{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{16}};
+        push_http2_frame(s2c, 0x08, 0, 1, credit);
+        bool ended = false;
+        for (const auto& frame : parse_h2_client_output(c2s.buffer))
+            ended = ended || (frame.stream_id == 1 && (frame.flags & 0x01) != 0);
+        expect(ended);
+        run_sync(http::coroutine::close(client));
+    };
+
+    "http2_respond_does_not_recreate_a_peer_reset_stream"_test = [] {
+        async_pipe c2s{}, s2c{};
+        async_mock_stream client_transport{.input = s2c, .output = c2s};
+        async_mock_stream server_transport{.input = c2s, .output = s2c};
+        http::v2::client client{client_transport};
+        http::v2::server server{server_transport};
+        auto accept = [&]() -> http::task<http::v2::server<async_mock_stream>::incoming_request> {
+            co_await http::coroutine::start(server);
+            co_return co_await http::coroutine::receive(server);
+        };
+        auto accepted = accept();
+        accepted.start();
+        run_sync(http::coroutine::start(client));
+        auto request = http::coroutine::request(client, basic_get("/reset"));
+        request.start();
+        auto incoming = run_sync(std::move(accepted));
+        const std::array cancel{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{8}};
+        push_http2_frame(c2s, 0x03, 0, 1, cancel);
+        auto before = s2c.buffer.size();
+        auto body = make_body("unused response");
+        auto response = http::coroutine::respond(server, std::move(incoming.token), http::response{}, body);
+        std::stop_source stop;
+        response.start(stop.get_token());
+        auto completed = response.done();
+        if (!completed) stop.request_stop();
+        expect(completed);
+        if (completed) response.result();
+        expect(!body.empty());
+        expect(s2c.buffer.size() == before);
+        run_sync(http::coroutine::close(client));
+        run_sync(http::coroutine::close(server));
+    };
+
+    "http2_cancelled_contiguous_body_is_not_read_after_its_owner_exits"_test = [] {
+        async_pipe c2s{}, s2c{};
+        async_mock_stream transport{.input = s2c, .output = c2s};
+        http::v2::client client{transport};
+        push_http2_setting_frame(s2c, 0x04, 0);
+        run_sync(http::coroutine::start(client));
+        std::string original = "original-body";
+        std::string unrelated = "must-not-send-after-cancellation";
+        std::optional<http::span_body> body{std::in_place, std::as_bytes(std::span{original})};
+        auto request = http::coroutine::request(client,
+            http::request{.method = http::method::POST, .target = "/cancel", .scheme = "https", .authority = "example.com"}, *body);
+        std::stop_source stop;
+        request.start(stop.get_token());
+        expect(!request.done());
+        stop.request_stop();
+        expect(request.done());
+        bool stopped = false;
+        try { static_cast<void>(request.result()); }
+        catch (const http::stopped&) { stopped = true; }
+        expect(stopped);
+        request = {};
+        body.reset();
+        body.emplace(std::as_bytes(std::span{unrelated}));
+        const std::array credit{std::byte{0}, std::byte{0}, std::byte{0}, std::byte{64}};
+        push_http2_frame(s2c, 0x08, 0, 1, credit);
+        for (const auto& frame : parse_h2_client_output(c2s.buffer))
+            expect(frame.type != std::uint8_t{0x00});
+        run_sync(http::coroutine::close(client));
+    };
+
     "http2_flow_control_credit_follows_body_reads"_test = [] {
         async_pipe c2s{};
         async_pipe s2c{};
@@ -1075,7 +1166,7 @@ static suite<"conformance"> conformance_suite = [] {
             run_sync(client.expire_settings(ticket));
         } catch (const http::protocol_error& failure) {
             const auto& close = std::get<http::close_connection>(failure.action());
-            expect(std::get<http::v2::error_code>(*close.code).value == 4_u);
+            expect(*close.code == 4_u);
             threw = true;
         }
         expect(threw);
@@ -1243,13 +1334,12 @@ static suite<"conformance"> conformance_suite = [] {
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::stream_reset);
             expect(failure.info().scope == http::error_scope::stream);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             expect(failure.info().exchange_identity.has_value());
             expect(*failure.info().exchange_identity == 2_u);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::holds_alternative<http::v2::error_code>(reset.code));
-            expect(std::get<http::v2::error_code>(reset.code).value == 7_u);
+            expect(reset.code == 7_u);
             threw = true;
         }
         expect(threw);
@@ -1291,20 +1381,21 @@ static suite<"conformance"> conformance_suite = [] {
             static_cast<void>(run_sync(std::move(refused)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::stream_reset);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             expect(failure.info().exchange_identity.has_value());
             expect(*failure.info().exchange_identity == 1_u);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::holds_alternative<http::v2::error_code>(reset.code));
-            expect(std::get<http::v2::error_code>(reset.code).value == 7_u);
+            expect(reset.code == 7_u);
             threw = true;
         }
         expect(threw);
 
-        // RFC 9113 §7 — "CANCEL (0x08): The endpoint uses this error code to
-        // indicate that the stream is no longer needed." — CANCEL is not a
-        // "safe to retry" signal, so the typed error reports retryable=false.
+        // RFC 9114 §4.1.1 — "When a stream is reset... the client MAY repeat
+        // the request on a new stream"; the same sentence covers every reset
+        // code, so retryability is a property of the reset, not of the code the
+        // peer chose. (Whether repeating a non-idempotent request is sensible is
+        // the caller's decision.)
         auto cancelled = http::coroutine::request(client, basic_get("/cancelled"));
         cancelled.start();
         const std::vector<std::byte> cancel_code{
@@ -1316,9 +1407,9 @@ static suite<"conformance"> conformance_suite = [] {
             static_cast<void>(run_sync(std::move(cancelled)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::stream_reset);
-            expect(!failure.info().retryable);
+            expect(http::retryable(failure.info()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v2::error_code>(reset.code).value == 8_u);
+            expect(reset.code == 8_u);
             threw = true;
         }
         expect(threw);
@@ -1361,11 +1452,10 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().scope == http::error_scope::stream);
             expect(failure.info().exchange_identity.has_value());
             expect(*failure.info().exchange_identity == 1_u);
-            expect(!failure.info().retryable);
+            expect(!http::retryable(failure.info()));
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::holds_alternative<http::v2::error_code>(reset.code));
-            expect(std::get<http::v2::error_code>(reset.code).value == 1_u);
+            expect(reset.code == 1_u);
             threw = true;
         }
         expect(threw);
@@ -1382,76 +1472,6 @@ static suite<"conformance"> conformance_suite = [] {
             reset_found = true;
         }
         expect(reset_found);
-    };
-
-    // RFC 9110 §15 — "All valid status codes are within the range of 100 to
-    // 599, inclusive." — an application answering with a status outside that
-    // range would put an invalid ':status' value on the wire (RFC 9113 §8.3.2),
-    // so the send path rejects it locally before any frame is submitted,
-    // mirroring the inbound :status validation. The connection and its other
-    // streams survive.
-    "http2_out_of_range_status_rejected_on_send"_test = [] {
-        async_pipe c2s{};
-        async_pipe s2c{};
-        async_mock_stream client_transport{.input = s2c, .output = c2s};
-        async_mock_stream server_transport{.input = c2s, .output = s2c};
-
-        http::v2::client<async_mock_stream> client{client_transport};
-        http::v2::server<async_mock_stream> server{server_transport};
-
-        auto accept_request = [&]() -> http::task<h2_req> {
-            co_await http::coroutine::start(server);
-            co_return co_await http::coroutine::receive(server);
-        };
-        auto server_request = accept_request();
-        server_request.start();
-        run_sync(http::coroutine::start(client));
-
-        auto client_request = http::coroutine::request(client, basic_get("/status-700"));
-        client_request.start();
-
-        auto received = run_sync([&]() -> http::task<h2_req> {
-            co_return co_await std::move(server_request);
-        }());
-        expect(received.head.target == "/status-700"sv);
-        static_cast<void>(run_sync(drain_body(received.body)));
-
-        auto threw = false;
-        try {
-            http::buffer_body body;
-            run_sync(http::coroutine::respond(server,
-                std::move(received.token),
-                http::response{.status = 700, .reason = {}, .fields = {}},
-                body));
-        } catch (const http::usage_error& failure) {
-            expect(std::string_view{failure.what()}.contains("http/2:"sv));
-            threw = true;
-        }
-        expect(threw);
-
-        // The rejected response never reaches the wire, and the connection
-        // survives: a second exchange with a valid status completes normally.
-        auto server_request_2 = accept_request();
-        server_request_2.start();
-        auto good_request = http::coroutine::request(client, basic_get("/fine"));
-        good_request.start();
-
-        auto received_2 = run_sync([&]() -> http::task<h2_req> {
-            co_return co_await std::move(server_request_2);
-        }());
-        expect(received_2.head.target == "/fine"sv);
-        static_cast<void>(run_sync(drain_body(received_2.body)));
-        http::buffer_body response_body;
-        run_sync(http::coroutine::respond(server,
-            std::move(received_2.token),
-            http::response{.status = 200, .reason = {}, .fields = {}},
-            response_body));
-
-        auto good_response = run_sync([&]() -> http::task<h2_res> {
-            co_return co_await std::move(good_request);
-        }());
-        expect(good_response.head.status == 200_u);
-        static_cast<void>(run_sync(drain_body(good_response.body)));
     };
 
     // RFC 9113 §8.3.1 — "A server SHOULD treat a request as malformed if it
@@ -1964,7 +1984,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::resource_limit);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_excessive_load);
+            expect(reset.code == h3_excessive_load);
             threw = true;
         }
         expect(threw);
@@ -2056,8 +2076,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(std::holds_alternative<http::close_connection>(failure.action()));
             const auto& close = std::get<http::close_connection>(failure.action());
             expect(close.code.has_value());
-            expect(std::holds_alternative<http::v3::error_code>(*close.code));
-            expect(std::get<http::v3::error_code>(*close.code).value == h3_id_error);
+            expect(*close.code == h3_id_error);
             threw = true;
         }
 
@@ -2092,7 +2111,7 @@ static suite<"conformance"> conformance_suite = [] {
             static_cast<void>(run_sync(http::coroutine::request(client, basic_get("/after-goaway"), empty)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::goaway_rejected);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             expect(!failure.info().exchange_identity.has_value());
             expect(std::holds_alternative<http::no_action>(failure.action()));
             threw = true;
@@ -2178,7 +2197,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::stream_reset);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_message_error);
+            expect(reset.code == h3_message_error);
             threw = true;
         }
         expect(threw);
@@ -2767,8 +2786,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(std::holds_alternative<http::close_connection>(failure.action()));
             const auto& close = std::get<http::close_connection>(failure.action());
             expect(close.code.has_value());
-            expect(std::holds_alternative<http::v3::error_code>(*close.code));
-            expect(std::get<http::v3::error_code>(*close.code).value == h3_missing_settings);
+            expect(*close.code == h3_missing_settings);
             threw = true;
         }
 
@@ -3044,7 +3062,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::malformed_message);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_message_error);
+            expect(reset.code == h3_message_error);
             threw = true;
         }
         expect(threw);
@@ -3093,7 +3111,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::malformed_message);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_message_error);
+            expect(reset.code == h3_message_error);
             threw = true;
         }
         expect(threw);
@@ -3232,7 +3250,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().scope == http::error_scope::stream);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_request_incomplete);
+            expect(reset.code == h3_request_incomplete);
             threw = true;
         }
         expect(threw);
@@ -3284,7 +3302,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::malformed_message);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_message_error);
+            expect(reset.code == h3_message_error);
             threw = true;
         }
         expect(threw);
@@ -3483,7 +3501,7 @@ static suite<"conformance"> conformance_suite = [] {
             expect(failure.info().condition == http::error_condition::stream_reset);
             expect(std::holds_alternative<http::reset_stream>(failure.action()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
-            expect(std::get<http::v3::error_code>(reset.code).value == h3_message_error);
+            expect(reset.code == h3_message_error);
             threw = true;
         }
         expect(threw);

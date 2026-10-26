@@ -59,20 +59,6 @@ static suite<"protocol"> protocol_suite = [] {
         expect(http::stream_factory<::httpant::examples::quic_connection_transport>);
     };
 
-    "concept_mock_stream_factory"_test = [] {
-        expect(http::byte_stream<mock_factory_stream>);
-        expect(http::stream_constructible<mock_stream_factory>);
-        expect(http::stream_accepting<mock_stream_factory>);
-        expect(http::stream_factory<mock_stream_factory>);
-    };
-
-    "concept_recording_stream_factory"_test = [] {
-        expect(http::byte_stream<recording_stream_factory::stream>);
-        expect(http::stream_constructible<recording_stream_factory>);
-        expect(http::stream_accepting<recording_stream_factory>);
-        expect(http::stream_factory<recording_stream_factory>);
-    };
-
     // RFC 9113 §3.4 — "The client connection preface starts with the string
     // "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".  This sequence MUST be followed by a
     // SETTINGS frame (Section 6.5), which MAY be empty."

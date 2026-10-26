@@ -14,15 +14,19 @@ export namespace http::v2 {
 
 // ─── HTTP/2 server (RFC 9113) ─────────────────────────────────
 
-template <byte_stream S>
+template <byte_stream S, template <class> class Queue = http::queues::local>
 class server {
 public:
+    // The prefix every local-misuse message of this engine starts with; the
+    // exchange token reads it from the server type that minted it.
+    static constexpr std::string_view message_prefix = error_prefix.view();
+
     // The token's engine payload: the request stream record. The shared core
     // has the owning-server pointer, so a token minted by one connection
-    // cannot be used to respond on another (checked in operation_respond).
+    // cannot be used to respond on another (checked in respond).
     using exchange_token =
-        http::detail::exchange_token<server, std::shared_ptr<detail::stream_data>>;
-    using incoming_request = http::detail::incoming_request<body_reader, exchange_token>;
+        http::detail::exchange_token<server, std::shared_ptr<detail::stream_data<Queue>>>;
+    using incoming_request = http::detail::incoming_request<body_reader<Queue>, exchange_token>;
 
     explicit server(
         S& transport,
@@ -37,15 +41,15 @@ public:
     server(const server&) = delete;
     server& operator=(const server&) = delete;
 
-private:
-    auto operation_start() -> task<void> {
+public:
+    auto start() -> http::detail::operation<void> {
         co_await runtime_.start();
         co_await runtime_.handshake();
     }
 
     // Read the request head (waiting for the header section) and return it plus
     // a lazy body reader.
-    auto operation_receive() -> task<incoming_request> {
+    auto receive() -> http::detail::operation<incoming_request> {
         // RFC 9113 §8.1 — "A client sends an HTTP request on a new stream, using a previously
         // unused stream identifier (Section 5.1.1). A server sends an HTTP response on the same
         // stream as the request." — a request is delivered once its header section is complete.
@@ -63,7 +67,10 @@ private:
             std::max(ctx_.last_processed_peer_stream_id, sd->core.id);
 
         auto head = http::request{
-            .method = *http::method::parse(sd->core.decoded.method_token),
+            // The parse layer admits a request stream into the receive queue
+            // only after it saw a representable :method (see decoded_fields),
+            // so the delivered method is already validated.
+            .method = *sd->core.decoded.method,
             .target = std::move(sd->core.decoded.path),
             .scheme = std::move(sd->core.decoded.scheme),
             .authority = std::move(sd->core.decoded.authority),
@@ -72,10 +79,7 @@ private:
 
         co_return incoming_request{
             .head = std::move(head),
-            .body = body_reader{ctx_, sd,
-                [this, stream_id = sd->core.id](std::size_t n) -> task<void> {
-                    co_await runtime_.return_credit(stream_id, n);
-                }},
+            .body = body_reader<Queue>{ctx_, sd, detail::credit_return{runtime_, sd->core.id}},
             .token = exchange_token{*this, sd},
         };
     }
@@ -83,17 +87,21 @@ private:
     // RFC 9113 §8.1 — "A server sends an HTTP response on the same stream as the request."
     // The opaque move-only token holds that correlation atomically with the request.
     template <body_stream Body>
-    auto operation_respond(
+    auto respond(
         exchange_token token,
         http::response head,
-        Body& body) -> task<void> {
+        Body& body) -> http::detail::operation<void> {
         if (!token.valid())
             throw usage_error("http/2: invalid exchange token");
         // A token minted by another server must not respond on this
         // connection; responding consumes the token (the stream handle moves
         // out), so a second respond with the same token fails the check above.
-        token.check_owner(*this, "http/2: ");
+        token.check_owner(*this);
         auto stream = token.take_handle();
+        if (stream->core.closed || stream->core.aborted)
+            co_return;
+        if (ctx_.core.connection_error)
+            std::rethrow_exception(ctx_.core.connection_error);
         // RFC 9110 §15.2 / §15.3.5 / §15.4.5 — "A 1xx response is terminated by
         // the end of the header section; it cannot contain content or trailers."
         // / "A 204 response is terminated by the end of the header section; it
@@ -104,34 +112,17 @@ private:
         // request, exactly as RFC 9110 §9.3.2 — "The HEAD method is identical
         // to GET except that the server MUST NOT send content in the response."
         // — does for HEAD. The shared predicate decides suppression.
-        if (!http::response_has_body(*http::method::parse(stream->core.decoded.method_token),
+        if (!http::response_has_body(*stream->core.decoded.method,
                                          head.status)) {
             http::buffer_body empty;
-            co_await send_response(stream->core.id, std::move(head), empty);
+            co_await send_response(std::move(stream), std::move(head), empty);
             co_return;
         }
-        co_await send_response(stream->core.id, std::move(head), body);
+        co_await send_response(std::move(stream), std::move(head), body);
     }
 
-    friend auto operation_start(server& endpoint) -> task<void> {
-        return endpoint.operation_start();
-    }
-
-    friend auto operation_close(server& endpoint) -> task<void> {
-        return endpoint.runtime_.close();
-    }
-
-    friend auto operation_receive(server& endpoint) -> task<incoming_request> {
-        return endpoint.operation_receive();
-    }
-
-    template <body_stream Body>
-    friend auto operation_respond(
-        server& endpoint,
-        exchange_token token,
-        http::response head,
-        Body& body) -> task<void> {
-        return endpoint.operation_respond(std::move(token), std::move(head), body);
+    auto close() -> http::detail::operation<void> {
+        return runtime_.close();
     }
 
 public:
@@ -141,9 +132,12 @@ public:
     // separately (responses carry no embedded body).
     template <body_stream Body>
     auto push(const exchange_token& associated, http::request req, http::response res, Body& body)
-        -> task<void> {
+        -> http::detail::operation<void> {
         if (!associated.valid())
             throw usage_error("http/2: invalid exchange token");
+        associated.check_owner(*this);
+        if (associated.handle()->core.closed || associated.handle()->core.aborted)
+            co_return;
         auto associated_stream_id = associated.handle()->core.id;
         // RFC 9113 §6.8 — "Receivers of a GOAWAY frame MUST NOT open additional
         // streams on the connection" — a promised stream is a new stream, so a
@@ -159,16 +153,11 @@ public:
 
         // RFC 9113 §8.4.1 — "The header fields in PUSH_PROMISE and any subsequent CONTINUATION
         // frames MUST be a valid and complete set of request header fields (Section 8.3.1)."
-        auto fields = http::detail::make_request_field_block(req);
+        auto fields = http::detail::make_request_field_block(req, detail::make_nv);
         if (!fields)
             throw usage_error(
                 std::string{"http/2: pushed request "} +
                 std::string{http::detail::request_field_error_name(fields.error())});
-
-        std::vector<nghttp2_nv> nva;
-        nva.reserve(fields->size());
-        for (auto& field : *fields)
-            nva.push_back(detail::make_nv(field.name, field.value));
 
         // RFC 9113 §6.6 — "PUSH_PROMISE frames MUST only be sent on a peer-initiated stream that
         // is in either the 'open' or 'half-closed (remote)' state." — the associated request
@@ -179,10 +168,14 @@ public:
                 session_.get(),
                 NGHTTP2_FLAG_NONE,
                 associated_stream_id,
-                nva.data(),
-                nva.size(),
+                fields->data(),
+                fields->size(),
                 nullptr),
             "submit_push_promise");
+
+        auto promised = std::make_shared<detail::stream_data<Queue>>();
+        promised->core.id = promised_stream_id;
+        ctx_.core.streams[promised_stream_id] = promised;
 
         // RFC 9113 §8.4.2 — "The client never sends a frame with the END_STREAM flag set for a
         // server push." — the stream is closed by the server's own END_STREAM. HEAD responses
@@ -190,16 +183,16 @@ public:
         // response is terminated by the end of the header section" — likewise for 204/304.
         if (req.method == method::HEAD || !http::status_allows_body(res.status)) {
             http::buffer_body empty;
-            co_await send_response(promised_stream_id, std::move(res), empty);
+            co_await send_response(std::move(promised), std::move(res), empty);
         } else {
-            co_await send_response(promised_stream_id, std::move(res), body);
+            co_await send_response(std::move(promised), std::move(res), body);
         }
         co_return;
     }
 
     // RFC 9113 §6.7 — see detail::endpoint_runtime::ping.
-    auto ping() -> task<void> {
-        co_await runtime_.ping();
+    auto ping() -> http::detail::operation<void> {
+        return runtime_.ping();
     }
 
     // RFC 9113 §6.8 — "An endpoint SHOULD always send a GOAWAY frame before
@@ -207,22 +200,22 @@ public:
     // has been partially processed or not." The last-stream-id is the highest
     // request delivered to the application, clamped per §6.8 (see
     // detail::endpoint_runtime::shutdown).
-    auto shutdown() -> task<void> {
-        co_await runtime_.shutdown();
+    auto shutdown() -> http::detail::operation<void> {
+        return runtime_.shutdown();
     }
 
     auto update_settings(std::span<const setting> settings)
-        -> task<settings_ticket>
+        -> http::detail::operation<settings_ticket>
     {
-        co_return co_await runtime_.update_settings(settings);
+        return runtime_.update_settings(settings);
     }
 
     [[nodiscard]] auto acknowledged(settings_ticket ticket) const noexcept -> bool {
         return runtime_.acknowledged(ticket);
     }
 
-    auto expire_settings(settings_ticket ticket) -> task<void> {
-        co_await runtime_.expire_settings(ticket);
+    auto expire_settings(settings_ticket ticket) -> http::detail::operation<void> {
+        return runtime_.expire_settings(ticket);
     }
 
     [[nodiscard]] auto compression_state() const -> hpack_state {
@@ -241,16 +234,12 @@ public:
 private:
     // Submit and stream a response head and body on the given stream.
     template <body_stream Body>
-    auto send_response(std::int32_t stream_id, http::response head, Body& body) -> task<void> {
-        // RFC 9110 §15 — "All valid status codes are within the range of 100
-        // to 599, inclusive." — an out-of-range status would be emitted as an
-        // invalid ':status' value (RFC 9113 §8.3.2), so the send path rejects
-        // it locally before any frame is submitted, mirroring the inbound
-        // parse_status check.
-        if (head.status < 100 || head.status > 599)
-            throw usage_error("http/2: response status outside 100-599");
+    auto send_response(std::shared_ptr<detail::stream_data<Queue>> sd, http::response head, Body& body) -> http::detail::operation<void> {
+        auto stream_id = sd->core.id;
+        // RFC 9113 §8.3.2 — ":status" holds an RFC 9110 §15 status code,
+        // which http::status cannot leave the 100-599 range of.
         std::vector<nghttp2_nv> nva;
-        auto status_str = std::format("{}", head.status);
+        auto status_str = std::format("{}", head.status.code());
         // RFC 9113 §8.3.2 — "For HTTP/2 responses, a single ':status' pseudo-header field is
         // defined that carries the HTTP status code field (see Section 15 of [HTTP]). This
         // pseudo-header field MUST be included in all responses, including interim responses;
@@ -265,28 +254,20 @@ private:
             nva.data(), nva.size(), &binding.provider), "submit_response");
         ctx_.core.outbound_bodies[stream_id] = binding.state;
 
-        // The window waiter parks on a stream record; promised (push) streams
-        // are server-initiated and have none until now.
-        auto& sd = ctx_.core.streams[stream_id];
-        if (!sd) {
-            sd = std::make_shared<detail::stream_data>();
-            sd->core.id = stream_id;
-        }
-
         // Emit the response HEADERS and allow the empty provider to become
         // deferred before the first explicit resume.
         co_await runtime_.flush();
 
         co_await detail::stream_outbound_body(
-            runtime_, session_.get(), ctx_, stream_id, sd, *binding.state,
+            runtime_, session_.get(), ctx_, stream_id, std::move(sd), *binding.state,
             *binding.bridge, false);
     }
 
     S& transport_;
     detail::session_handle session_{};
-    detail::session_context ctx_{};
+    detail::session_context<Queue> ctx_{};
     configuration configuration_{};
-    detail::endpoint_runtime<S> runtime_;
+    detail::endpoint_runtime<S, Queue> runtime_;
 };
 
 } // namespace http::v2

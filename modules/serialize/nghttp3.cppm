@@ -10,53 +10,25 @@ export namespace http::v3 {
 
 namespace detail {
 
-struct nv_block {
-    std::vector<std::string> storage{};
-    std::vector<nghttp3_nv> fields{};
-
-    explicit nv_block(std::size_t count = 0) {
-        storage.reserve(count * 2);
-        fields.reserve(count);
-    }
-
-    void push(std::string_view name, std::string_view value) {
-        // Pointer stability is required: every stored nghttp3_nv borrows
-        // .data() from the two strings emplaced below, so a reallocation here
-        // would dangle each previously stored pointer. The reserve(count*2) /
-        // reserve(count) at construction is therefore a hard bound, not a
-        // hint; one push beyond it is a caller bug.
-        if (storage.size() + 2 > storage.capacity() || fields.size() + 1 > fields.capacity())
-            throw std::logic_error("http/3: nv_block grew past its reservation");
-        storage.emplace_back(name);
-        storage.emplace_back(value);
-        auto& sn = storage[storage.size() - 2];
-        auto& sv = storage[storage.size() - 1];
-        fields.push_back({
-            .name = reinterpret_cast<const std::uint8_t*>(sn.data()),
-            .value = reinterpret_cast<const std::uint8_t*>(sv.data()),
-            .namelen = sn.size(),
-            .valuelen = sv.size(),
-            // RFC 9204 §4.5.4/§4.5.6 — the 'N' bit of a literal field line
-            // marks the field as never-indexed; RFC 9204 §7.1.3 — "The
-            // never-indexed literal bit ... can be used to signal to
-            // intermediaries that a particular value was intentionally sent
-            // as a literal." Sensitive fields therefore use the literal
-            // representation with the N bit set and are never inserted into
-            // the dynamic table.
-            .flags = static_cast<std::uint8_t>(
-                http::detail::is_sensitive_field_name(name)
-                    ? NGHTTP3_NV_FLAG_NEVER_INDEX
-                    : NGHTTP3_NV_FLAG_NONE),
-        });
-    }
-};
+// Request/response objects own these strings through submit; the library
+// copies names and values because neither NO_COPY flag is set.
+inline auto make_nv(std::string_view name, std::string_view value) -> nghttp3_nv {
+    return {
+        .name = reinterpret_cast<const std::uint8_t*>(name.data()),
+        .value = reinterpret_cast<const std::uint8_t*>(value.data()),
+        .namelen = name.size(),
+        .valuelen = value.size(),
+        .flags = static_cast<std::uint8_t>(http::detail::is_sensitive_field_name(name)
+            ? NGHTTP3_NV_FLAG_NEVER_INDEX : NGHTTP3_NV_FLAG_NONE),
+    };
+}
 
 // RFC 9114 §4.2.2 — "The size of a field list is calculated based on the
 // uncompressed size of fields, including the length of the name and value in
 // bytes plus an overhead of 32 bytes for each field."
-inline auto field_section_size(const nv_block& block) -> std::uint64_t {
+inline auto field_section_size(std::span<const nghttp3_nv> fields) -> std::uint64_t {
     std::uint64_t size = 0;
-    for (const auto& field : block.fields)
+    for (const auto& field : fields)
         size += static_cast<std::uint64_t>(field.namelen) + field.valuelen +
             field_entry_overhead;
     return size;
@@ -69,14 +41,15 @@ inline auto field_section_size(const nv_block& block) -> std::uint64_t {
 // on its current understanding of the peer's settings.") The peer's
 // SETTINGS_MAX_FIELD_SECTION_SIZE defaults to unlimited until a SETTINGS
 // frame arrives, so before that point every outbound field section passes.
-inline void check_outbound_field_section(const conn_context& ctx, const nv_block& block) {
-    if (field_section_size(block) > ctx.peer_max_field_section_size)
+template <template <class> class Queue>
+inline void check_outbound_field_section(const conn_context<Queue>& ctx, std::span<const nghttp3_nv> fields) {
+    if (field_section_size(fields) > ctx.peer_max_field_section_size)
         throw usage_error(
             "http/3: field section exceeds peer SETTINGS_MAX_FIELD_SECTION_SIZE");
 }
 
-template <body_stream Body>
-inline auto fill_outbound_body(Body& body, outbound_body_state& state) -> task<void> {
+template <body_stream Body, template <class> class Queue>
+inline auto fill_outbound_body(Body& body, outbound_body_state<Queue>& state) -> http::detail::operation<void> {
     state.data.resize(body_buffer_limit);
     auto size = co_await body.async_read(std::span{state.data}, co_await current_stop_token());
     if (size > state.data.size())
@@ -87,22 +60,22 @@ inline auto fill_outbound_body(Body& body, outbound_body_state& state) -> task<v
     state.eof = size == 0;
 }
 // Parks pump_outbound_body while a body chunk has been offered to nghttp3 but
-// not yet fully acknowledged. Without this wait, a transport whose
-// acknowledgement completes before nghttp3's acked_stream_data callback would
-// spin in flush() until the peer ACK clears the retained chunk.
-inline auto outbound_ack(outbound_body_state& state) {
+// not yet released. flush() releases a chunk once the transport accepts its
+// copy; a flush already running for another stream may still hold the gate.
+template <template <class> class Queue>
+inline auto outbound_ack(outbound_body_state<Queue>& state) {
     return http::detail::park_until{state.ack_waiter, [&state] {
         return state.data.empty() || !state.offered;
     }};
 }
 
-template <body_stream Body, stream_factory S>
+template <body_stream Body, stream_factory S, template <class> class Queue>
 inline auto pump_outbound_body(
     Body& body,
-    outbound_body_state& state,
+    outbound_body_state<Queue>& state,
     std::int64_t stream_id,
     nghttp3_conn* connection,
-    endpoint_runtime<S>& runtime) -> task<void>
+    endpoint_runtime<S, Queue>& runtime) -> http::detail::operation<void>
 {
     for (;;) {
         co_await runtime.flush();
@@ -114,12 +87,13 @@ inline auto pump_outbound_body(
         if (state.eof && state.data.empty())
             co_return;
         // The current chunk has been offered to nghttp3 and is waiting for
-        // the peer ACK. Wait for acked_stream_data to clear it instead of
+        // the transport. Wait for acked_stream_data to clear it instead of
         // re-entering flush() and busy-polling.
         co_await outbound_ack(state);
     }
 }
 
+template <template <class> class Queue>
 inline auto read_outbound_body(
     nghttp3_conn*,
     std::int64_t,
@@ -129,9 +103,9 @@ inline auto read_outbound_body(
     void* user_data,
     void* stream_user_data) noexcept -> nghttp3_ssize
 {
-    auto& ctx = *static_cast<conn_context*>(user_data);
+    auto& ctx = *static_cast<conn_context<Queue>*>(user_data);
     try {
-        auto* state = static_cast<outbound_body_state*>(stream_user_data);
+        auto* state = static_cast<outbound_body_state<Queue>*>(stream_user_data);
         if (state == nullptr)
             throw std::logic_error("http/3: missing outbound body stream state");
         if (veccnt == 0)

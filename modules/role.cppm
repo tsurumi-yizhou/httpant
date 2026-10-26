@@ -29,6 +29,15 @@ export namespace http {
 
 namespace detail {
 
+// The engine's diagnostic prefix, declared by every server type that mints an
+// exchange token ("http/1.1: ", "http/2: ", "http/3: "). The protocol's text is
+// a property of the type, so the token reads it from the owner instead of
+// taking it as an argument that could carry another protocol's string.
+template <typename Owner>
+concept prefixed_owner = requires {
+    { Owner::message_prefix } -> std::convertible_to<std::string_view>;
+};
+
 // ─── Server exchange-token shell ─────────────────────────────
 
 // The move-only ownership guard every server's public exchange_token is built
@@ -64,13 +73,13 @@ public:
     auto take_handle() -> Handle { return std::exchange(handle_, {}); }
 
     // The uniform wrong-owner rejection: a token minted by another server must
-    // not respond on this connection. Each engine passes its protocol error
-    // prefix ("http/1.1: " / "http/2: " / "http/3: ") so the local-misuse
-    // error matches the engine's own wording.
-    void check_owner(const Owner& expected, std::string_view prefix) const {
+    // not respond on this connection, with the owning protocol's own wording.
+    void check_owner(const Owner& expected) const
+        requires prefixed_owner<Owner>
+    {
         if (owner_ != &expected)
             throw usage_error(
-                std::string(prefix) + "exchange token does not belong to server");
+                std::string(Owner::message_prefix) + "exchange token does not belong to server");
     }
 
 private:

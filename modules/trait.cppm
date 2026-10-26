@@ -1,6 +1,8 @@
 export module httpant:trait;
 
 import httpant.dependencies.stdexec;
+import httpant.memory;
+export import httpant.queue;
 import std;
 
 export namespace http {
@@ -12,6 +14,26 @@ export namespace http {
 // handles failures, not cancellation.
 struct stopped {};
 
+// A string literal as a template argument. std::string_view is not a structural
+// type, so a constant that belongs in the program's types (an engine's
+// diagnostic prefix, a protocol's ALPN identifier) is held by this instead:
+// `template <literal Prefix>` takes the text at compile time, and no runtime
+// argument can carry the wrong one.
+template <std::size_t N>
+struct literal {
+    char text[N]{};
+
+    consteval literal(const char (&value)[N]) { std::ranges::copy(value, text); }
+
+    [[nodiscard]] constexpr auto view() const noexcept -> std::string_view {
+        return {text, N - 1};
+    }
+    constexpr operator std::string_view() const noexcept { return view(); }
+};
+
+template <std::size_t N>
+literal(const char (&)[N]) -> literal<N>;
+
 // A call outside the library's contract: a request on a closed connection, an
 // exchange token from another server, an outbound message that cannot be
 // framed, a transport that breaks the byte_stream contract. Only the caller
@@ -21,15 +43,32 @@ public:
     using std::logic_error::logic_error;
 };
 
-template <typename T>
-class task;
+namespace detail {
+struct coroutine_tag {};
+struct operation_tag {};
+}
 
-class task_scope;
+template <typename T, typename Tag>
+class basic_task;
+template <typename Tag>
+class basic_scope;
+
+template <typename T = void>
+using task = basic_task<T, detail::coroutine_tag>;
+using task_scope = basic_scope<detail::coroutine_tag>;
+
+namespace detail {
+// Protocol operations have their own frame type. The sender stack never
+// constructs or waits on the public coroutine task type.
+template <typename T = void>
+using operation = basic_task<T, operation_tag>;
+using operation_scope = basic_scope<operation_tag>;
+}
 
 namespace detail {
 
-template <typename T>
-class with_stop_awaiter;
+template <typename T, typename Tag, typename Promise>
+class foreign_task_awaiter;
 
 // A promise that exposes its chain's stop token takes part in stop
 // propagation: whatever it awaits receives that token.
@@ -58,86 +97,8 @@ template <typename Promise>
     }
 }
 
-// Coroutine frames come from a per-thread pool of size classes, so a protocol
-// operation that builds a chain of tasks allocates from the heap only until
-// the pool has warmed up. A frame freed on another thread joins that thread's
-// pool; each class keeps a bounded number of blocks and returns the rest.
-class frame_pool {
-public:
-    static auto allocate(std::size_t size) -> void* {
-        auto index = class_of(size);
-        if (index == classes) return ::operator new(size);
-        // Blocks are always a whole size class, so any pool can reuse them.
-        if (auto* pool = local()) {
-            auto& list = pool->free_[index];
-            if (list.count != 0) {
-                auto* block = list.head;
-                list.head = block->next;
-                --list.count;
-                return block;
-            }
-        }
-        return ::operator new(class_size(index));
-    }
-
-    static void deallocate(void* frame, std::size_t size) noexcept {
-        auto index = class_of(size);
-        auto* pool = index == classes ? nullptr : local();
-        if (pool == nullptr || pool->free_[index].count >= max_cached)
-            return ::operator delete(frame);
-        auto& list = pool->free_[index];
-        auto* block = static_cast<block_node*>(frame);
-        block->next = list.head;
-        list.head = block;
-        ++list.count;
-    }
-
-private:
-    struct block_node {
-        block_node* next;
-    };
-    struct free_list {
-        block_node* head{nullptr};
-        std::size_t count{0};
-    };
-
-    // 64 B, 128 B, ... 32 KiB; larger frames use the heap directly.
-    static constexpr std::size_t first_class = 64;
-    static constexpr std::size_t classes = 10;
-    static constexpr std::size_t max_cached = 32;
-
-    static constexpr auto class_size(std::size_t index) -> std::size_t { return first_class << index; }
-    static constexpr auto class_of(std::size_t size) -> std::size_t {
-        std::size_t index = 0;
-        while (index < classes && class_size(index) < size) ++index;
-        return index;
-    }
-
-    explicit frame_pool(bool* destroyed) noexcept : destroyed_(destroyed) {}
-    ~frame_pool() {
-        *destroyed_ = true;
-        for (auto& list : free_)
-            for (auto* block = list.head; block != nullptr;) {
-                auto* next = block->next;
-                ::operator delete(block);
-                block = next;
-            }
-    }
-    frame_pool(const frame_pool&) = delete;
-    auto operator=(const frame_pool&) -> frame_pool& = delete;
-
-    // The calling thread's pool, or null once thread teardown has destroyed
-    // it: a frame freed that late goes straight back to the heap. The flag is
-    // trivially destructible, so it stays readable after the pool is gone.
-    static auto local() -> frame_pool* {
-        static thread_local bool destroyed = false;
-        static thread_local frame_pool pool{&destroyed};
-        return destroyed ? nullptr : &pool;
-    }
-
-    bool* destroyed_;
-    free_list free_[classes]{};
-};
+// Shared allocation machinery; task ownership stays with each facade.
+using frame_pool = http::memory::frames;
 
 struct task_promise_base;
 
@@ -202,34 +163,36 @@ struct task_result<void> {
     void return_void() noexcept {}
 };
 
+template <typename T>
+struct task_promise : task_promise_base, task_result<T> {
+    auto get_return_object() -> basic_task<T, operation_tag>;
+};
+
 } // namespace detail
 
-// ─── The coroutine stack ─────────────────────────────────────
-//
-// A lazy, single-consumer, move-only coroutine with no executor. It runs by
-// resumption: co_await it from another task, which hands down its stop token,
-// or start() it as a root with a token of its own. The execution stack does
-// not see tasks; it runs them behind its own senders (http::execution).
-template <typename T = void>
-class [[clang::coro_await_elidable]] task {
+// A lazy frame shared as implementation machinery. The tag gives public
+// coroutine tasks and internal protocol operations distinct types and owners.
+// Neither public asynchronous stack calls the other stack.
+template <typename T, typename Tag>
+class [[clang::coro_await_elidable]] basic_task {
 public:
-    struct promise_type : detail::task_promise_base, detail::task_result<T> {
-        auto get_return_object() -> task {
-            return task{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-    };
+    using promise_type = detail::task_promise<T>;
 
     using handle_type = std::coroutine_handle<promise_type>;
     using value_type = T;
 
-    task() = default;
-    explicit task(handle_type handle) : handle_(handle) {}
-    task(const task&) = delete;
-    auto operator=(const task&) -> task& = delete;
-    task(task&& other) noexcept
+    basic_task() = default;
+    explicit basic_task(handle_type handle) : handle_(handle) {}
+    basic_task(const basic_task&) = delete;
+    auto operator=(const basic_task&) -> basic_task& = delete;
+    basic_task(basic_task&& other) noexcept
         : handle_(std::exchange(other.handle_, {})),
           started_(std::exchange(other.started_, false)) {}
-    auto operator=(task&& other) noexcept -> task& {
+    template <typename OtherTag>
+    basic_task(basic_task<T, OtherTag>&& other) noexcept
+        : handle_(std::exchange(other.handle_, {})),
+          started_(std::exchange(other.started_, false)) {}
+    auto operator=(basic_task&& other) noexcept -> basic_task& {
         if (this != &other) {
             if (handle_)
                 handle_.destroy();
@@ -238,7 +201,7 @@ public:
         }
         return *this;
     }
-    ~task() {
+    ~basic_task() {
         if (handle_)
             handle_.destroy();
     }
@@ -267,7 +230,7 @@ public:
 
         auto await_resume() -> T {
             if (!handle_)
-                throw usage_error("task: no coroutine");
+                throw usage_error("basic_task: no coroutine");
             if (handle_.promise().exception_)
                 std::rethrow_exception(handle_.promise().exception_);
             if constexpr (!std::is_void_v<T>)
@@ -276,7 +239,21 @@ public:
     };
 
     [[nodiscard]] auto operator co_await() && -> awaiter {
+        if (started_ && !done())
+            throw usage_error("basic_task: cannot await a running task");
         return awaiter{std::exchange(handle_, {})};
+    }
+
+    // Promise-aware coroutine interoperation uses the P2300 as_awaitable
+    // customization. It preserves cancellation without converting the task
+    // into a sender or depending on another HTTP stack.
+    template <typename Promise>
+        requires requires(Promise& promise) {
+            stdexec::get_env(promise);
+            { promise.unhandled_stopped() } -> std::convertible_to<std::coroutine_handle<>>;
+        }
+    auto as_awaitable(Promise& promise) && {
+        return detail::foreign_task_awaiter<T, Tag, Promise>{std::move(*this), promise};
     }
 
     // Starts a root coroutine. The token cancels the chain; it is kept in the
@@ -300,7 +277,7 @@ public:
     // The outcome of a finished root: its value, or its exception rethrown.
     auto result() -> T {
         if (!handle_ || !handle_.done())
-            throw usage_error("task: result of a coroutine that has not finished");
+            throw usage_error("basic_task: result of a coroutine that has not finished");
         if (handle_.promise().exception_)
             std::rethrow_exception(handle_.promise().exception_);
         if constexpr (!std::is_void_v<T>)
@@ -308,9 +285,12 @@ public:
     }
 
 private:
-    friend class task_scope;
+    template <typename, typename>
+    friend class basic_task;
     template <typename>
-    friend class detail::with_stop_awaiter;
+    friend class basic_scope;
+    template <typename, typename, typename>
+    friend class detail::foreign_task_awaiter;
     template <typename, typename>
     friend class execution_sender;
 
@@ -319,6 +299,11 @@ private:
 };
 
 namespace detail {
+
+template <typename T>
+auto task_promise<T>::get_return_object() -> basic_task<T, operation_tag> {
+    return basic_task<T, operation_tag>{std::coroutine_handle<task_promise<T>>::from_promise(*this)};
+}
 
 // The calling chain's stop token, for an operation at a boundary that takes
 // one as an argument (a transport read, a body read). It never suspends.
@@ -346,6 +331,11 @@ private:
 
 namespace detail {
 
+template <typename S>
+concept tagged_sender = requires { typename std::remove_cvref_t<S>::sender_concept; };
+template <typename S>
+class sender_awaiter;
+
 template <typename A>
 concept has_await_members = requires(A a) {
     { a.await_ready() } -> std::convertible_to<bool>;
@@ -364,7 +354,7 @@ concept has_free_co_await = requires(A a) {
 };
 
 template <typename A>
-concept awaitable = has_await_members<A> || has_member_co_await<A> || has_free_co_await<A>;
+concept awaitable = tagged_sender<A> || has_await_members<A> || has_member_co_await<A> || has_free_co_await<A>;
 
 template <typename A>
 decltype(auto) get_awaiter(A&& awaitable_value) {
@@ -372,6 +362,8 @@ decltype(auto) get_awaiter(A&& awaitable_value) {
         return std::forward<A>(awaitable_value).operator co_await();
     } else if constexpr (requires { operator co_await(std::forward<A>(awaitable_value)); }) {
         return operator co_await(std::forward<A>(awaitable_value));
+    } else if constexpr (tagged_sender<A>) {
+        return sender_awaiter<std::remove_cvref_t<A>>{std::forward<A>(awaitable_value)};
     } else {
         return std::forward<A>(awaitable_value);
     }
@@ -392,9 +384,6 @@ concept awaitable_result = requires(A awaitable_value) {
 // lives in the awaiting frame, its receiver points back at the awaiter, and
 // the receiver's environment has the awaiting chain's stop token. A
 // stopped sender resumes the coroutine with http::stopped.
-
-template <typename S>
-concept tagged_sender = requires { typename std::remove_cvref_t<S>::sender_concept; };
 
 struct sender_env {
     const std::stop_token* stop;
@@ -419,20 +408,21 @@ class sender_awaiter {
         template <typename... Values>
         void set_value(Values&&... values) noexcept {
             try {
-                self_->result_.template emplace<1>(
+                self_->result_.template emplace<typename sender_awaiter::values_type>(
                     std::in_place_type<decayed_tuple<Values...>>, std::forward<Values>(values)...);
             } catch (...) {
-                self_->result_.template emplace<2>(std::current_exception());
+                self_->result_.template emplace<std::exception_ptr>(std::current_exception());
             }
             self_->complete();
         }
         template <typename Error>
         void set_error(Error&& error) noexcept {
-            self_->result_.template emplace<2>(as_exception(std::forward<Error>(error)));
+            self_->result_.template emplace<std::exception_ptr>(
+                as_exception(std::forward<Error>(error)));
             self_->complete();
         }
         void set_stopped() noexcept {
-            self_->result_.template emplace<3>();
+            self_->result_.template emplace<typename sender_awaiter::settled_stopped>();
             self_->complete();
         }
     };
@@ -458,6 +448,15 @@ class sender_awaiter {
         using type = void;
     };
     using value_type = typename value_of<single_values>::type;
+
+    // The state of the awaited operation, read by name, not by variant
+    // index: a sender that has not settled, one that delivered values, one that
+    // failed, and one that stopped. The two empty alternatives need distinct
+    // types for that to be possible.
+    struct not_settled {};
+    struct settled_stopped {};
+    using result_type =
+        std::variant<not_settled, values_type, std::exception_ptr, settled_stopped>;
 
     template <typename Error>
     static auto as_exception(Error&& error) noexcept -> std::exception_ptr {
@@ -499,14 +498,14 @@ public:
         // A stop already requested ends the await before the operation
         // starts, whether or not the sender itself watches its token.
         if (stop_->stop_requested()) {
-            result_.template emplace<3>();
+            result_.template emplace<settled_stopped>();
             return false;
         }
         try {
             ::new (static_cast<void*>(storage_)) operation_type(
                 stdexec::connect(std::move(sender_), receiver{this}));
         } catch (...) {
-            result_.template emplace<2>(std::current_exception());
+            result_.template emplace<std::exception_ptr>(std::current_exception());
             return false;
         }
         live_ = true;
@@ -520,11 +519,11 @@ public:
     }
 
     auto await_resume() -> value_type {
-        if (auto* failure = std::get_if<2>(&result_))
+        if (auto* failure = std::get_if<std::exception_ptr>(&result_))
             std::rethrow_exception(*failure);
-        if (result_.index() == 3)
+        if (std::holds_alternative<settled_stopped>(result_))
             throw stopped{};
-        auto& values = std::get<0>(std::get<1>(result_));
+        auto& values = std::get<0>(std::get<values_type>(result_));
         if constexpr (std::tuple_size_v<single_values> == 1)
             return std::move(std::get<0>(values));
         else if constexpr (std::tuple_size_v<single_values> > 1)
@@ -548,7 +547,7 @@ private:
     const std::stop_token* stop_{&unstoppable};
     bool explicit_stop_{false};
     std::coroutine_handle<> continuation_{};
-    std::variant<std::monostate, values_type, std::exception_ptr, std::monostate> result_{};
+    result_type result_{};
     enum class phase { starting, suspended, completed };
     std::atomic<phase> phase_{phase::starting};
     bool live_{false};
@@ -569,24 +568,24 @@ template <detail::tagged_sender S>
 
 namespace detail {
 
-template <typename T>
+template <typename T, typename Tag>
 class with_stop_awaiter {
 public:
-    with_stop_awaiter(const std::stop_token& stop, task<T> child)
-        : stop_(stop), child_(std::move(child)) {}
+    with_stop_awaiter(const std::stop_token& stop, basic_task<T, Tag>&& child)
+        : stop_(stop), child_(std::move(child).operator co_await()) {}
 
-    [[nodiscard]] auto await_ready() const noexcept -> bool { return child_.done(); }
+    [[nodiscard]] auto await_ready() const noexcept -> bool { return child_.await_ready(); }
     auto await_suspend(std::coroutine_handle<> parent) noexcept -> std::coroutine_handle<> {
         auto& promise = child_.handle_.promise();
         promise.continuation_ = parent;
         promise.stop_ = &stop_;
         return child_.handle_;
     }
-    auto await_resume() -> T { return child_.result(); }
+    auto await_resume() -> T { return child_.await_resume(); }
 
 private:
     const std::stop_token& stop_;
-    task<T> child_;
+    typename basic_task<T, Tag>::awaiter child_;
 };
 
 } // namespace detail
@@ -594,9 +593,9 @@ private:
 // Awaits a task under an explicit stop token instead of the awaiting chain's,
 // for a boundary that receives its token as an argument. The token must
 // outlive the await.
-template <typename T>
-[[nodiscard]] auto with_stop(const std::stop_token& stop, task<T> child)
-    -> detail::with_stop_awaiter<T> {
+template <typename T, typename Tag>
+[[nodiscard]] auto with_stop(const std::stop_token& stop, basic_task<T, Tag>&& child)
+    -> detail::with_stop_awaiter<T, Tag> {
     return {stop, std::move(child)};
 }
 
@@ -618,12 +617,13 @@ template <detail::tagged_sender S>
 // for its I/O to settle. Destroying a scope with a running child would free a
 // frame whose I/O is still in flight, so the destructor requests stop and
 // terminates if a child is still running.
-class task_scope {
+template <typename Tag>
+class basic_scope {
 public:
-    task_scope() = default;
-    task_scope(const task_scope&) = delete;
-    auto operator=(const task_scope&) -> task_scope& = delete;
-    ~task_scope() {
+    basic_scope() = default;
+    basic_scope(const basic_scope&) = delete;
+    auto operator=(const basic_scope&) -> basic_scope& = delete;
+    ~basic_scope() {
         source_.request_stop();
         if (running_ != 0) {
             std::println(std::cerr,
@@ -633,8 +633,8 @@ public:
         }
     }
 
-    void spawn(task<void> child) {
-        std::erase_if(children_, [](const task<void>& finished) { return finished.done(); });
+    void spawn(basic_task<void, Tag> child) {
+        std::erase_if(children_, [](const basic_task<void, Tag>& finished) { return finished.done(); });
         auto handle = child.handle_;
         if (!handle)
             throw usage_error("httpant: cannot spawn an empty task");
@@ -644,7 +644,7 @@ public:
             throw usage_error("httpant: cannot spawn a task that was already started");
         auto& promise = handle.promise();
         promise.owner_ = this;
-        promise.complete_ = &task_scope::finished;
+        promise.complete_ = &basic_scope::finished;
         promise.stop_ = &token_;
         child.started_ = true;
         children_.push_back(std::move(child));
@@ -659,7 +659,7 @@ public:
 
     class join_awaiter {
     public:
-        explicit join_awaiter(task_scope& scope) noexcept : scope_(scope) {}
+        explicit join_awaiter(basic_scope& scope) noexcept : scope_(scope) {}
         [[nodiscard]] auto await_ready() const noexcept -> bool { return scope_.running_ == 0; }
         void await_suspend(std::coroutine_handle<> handle) {
             if (scope_.joiner_)
@@ -673,7 +673,7 @@ public:
         }
 
     private:
-        task_scope& scope_;
+        basic_scope& scope_;
     };
 
     [[nodiscard]] auto join() noexcept -> join_awaiter { return join_awaiter{*this}; }
@@ -681,7 +681,7 @@ public:
 private:
     static auto finished(void* owner, detail::task_promise_base& promise) noexcept
         -> std::coroutine_handle<> {
-        auto& self = *static_cast<task_scope*>(owner);
+        auto& self = *static_cast<basic_scope*>(owner);
         if (promise.exception_ && !self.failure_ && !detail::is_stopped(promise.exception_))
             self.failure_ = promise.exception_;
         if (--self.running_ == 0 && self.joiner_)
@@ -691,7 +691,7 @@ private:
 
     std::stop_source source_{};
     std::stop_token token_{source_.get_token()};
-    std::vector<task<void>> children_{};
+    std::vector<basic_task<void, Tag>> children_{};
     std::size_t running_{0};
     std::coroutine_handle<> joiner_{};
     std::exception_ptr failure_{};
@@ -711,43 +711,45 @@ namespace detail {
 // dispatch_wakeups, which resumes the queued coroutines once the driver has
 // itself suspended. The driver is a child of the endpoint's task_scope, so a
 // woken coroutine cannot free it: closing joins the driver first.
-using wake_queue = std::vector<std::coroutine_handle<>>;
+template <template <class> class Queue = http::queues::local>
+using wake_queue = http::queues::buffer<std::coroutine_handle<>, Queue>;
 
-inline thread_local wake_queue* active_wake_queue = nullptr;
+template <template <class> class Queue>
+inline thread_local wake_queue<Queue>* active_wake_queue = nullptr;
 
+template <template <class> class Queue>
 class wake_scope {
 public:
-    explicit wake_scope(wake_queue& queue) noexcept
-        : previous_(std::exchange(active_wake_queue, &queue)) {}
+    explicit wake_scope(wake_queue<Queue>& queue) noexcept
+        : previous_(std::exchange(active_wake_queue<Queue>, &queue)) {}
     wake_scope(const wake_scope&) = delete;
     auto operator=(const wake_scope&) -> wake_scope& = delete;
-    ~wake_scope() { active_wake_queue = previous_; }
-
+    ~wake_scope() { active_wake_queue<Queue> = previous_; }
 private:
-    wake_queue* previous_;
+    wake_queue<Queue>* previous_;
 };
 
-// Resume a parked coroutine now, or queue it when a wake_scope is active.
+template <template <class> class Queue>
 inline void wake(std::coroutine_handle<> handle) noexcept {
-    if (active_wake_queue != nullptr)
-        active_wake_queue->push_back(handle);
+    if (active_wake_queue<Queue> != nullptr)
+        active_wake_queue<Queue>->push_back(handle);
     else
         handle.resume();
 }
 
+template <template <class> class Queue>
 struct dispatch_wakeups {
-    wake_queue& queue;
-
+    wake_queue<Queue>& queue;
     [[nodiscard]] auto await_ready() const noexcept -> bool { return queue.empty(); }
-
     auto await_suspend(std::coroutine_handle<> driver) noexcept -> std::coroutine_handle<> {
-        wake_queue batch;
-        batch.swap(queue);
-        for (auto handle : batch)
+        auto count = queue.size();
+        while (count--) {
+            auto handle = queue.front();
+            queue.pop_front();
             handle.resume();
+        }
         return driver;
     }
-
     void await_resume() const noexcept {}
 };
 
@@ -761,6 +763,7 @@ struct dispatch_wakeups {
 // a time (a second park would overwrite and hang the first), and a wakeup is
 // claimed with std::exchange so a normal resume and a stop request can never
 // both resume the same coroutine.
+template <template <class> class Queue = http::queues::local>
 class waiter_slot {
 public:
     void park(std::coroutine_handle<> handle) {
@@ -772,12 +775,13 @@ public:
     // Wake the parked coroutine exactly once, if any.
     void resume() noexcept {
         if (handle_)
-            wake(std::exchange(handle_, {}));
+            wake<Queue>(std::exchange(handle_, {}));
     }
 
     [[nodiscard]] auto take() noexcept -> std::coroutine_handle<> {
         return std::exchange(handle_, {});
     }
+    [[nodiscard]] auto waiting() const noexcept -> bool { return handle_ != nullptr; }
 
 private:
     std::coroutine_handle<> handle_{};
@@ -787,13 +791,13 @@ private:
 // on a waiter_slot until Ready holds. A stop request on the waiting chain
 // claims the slot and resumes the coroutine with http::stopped; whichever of
 // the wake and the stop claims the slot first is the only one that resumes.
-template <typename Ready>
+template <typename Ready, template <class> class Queue>
 class park_until {
 public:
-    park_until(waiter_slot& slot, Ready ready) : slot_(slot), ready_(std::move(ready)) {}
+    park_until(waiter_slot<Queue>& slot, Ready ready) : slot_(slot), ready_(std::move(ready)) {}
     // At a boundary that takes its stop token as an argument (a body read), that
     // token governs the wait instead of the chain's.
-    park_until(waiter_slot& slot, Ready ready, const std::stop_token& stop)
+    park_until(waiter_slot<Queue>& slot, Ready ready, const std::stop_token& stop)
         : slot_(slot), ready_(std::move(ready)), stop_(&stop) {}
     park_until(const park_until&) = delete;
     auto operator=(const park_until&) -> park_until& = delete;
@@ -841,7 +845,7 @@ private:
         }
     };
 
-    waiter_slot& slot_;
+    waiter_slot<Queue>& slot_;
     Ready ready_;
     const std::stop_token* stop_{nullptr};
     bool cancelled_{false};
@@ -919,11 +923,18 @@ struct stop_bridge {
         }
     };
 
-    std::stop_source source{};
-    std::stop_token token{source.get_token()};
+    std::stop_source source{std::nostopstate};
+    std::stop_token token{};
     std::optional<stdexec::stop_callback_for_t<Token, forward>> callback{};
 
-    void attach(Token outer) { callback.emplace(std::move(outer), forward{&source}); }
+    auto attach(Token outer) -> bool {
+        if (outer.stop_requested()) return false;
+        if (!outer.stop_possible()) return true;
+        source = std::stop_source{};
+        token = source.get_token();
+        callback.emplace(std::move(outer), forward{&source});
+        return !token.stop_requested();
+    }
     void detach() noexcept { callback.reset(); }
 };
 
@@ -931,7 +942,10 @@ template <>
 struct stop_bridge<std::stop_token> {
     std::stop_token token{};
 
-    void attach(std::stop_token outer) noexcept { token = std::move(outer); }
+    auto attach(std::stop_token outer) noexcept -> bool {
+        token = std::move(outer);
+        return !token.stop_requested();
+    }
     void detach() noexcept {}
 };
 
@@ -939,8 +953,51 @@ template <stdexec::unstoppable_token Token>
 struct stop_bridge<Token> {
     std::stop_token token{};
 
-    void attach(Token) noexcept {}
+    auto attach(Token) noexcept -> bool { return true; }
     void detach() noexcept {}
+};
+
+// A direct coroutine boundary. The child keeps its native task frame; only
+// the stop-token representation and stopped continuation cross the boundary.
+template <typename T, typename Tag, typename Promise>
+class foreign_task_awaiter {
+public:
+    foreign_task_awaiter(basic_task<T, Tag> child, Promise& parent)
+        : child_(std::move(child)), parent_(&parent) {}
+    foreign_task_awaiter(const foreign_task_awaiter&) = delete;
+    auto operator=(const foreign_task_awaiter&) -> foreign_task_awaiter& = delete;
+
+    auto await_ready() const noexcept -> bool { return false; }
+    auto await_suspend(std::coroutine_handle<> continuation) -> std::coroutine_handle<> {
+        if (!child_.handle_ || child_.started_)
+            throw usage_error("task: awaiting requires an unstarted task");
+        continuation_ = continuation;
+        if (!stop_.attach(stdexec::get_stop_token(stdexec::get_env(*parent_)))) {
+            stop_.detach();
+            return parent_->unhandled_stopped();
+        }
+        auto& promise = child_.handle_.promise();
+        promise.owner_ = this;
+        promise.complete_ = &complete;
+        promise.stop_ = &stop_.token;
+        child_.started_ = true;
+        return child_.handle_;
+    }
+    auto await_resume() -> T { return child_.result(); }
+
+private:
+    static auto complete(void* owner, task_promise_base& promise) noexcept -> std::coroutine_handle<> {
+        auto& self = *static_cast<foreign_task_awaiter*>(owner);
+        self.stop_.detach();
+        if (promise.exception_ && is_stopped(promise.exception_))
+            return self.parent_->unhandled_stopped();
+        return self.continuation_;
+    }
+    using token_type = stdexec::stop_token_of_t<stdexec::env_of_t<Promise>>;
+    basic_task<T, Tag> child_;
+    Promise* parent_;
+    std::coroutine_handle<> continuation_{};
+    stop_bridge<token_type> stop_{};
 };
 
 template <typename T>
@@ -966,7 +1023,7 @@ struct completion_of<void> {
 template <typename T, typename Operation>
 class execution_sender {
 public:
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = typename detail::completion_of<T>::type;
 
     explicit execution_sender(Operation operation) : operation_(std::move(operation)) {}
@@ -979,7 +1036,7 @@ public:
     template <typename Receiver>
     class state {
     public:
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
 
         state(Operation operation, Receiver receiver)
             : operation_(std::move(operation)), receiver_(std::move(receiver)) {}
@@ -988,8 +1045,7 @@ public:
 
         void start() noexcept {
             try {
-                stop_.attach(stdexec::get_stop_token(stdexec::get_env(receiver_)));
-                if (stop_.token.stop_requested()) {
+                if (!stop_.attach(stdexec::get_stop_token(stdexec::get_env(receiver_)))) {
                     stop_.detach();
                     auto receiver = std::move(receiver_);
                     stdexec::set_stopped(std::move(receiver));
@@ -1047,7 +1103,7 @@ public:
         Operation operation_;
         Receiver receiver_;
         detail::stop_bridge<token_type> stop_{};
-        task<T> task_{};
+        std::invoke_result_t<Operation&&> task_{};
     };
 
     template <typename Receiver>
@@ -1085,12 +1141,40 @@ struct received {
     Body body;
 };
 
+// A borrowed contiguous body. Its bytes outlive the operation that reads it.
+class span_body {
+public:
+    explicit span_body(std::span<const std::byte> bytes) noexcept : remaining_(bytes) {}
+    [[nodiscard]] auto empty() const noexcept -> bool { return remaining_.empty(); }
+    auto read(std::span<std::byte> output) noexcept -> std::size_t {
+        auto size = std::min(output.size(), remaining_.size());
+        std::ranges::copy(remaining_.first(size), output.begin());
+        remaining_ = remaining_.subspan(size);
+        return size;
+    }
+    struct read_awaiter {
+        span_body& body;
+        std::span<std::byte> output;
+        auto await_ready() const noexcept -> bool { return true; }
+        void await_suspend(std::coroutine_handle<>) const noexcept {}
+        auto await_resume() noexcept -> std::size_t { return body.read(output); }
+    };
+    auto async_read(std::span<std::byte> output, std::stop_token) noexcept -> read_awaiter {
+        return {*this, output};
+    }
+private:
+    std::span<const std::byte> remaining_;
+};
+
 // An in-memory body_stream used to supply a request/response body on the write
 // path. Move-only; async_read yields the buffered bytes, then 0 at EOF.
 class buffer_body {
 public:
     buffer_body() = default;
     explicit buffer_body(std::vector<std::byte> data) : data_(std::move(data)) {}
+
+    [[nodiscard]] auto empty() const noexcept -> bool { return data_.empty(); }
+    auto read(std::span<std::byte> output) -> std::size_t { return data_.read(output); }
 
     struct read_awaiter {
         buffer_body& self;
@@ -1099,7 +1183,7 @@ public:
         bool await_ready() noexcept { return true; }
         void await_suspend(std::coroutine_handle<>) noexcept {}
         auto await_resume() noexcept -> std::size_t {
-            return self.data_.read(buf);
+            return self.read(buf);
         }
     };
 
@@ -1130,7 +1214,7 @@ public:
     // true once the body reached EOF (and the buffer is empty). The read takes
     // the calling chain's stop token. The staging buffer is allocated once and
     // never zero-filled.
-    auto refill() -> task<bool> {
+    auto refill() -> detail::operation<bool> {
         if (eof_) co_return true;
         if (offset_ < size_) co_return false;
         if (!buffer_)
@@ -1164,6 +1248,7 @@ public:
         return std::nullopt;
     }
 
+    void detach() noexcept { offset_ = size_ = 0; eof_ = false; }
     [[nodiscard]] auto eof() const -> bool { return eof_; }
     [[nodiscard]] auto drained() const -> bool { return offset_ >= size_; }
 
@@ -1174,6 +1259,43 @@ private:
     std::size_t offset_{0};
     std::size_t size_{0};
     bool eof_{false};
+};
+
+// Contiguous bodies need no asynchronous staging allocation or refill frame.
+template <body_stream Body>
+    requires(std::same_as<Body, buffer_body> || std::same_as<Body, span_body>)
+class body_bridge<Body> {
+public:
+    explicit body_bridge(Body& body) noexcept : body_(body) {}
+    body_bridge(const body_bridge&) = delete;
+    auto operator=(const body_bridge&) -> body_bridge& = delete;
+    struct refill_awaiter {
+        bool eof;
+        auto await_ready() const noexcept -> bool { return true; }
+        void await_suspend(std::coroutine_handle<>) const noexcept {}
+        auto await_resume() const noexcept -> bool { return eof; }
+    };
+    auto refill() noexcept -> refill_awaiter {
+        phase_ = body_.empty() ? phase::eof : phase::data;
+        return {phase_ == phase::eof};
+    }
+    auto read(std::uint8_t* destination, std::size_t size, bool& eof) -> std::optional<std::size_t> {
+        if (phase_ == phase::waiting) return std::nullopt;
+        if (phase_ == phase::eof) {
+            eof = true;
+            return 0;
+        }
+        auto count = body_.read({reinterpret_cast<std::byte*>(destination), size});
+        if (body_.empty()) phase_ = phase::waiting;
+        return count;
+    }
+    void detach() noexcept { phase_ = phase::waiting; }
+    [[nodiscard]] auto eof() const noexcept -> bool { return phase_ == phase::eof; }
+    [[nodiscard]] auto drained() const noexcept -> bool { return body_.empty(); }
+private:
+    enum class phase { waiting, data, eof };
+    Body& body_;
+    phase phase_{phase::waiting};
 };
 
 // The single transport abstraction: an asynchronous byte stream. No copy
@@ -1192,13 +1314,38 @@ concept byte_stream = requires(
     { s.async_write(wb, stop) } -> detail::awaitable_result<std::size_t>;
 };
 
+// A stream whose primitive I/O follows the sender/receiver protocol.
+template <class S> auto read_some(S& stream, std::span<std::byte> bytes) -> decltype(stream.read_some(bytes)) { return stream.read_some(bytes); }
+template <class S> auto write_some(S& stream, std::span<const std::byte> bytes) -> decltype(stream.write_some(bytes)) { return stream.write_some(bytes); }
+
+template <typename S>
+concept sender_stream = requires(S& stream, std::span<std::byte> input, std::span<const std::byte> output) {
+    requires stdexec::sender_of<decltype(read_some(stream, input)), stdexec::set_value_t(std::size_t)>;
+    requires stdexec::sender_of<decltype(write_some(stream, output)), stdexec::set_value_t(std::size_t)>;
+};
+
+template <sender_stream S>
+class stream {
+public:
+    explicit stream(S& transport) noexcept : transport_(&transport) {}
+    auto async_read(std::span<std::byte> buffer, std::stop_token stop) {
+        return stdexec::write_env(read_some(*transport_, buffer), stdexec::prop{stdexec::get_stop_token, std::move(stop)});
+    }
+    auto async_write(std::span<const std::byte> buffer, std::stop_token stop) {
+        return stdexec::write_env(write_some(*transport_, buffer), stdexec::prop{stdexec::get_stop_token, std::move(stop)});
+    }
+
+private:
+    S* transport_;
+};
+
 namespace detail {
 
 // Writes the whole buffer with the calling chain's stop token. A transport
 // that reports no progress, or more bytes than it was given, breaks the
 // byte_stream contract.
 template <byte_stream S>
-auto write_all(S& stream, std::span<const std::byte> buffer) -> task<void> {
+auto write_all(S& stream, std::span<const std::byte> buffer) -> detail::operation<void> {
     auto& stop = co_await current_stop_token();
     while (!buffer.empty()) {
         auto written = co_await stream.async_write(buffer, stop);
@@ -1287,8 +1434,10 @@ concept stream_accepting = requires(F& factory, std::stop_token stop) {
 // The write-acknowledgement contract for HTTP/3. `accepted` is the number of
 // bytes the transport accepted for nghttp3_conn_add_write_offset; `buffer_release`
 // completes when the adapter no longer references the caller's span; and
-// `acknowledgement` completes with the number of peer-acknowledged bytes for
-// nghttp3_conn_add_ack_offset.
+// `acknowledgement` completes with the number of peer-acknowledged bytes, or
+// stopped once the write's stop token is requested. The endpoint awaits it off
+// the write path: a FIN acknowledgement completes the stream's sending side,
+// and shutdown waits for all of them.
 template <typename BufferRelease, typename Acknowledgement>
 struct stream_write_result {
     std::size_t accepted;
@@ -1351,3 +1500,36 @@ concept stream_factory =
     };
 
 } // namespace http
+
+export namespace http::detail {
+
+// Awaits work(), then cleanup() however the work ended (returned, threw or was
+// stopped). The work's failure wins over the cleanup's; otherwise the
+// cleanup's failure, then the work's value, is the outcome. Both callables
+// live in this frame, so a coroutine lambda's captures outlive its await.
+template <typename Work, typename Cleanup>
+auto finally(Work work, Cleanup cleanup) -> operation<typename std::invoke_result_t<Work&>::value_type> {
+    using value = typename std::invoke_result_t<Work&>::value_type;
+    std::conditional_t<std::is_void_v<value>, bool, std::optional<value>> result{};
+    std::exception_ptr failure;
+    try {
+        if constexpr (std::is_void_v<value>)
+            co_await work();
+        else
+            result.emplace(co_await work());
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    try {
+        co_await cleanup();
+    } catch (...) {
+        if (!failure)
+            failure = std::current_exception();
+    }
+    if (failure)
+        std::rethrow_exception(failure);
+    if constexpr (!std::is_void_v<value>)
+        co_return std::move(*result);
+}
+
+} // namespace http::detail

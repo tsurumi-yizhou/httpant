@@ -87,7 +87,11 @@ inline auto make_settings() -> llhttp_settings_t {
             st->value_seen = false;
         }
         st->headers_done = true;
-        st->status_code = static_cast<http::status>(p->status_code);
+        if (auto status = http::status::from_number(
+                static_cast<std::uint16_t>(p->status_code)))
+            st->status_code = *status;
+        else
+            st->status_overflow = true;
         st->req_method = from_llhttp_method(static_cast<llhttp_method_t>(p->method));
         st->keep_alive = llhttp_should_keep_alive(p) != 0;
         st->upgraded = llhttp_get_upgrade(p) != 0;
@@ -117,7 +121,11 @@ inline auto make_settings() -> llhttp_settings_t {
     s.on_body = [](llhttp_t* p, const char* at, std::size_t len) -> int {
         auto* st = static_cast<parser_state*>(p->data);
         auto bytes = std::as_bytes(std::span{at, len});
-        st->body.append(bytes);
+        auto size = std::min(bytes.size(), st->body_output.size() - st->body_written);
+        std::ranges::copy(bytes.first(size), st->body_output.subspan(st->body_written).begin());
+        st->body_written += size;
+        if (size != bytes.size())
+            st->body.append(bytes.subspan(size));
         return 0;
     };
     s.on_message_complete = [](llhttp_t* p) -> int {
@@ -235,7 +243,7 @@ public:
     // verbatim; framing validation (including Content-Length comma-lists, RFC
     // 9112 §6.3 item 5) is llhttp's strict check, not a hand-rolled pre-pass.
     template <byte_stream S>
-    auto read_headers(S& transport) -> task<void> {
+    auto read_headers(S& transport) -> http::detail::operation<void> {
         auto& stop = co_await current_stop_token();
         while (!state_.headers_done) {
             if (!pending_.empty()) {
@@ -251,12 +259,9 @@ public:
                 // recipient MUST consider the message to be incomplete."
                 throw protocol_error{
                     error_info{
-                        .version = protocol_version::http1,
-                        .scope = error_scope::connection,
                         .condition = error_condition::peer_closed,
                         .exchange_identity = std::nullopt,
                         .library_code = std::nullopt,
-                        .retryable = false,
                     },
                     close_connection{std::nullopt},
                     "http/1.1: connection closed before headers"};
@@ -278,7 +283,8 @@ public:
     auto read_body(
         S& transport,
         std::span<std::byte> buf,
-        std::stop_token stop) -> task<std::size_t> {
+        std::stop_token stop) -> http::detail::operation<std::size_t> {
+        if (buf.empty()) co_return 0;
         for (;;) {
             if (state_.upgraded)
                 co_return 0;
@@ -292,7 +298,7 @@ public:
                 auto p = std::move(pending_);
                 resume_paused();
                 try {
-                    feed(p);
+                    if (auto size = feed_body(p, buf)) co_return size;
                 } catch (const protocol_error& failure) {
                     rethrow_body_phase_failure(failure);
                 }
@@ -305,7 +311,8 @@ public:
                 continue;
             }
             try {
-                feed(std::span<const std::byte>{buffer_.data(), static_cast<std::size_t>(n)});
+                if (auto size = feed_body(std::span<const std::byte>{buffer_.data(), static_cast<std::size_t>(n)}, buf))
+                    co_return size;
             } catch (const protocol_error& failure) {
                 rethrow_body_phase_failure(failure);
             }
@@ -321,13 +328,12 @@ public:
     // unconditional close, and the connection is latched closed so persistence
     // state stays consistent.
     [[noreturn]] void rethrow_body_phase_failure(const protocol_error& failure) {
-        if (failure.info().version == protocol_version::http1 &&
-            failure.info().condition == error_condition::malformed_message) {
-            auto info = failure.info();
-            info.scope = error_scope::connection;
+        // The action, not a version comparison, decides the scope: a body-phase
+        // framing error closes the connection (RFC 9112 §6.3 item 6).
+        if (failure.info().condition == error_condition::malformed_message) {
             connection_closed_ = true;
             throw protocol_error{
-                info,
+                failure.info(),
                 close_connection{std::nullopt},
                 failure.what()};
         }
@@ -401,6 +407,20 @@ public:
     [[nodiscard]] auto connection_upgraded() const -> bool { return connection_upgraded_; }
 
 private:
+    auto feed_body(std::span<const std::byte> bytes, std::span<std::byte> output) -> std::size_t {
+        state_.body_output = output;
+        state_.body_written = 0;
+        try {
+            feed(bytes);
+        } catch (...) {
+            state_.body_output = {};
+            state_.body_written = 0;
+            throw;
+        }
+        state_.body_output = {};
+        return std::exchange(state_.body_written, 0);
+    }
+
     void feed(std::span<const std::byte> bytes) {
         consume(parser_, state_, pending_, bytes);
         if (state_.complete) {
@@ -454,12 +474,9 @@ private:
         if (!state_.complete)
             throw protocol_error{
                 error_info{
-                    .version = protocol_version::http1,
-                    .scope = error_scope::connection,
                     .condition = error_condition::peer_closed,
                     .exchange_identity = std::nullopt,
                     .library_code = std::nullopt,
-                    .retryable = false,
                 },
                 close_connection{std::nullopt},
                 std::string(message)};
@@ -505,7 +522,7 @@ public:
 
     auto async_read(
         std::span<std::byte> buf,
-        std::stop_token stop) -> task<std::size_t> {
+        std::stop_token stop) -> http::detail::operation<std::size_t> {
         // An exchange can be born consumed — a response to HEAD ends at the
         // header section (RFC 9110 §9.3.2) — in which case the parser must not
         // be touched: it still expects the Content-Length it saw on the wire.

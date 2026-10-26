@@ -8,7 +8,38 @@ namespace httpant::testing {
 using namespace boost::ut;
 using namespace std::literals;
 
+static auto request_fields(const http::request& request) {
+    auto owned = request;
+    return http::detail::make_request_field_block(owned, [](std::string_view name, std::string_view value) {
+        return http::header{std::string{name}, std::string{value}};
+    });
+}
+
 static suite<"message"> message_suite = [] {
+    "request_field_paths_preserve_queries_and_empty_absolute_paths"_test = [] {
+        for (auto target : {"/x?a=1", "https://example.com/x?a=1", "https://example.com?a=1"}) {
+            auto block = request_fields(http::request{.target = target, .scheme = "https", .authority = "example.com"});
+            expect(block.has_value());
+            auto found = std::ranges::find(*block, ":path"sv, &http::header::name);
+            expect(found != block->end());
+            expect(found->value == (std::string_view{target} == "https://example.com?a=1" ? "/?a=1"sv : "/x?a=1"sv));
+        }
+        http::request absolute{.target = "https://example.com?a=/x"};
+        expect(http::request_authority(absolute).value_or("") == "example.com"sv);
+        expect(http::request_path(absolute).value_or("") == "/"sv);
+        http::request redirect{.target = "/redirect?next=https://foreign.example/", .fields = {{"host", "example.com"}}};
+        expect(http::request_authority(redirect).value_or("") == "example.com"sv);
+        expect(http::request_path_and_query(redirect).value_or("") == redirect.target);
+        for (auto invalid : {"a?u=http://victim/", "1http://victim/", "://victim/"}) {
+            http::request malformed{.target = invalid, .fields = {{"host", "example.com"}}};
+            expect(http::request_authority(malformed).value_or("") == "example.com"sv);
+            expect(!http::request_path_and_query(malformed));
+            expect(!http::request_scheme(malformed));
+        }
+        http::request custom{.target = "custom+v1.0://example.com/x"};
+        expect(http::request_scheme(custom).value_or("") == "custom+v1.0"sv);
+    };
+
     "http_message_types"_test = [] {
         // RFC 9110 §6.2 — "Request message control data includes a request
         // method (Section 9), request target (Section 7.1), and protocol
@@ -371,7 +402,7 @@ static suite<"message"> message_suite = [] {
             .scheme = "https",
             .authority = "example.com",
         };
-        auto block = http::detail::make_request_field_block(req);
+        auto block = request_fields(req);
         expect(block.has_value());
         auto field = [&](std::string_view name) -> std::string {
             for (auto& h : *block)
@@ -386,7 +417,7 @@ static suite<"message"> message_suite = [] {
         // value for the ':method', ':scheme', and ':path' pseudo-header fields" —
         // an asterisk-form OPTIONS still requires an explicit scheme.
         http::request no_scheme{.method = http::method::OPTIONS, .target = "*"};
-        expect(!http::detail::make_request_field_block(no_scheme).has_value());
+        expect(!request_fields(no_scheme).has_value());
     };
 
     "connect_authority_validated_as_authority_form"_test = [] {
@@ -400,7 +431,7 @@ static suite<"message"> message_suite = [] {
             .method = http::method::CONNECT,
             .target = "example.com:443",
         };
-        auto block = http::detail::make_request_field_block(valid);
+        auto block = request_fields(valid);
         expect(block.has_value());
         bool has_authority = false, has_path = false, has_scheme = false;
         for (auto& h : *block) {
@@ -420,13 +451,13 @@ static suite<"message"> message_suite = [] {
             .method = http::method::CONNECT,
             .authority = "example.com",
         };
-        expect(http::detail::make_request_field_block(no_port).error() ==
+        expect(request_fields(no_port).error() ==
                http::detail::request_field_error::malformed_connect_authority);
         http::request bad_port{
             .method = http::method::CONNECT,
             .authority = "example.com:abc",
         };
-        expect(http::detail::make_request_field_block(bad_port).error() ==
+        expect(request_fields(bad_port).error() ==
                http::detail::request_field_error::malformed_connect_authority);
 
         // RFC 9113 §8.3.1 — "':authority' MUST NOT include the deprecated userinfo
@@ -436,7 +467,7 @@ static suite<"message"> message_suite = [] {
             .method = http::method::CONNECT,
             .authority = "user@example.com:443",
         };
-        expect(http::detail::make_request_field_block(userinfo).error() ==
+        expect(request_fields(userinfo).error() ==
                http::detail::request_field_error::malformed_connect_authority);
 
         // RFC 9112 §3.2.3 — "authority-form = uri-host ":" port" — a colon inside
@@ -446,7 +477,7 @@ static suite<"message"> message_suite = [] {
             .method = http::method::CONNECT,
             .authority = "a:b:443",
         };
-        expect(http::detail::make_request_field_block(unbracketed_colon).error() ==
+        expect(request_fields(unbracketed_colon).error() ==
                http::detail::request_field_error::malformed_connect_authority);
 
         // RFC 9112 §3.2.3 — "authority-form = uri-host ":" port"; RFC 3986 §3.2.2 —
@@ -457,7 +488,7 @@ static suite<"message"> message_suite = [] {
             .method = http::method::CONNECT,
             .authority = "[::1]:443",
         };
-        auto ipv6_block = http::detail::make_request_field_block(ipv6);
+        auto ipv6_block = request_fields(ipv6);
         expect(ipv6_block.has_value());
         bool ipv6_authority = false;
         for (auto& h : *ipv6_block)
@@ -476,7 +507,7 @@ static suite<"message"> message_suite = [] {
             .authority = "example.com",
             .fields = {{"host", "example.com"}},
         };
-        auto block = http::detail::make_request_field_block(req);
+        auto block = request_fields(req);
         expect(block.has_value());
         expect((*block)[0].name == ":method"sv);
         expect((*block)[0].value == "PROPFIND"sv);

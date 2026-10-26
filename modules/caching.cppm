@@ -593,7 +593,7 @@ enum class cache_action : std::uint8_t {
 }
 
 [[nodiscard]] inline auto is_default_cacheable_status(status value) -> bool {
-    switch (value) {
+    switch (value.code()) {
         case 200:
         case 203:
         case 204:
@@ -639,10 +639,9 @@ enum class cache_action : std::uint8_t {
         return std::unexpected{storage_rejection::unsupported_method};
     // RFC 9111 §3 — "A cache MUST NOT store a response to a request unless:
     // ... the response status code is final (see Section 15 of [HTTP])" — a
-    // 1xx response is interim, not final, and RFC 9110 §15 — "All valid
-    // status codes are within the range of 100 to 599, inclusive" — so a
-    // code outside that range is invalid; neither is storable.
-    if (response.status < 200 || response.status > 599)
+    // 1xx response is interim, not final. (A code outside RFC 9110 §15's
+    // 100-599 range cannot reach here: http::status cannot hold one.)
+    if (response.status < 200)
         return std::unexpected{storage_rejection::uncacheable_status};
     // RFC 9111 §3 — "... if the response status code is 206 or 304, or the
     // must-understand cache directive ... is present: the cache understands

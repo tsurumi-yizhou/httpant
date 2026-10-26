@@ -53,25 +53,32 @@ inline auto read_outbound_body(
 // The outbound body machinery shared by client requests and server (including
 // pushed) responses: a body_bridge the exchange coroutine refills, an
 // outbound_body_state nghttp2's data provider drains, and the provider binding
-// the two. The provider's source points at the shared state, so the binding
-// must be moved as a whole (the provider never outlives the binding).
+// the two. One shared allocation owns both objects; a registry reference to
+// the state keeps its inline bridge alive after the exchange completes.
 template <body_stream Body>
 struct outbound_body_binding {
-    std::shared_ptr<body_bridge<Body>> bridge;
+    body_bridge<Body>* bridge;
     std::shared_ptr<outbound_body_state> state;
     nghttp2_data_provider2 provider;
 };
 
 template <body_stream Body>
 inline auto bind_outbound_body(Body& body) -> outbound_body_binding<Body> {
-    auto bridge = std::make_shared<body_bridge<Body>>(body);
-    auto state = std::make_shared<outbound_body_state>();
-    state->read = [bridge](std::uint8_t* destination, std::size_t size, bool& eof) {
-        return bridge->read(destination, size, eof);
+    struct state_with_body : outbound_body_state {
+        explicit state_with_body(Body& body) : bridge(body) {}
+        body_bridge<Body> bridge;
     };
-    auto* raw_state = state.get();
+    auto state = std::make_shared<state_with_body>(body);
+    auto* bridge = &state->bridge;
+    state->read = outbound_reader{
+        .bridge = bridge,
+        .read = +[](void* object, std::uint8_t* destination, std::size_t size, bool& eof) {
+            return static_cast<body_bridge<Body>*>(object)->read(destination, size, eof);
+        },
+    };
+    outbound_body_state* raw_state = state.get();
     return {
-        .bridge = std::move(bridge),
+        .bridge = bridge,
         .state = std::move(state),
         .provider = nghttp2_data_provider2{
             .source = nghttp2_data_source{.ptr = raw_state},

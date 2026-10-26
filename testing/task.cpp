@@ -15,13 +15,13 @@ namespace {
 // A sender that reports what its receiver's environment has: whether the
 // stop token can be stopped, or set_stopped once it has been.
 struct stop_probe {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<
         stdexec::set_value_t(bool), stdexec::set_stopped_t()>;
 
     template <typename Receiver>
     struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         Receiver receiver;
 
         void start() noexcept {
@@ -42,6 +42,43 @@ struct stop_probe {
 } // namespace
 
 static suite<"task"> task_suite = [] {
+    "a_completed_root_can_transfer_its_result_to_an_awaiter"_test = [] {
+        auto value = []() -> http::task<int> { co_return 19; };
+        auto child = value();
+        child.start();
+        auto parent = [&]() -> http::task<int> { co_return co_await std::move(child); };
+        expect(run_sync(parent()) == 19_i);
+    };
+
+    "awaiting_a_started_task_keeps_its_existing_owner"_test = [] {
+        auto suspend = []() -> http::task<void> { co_await std::suspend_always{}; };
+        auto child = suspend();
+        child.start();
+        bool rejected = false;
+        try { auto waiter = std::move(child).operator co_await(); }
+        catch (const http::usage_error&) { rejected = true; }
+        expect(rejected && !child.done());
+        rejected = false;
+        std::stop_token stop;
+        try { auto waiter = http::with_stop(stop, std::move(child)); }
+        catch (const http::usage_error&) { rejected = true; }
+        expect(rejected && !child.done());
+    };
+
+    "borrowed_body_reads_the_live_bytes_without_owning_a_copy"_test = [] {
+        std::array<std::byte, 5> input{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}, std::byte{5}};
+        http::span_body body{input};
+        input[0] = std::byte{9};
+        std::array<std::byte, 3> output{};
+        expect(body.async_read(output, {}).await_resume() == 3_u);
+        expect(output[0] == std::byte{9});
+        expect(!body.empty());
+        expect(body.async_read(output, {}).await_resume() == 2_u);
+        expect(output[0] == std::byte{4} && output[1] == std::byte{5});
+        expect(body.empty());
+        expect(body.async_read(output, {}).await_resume() == 0_u);
+    };
+
     // Coroutine frames come from a per-thread pool of size classes: a freed
     // frame is the next one handed out for its class, frames of one class are
     // interchangeable, and sizes beyond the largest class go to the heap.

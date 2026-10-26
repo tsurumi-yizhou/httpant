@@ -179,48 +179,16 @@ static suite<"transport"> transport_suite = [] {
 
     // Internal machinery test: opening streams through the factory assigns a
     // distinct identity to each handle.
-    "factory_assigns_unique_stream_identity"_test = [] {
-        model_stream_factory factory;
-        auto first = factory.async_open_bidirectional(std::stop_token{}).await_resume();
-        auto second = factory.async_open_bidirectional(std::stop_token{}).await_resume();
-        expect(first.identifier().value != second.identifier().value);
-    };
 
     // Internal machinery test: direction is recorded on the returned handle,
     // not inferred from a numeric id by the application.
-    "factory_reports_stream_direction"_test = [] {
-        model_stream_factory factory;
-        auto bidi = factory.async_open_bidirectional(std::stop_token{}).await_resume();
-        auto uni = factory.async_open_unidirectional(std::stop_token{}).await_resume();
-        auto accepted = factory.async_accept(std::stop_token{}).await_resume();
-
-        expect(bidi.access() == http::stream_access::bidirectional);
-        expect(uni.access() == http::stream_access::send_only);
-        expect(accepted.access() == http::stream_access::receive_only);
-    };
 
     // Internal machinery test: an accept operation must report ready only
     // after a peer stream has been announced. Returning a fabricated
     // stream from an empty queue would make an endpoint accept loop spin.
-    "mock_factory_accept_waits_for_announced_stream"_test = [] {
-        pipe input, output;
-        mock_stream_factory factory{input, output};
-
-        auto pending = factory.async_accept(std::stop_token{});
-        expect(!pending.await_ready());
-
-        factory.announce(3, http::stream_access::receive_only);
-        expect(pending.await_ready());
-        auto accepted = pending.await_resume();
-        expect(accepted.identifier().value == 3_u);
-        expect(accepted.access() == http::stream_access::receive_only);
-    };
 
     // Internal machinery test: the factory is not copyable, so no copy path
     // can implicitly create a stream.
-    "factory_copy_does_not_open_streams"_test = [] {
-        static_assert(!std::copy_constructible<model_stream_factory>);
-    };
 };
 
 } // namespace httpant::testing

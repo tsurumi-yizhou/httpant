@@ -27,12 +27,13 @@ inline auto make_settings(const configuration& config) -> nghttp3_settings {
     return settings;
 }
 
+template <template <class> class Queue>
 inline auto create_connection(
     endpoint_role role,
-    conn_context& context,
+    conn_context<Queue>& context,
     const configuration& config) -> connection_handle
 {
-    auto callbacks = make_callbacks();
+    auto callbacks = make_callbacks<Queue>();
     auto settings = make_settings(config);
     nghttp3_conn* raw_connection = nullptr;
     auto result = role == endpoint_role::client
@@ -59,7 +60,8 @@ inline auto create_connection(
     return connection_handle{raw_connection};
 }
 
-[[nodiscard]] inline auto compression_state(const conn_context& context)
+template <template <class> class Queue>
+[[nodiscard]] inline auto compression_state(const conn_context<Queue>& context)
     -> qpack_state
 {
     return qpack_state{
@@ -71,126 +73,19 @@ inline auto create_connection(
     };
 }
 
-// Flushes each nghttp3_conn_writev_stream batch. Only bytes the transport
-// accepted advance the nghttp3 write offset — a partially accepting
-// backend retries the remainder instead of nghttp3 losing track of unsent
-// data. Buffer release is awaited before the caller's span can change;
-// acknowledgement advances nghttp3's ACK offset and releases retained body
-// chunks through acked_stream_data.
-template <typename StreamMap>
-inline auto flush_output(
-    conn_context& ctx,
-    nghttp3_conn* conn,
-    StreamMap& open_streams,
-    std::stop_token stop) -> task<void>
-{
-    std::int64_t sid = -1;
-    int fin = 0;
-    nghttp3_vec vec[8];
-    for (;;) {
-        auto n = nghttp3_conn_writev_stream(conn, &sid, &fin, vec, 8);
-        if (n < 0) {
-            rethrow_callback_failure(ctx);
-            // RFC 9114 §8 — the negative code means the connection must be
-            // closed; infer the H3 application error code (Section 8.1) and
-            // record it for the upper layer to carry on CONNECTION_CLOSE.
-            auto wire_code = nghttp3_err_infer_quic_app_error_code(static_cast<int>(n));
-            record_connection_error(ctx, conn, wire_code);
-            throw protocol_error{
-                error_info{
-                    .version = protocol_version::http3,
-                    .scope = error_scope::connection,
-                    .condition = error_condition::malformed_frame,
-                    .exchange_identity = std::nullopt,
-                    .library_code = static_cast<int>(n),
-                    .retryable = false,
-                },
-                close_connection{error_code{wire_code}},
-                std::format("http/3: writev_stream failed ({})", n)};
-        }
-        rethrow_callback_failure(ctx);
-        if (n == 0 && fin == 0) break;
-
-        auto it = open_streams.find(sid);
-        if (it == open_streams.end())
-            throw std::logic_error("http/3: write on an unknown stream");
-        auto& stream = *it->second;
-
-        // The read_data contract keeps each vec's bytes owned by the caller
-        // until acked; they are copied into one stable buffer per batch.
-        std::vector<std::byte> data;
-        auto count = static_cast<std::size_t>(n);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto bytes = std::as_bytes(std::span{
-                reinterpret_cast<const char*>(vec[i].base), vec[i].len});
-            data.insert(data.end(), bytes.begin(), bytes.end());
-        }
-
-        if (data.empty()) {
-            // FIN-only batch: the nghttp3 contract reports a zero-byte write
-            // offset once the FIN has been handed to the transport.
-            auto result = co_await stream.async_write(std::span<const std::byte>{}, fin != 0, stop);
-            co_await std::move(result.buffer_release);
-            auto acknowledged = co_await std::move(result.acknowledgement);
-            static_cast<void>(result.accepted);
-            check(nghttp3_conn_add_write_offset(conn, sid, 0), "add_write_offset");
-            check(nghttp3_conn_add_ack_offset(conn, sid, acknowledged), "add_ack_offset");
-            continue;
-        }
-
-        try {
-            auto remaining = std::span<const std::byte>{data};
-            // FIN is kept off the data-bearing writes. If a
-            // transport accepts a partial write, the FIN would otherwise be
-            // delivered before the final byte, closing the send side early.
-            // Data is drained first, then a zero-length FIN-only write is
-            // emitted exactly once when nghttp3 requested stream finalization.
-            while (!remaining.empty()) {
-                auto result = co_await stream.async_write(remaining, false, stop);
-                co_await std::move(result.buffer_release);
-                auto acknowledged = co_await std::move(result.acknowledgement);
-                if (result.accepted == 0)
-                    throw usage_error("transport: stream write made no progress");
-                if (result.accepted > remaining.size())
-                    throw usage_error("transport: stream write accepted too many bytes");
-                if (acknowledged > result.accepted)
-                    throw usage_error("transport: stream write acknowledged too many bytes");
-                check(
-                    nghttp3_conn_add_write_offset(conn, sid, static_cast<nghttp3_ssize>(result.accepted)),
-                    "add_write_offset");
-                check(nghttp3_conn_add_ack_offset(conn, sid, acknowledged), "add_ack_offset");
-                remaining = remaining.subspan(result.accepted);
-            }
-            if (fin != 0) {
-                auto result = co_await stream.async_write(std::span<const std::byte>{}, true, stop);
-                co_await std::move(result.buffer_release);
-                auto acknowledged = co_await std::move(result.acknowledgement);
-                if (result.accepted != 0)
-                    throw usage_error("transport: FIN-only write accepted bytes");
-                if (acknowledged != 0)
-                    throw usage_error("transport: FIN-only write acknowledged bytes");
-                check(nghttp3_conn_add_write_offset(conn, sid, 0), "add_write_offset");
-                check(nghttp3_conn_add_ack_offset(conn, sid, acknowledged), "add_ack_offset");
-            }
-        } catch (const http::stream_reset& reset) {
-            // RFC 9114 §4.1.1 — the peer abandoned this one stream
-            // (STOP_SENDING); close it at the sole protocol owner and keep
-            // flushing the other streams. Abandon the retained body chunk so
-            // a pump_outbound_body parked on ACK wakes and exits instead of
-            // waiting for an ACK that can no longer arrive.
-            if (auto it = ctx.core.outbound_bodies.find(sid); it != ctx.core.outbound_bodies.end()) {
-                auto& state = *it->second;
-                state.data.clear();
-                state.acknowledged = 0;
-                state.offered = false;
-                state.eof = true;
-                state.resume_ack_waiter();
-            }
-            if (nghttp3_conn_close_stream(conn, sid, reset.error_code.value) != 0)
-                mark_stream_closed(ctx, sid, reset.error_code.value);
-            open_streams.erase(sid);
-        }
-    }
+template <template <class> class Queue>
+inline void close_finished_stream(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t id) {
+    auto input = ctx.inputs.find(id);
+    if ((id & 2) || input == ctx.inputs.end() || !input->second.closed ||
+        !input->second.fin_acknowledged || input->second.finished)
+        return;
+    if (auto exchange = ctx.core.streams.find(id);
+        exchange != ctx.core.streams.end() && !exchange->second->core.complete)
+        return; // QPACK can still be decoding a field section received at FIN.
+    // Both QUIC directions have completed: the peer's FIN was read and our
+    // FIN was acknowledged. nghttp3 retains its stream until told it closed.
+    input->second.finished = true;
+    check(nghttp3_conn_close_stream(conn, id, NGHTTP3_H3_NO_ERROR), "close_stream");
 }
 
 // Serializes flush_output so only one coroutine may be inside
@@ -204,9 +99,10 @@ inline auto flush_output(
 // must complete — with an error once the connection has failed — so the
 // holder always reaches unlock() and the queue drains. This gate relies on
 // that contract.
+template <template <class> class Queue = http::queues::local>
 struct flush_gate {
     bool locked{false};
-    std::deque<std::coroutine_handle<>> waiters{};
+    http::queues::buffer<std::coroutine_handle<>, Queue> waiters{};
 
     struct lock_awaiter {
         flush_gate& gate;
@@ -236,7 +132,7 @@ struct flush_gate {
     }
 };
 
-template <stream_factory S>
+template <stream_factory S, template <class> class Queue>
 class endpoint_runtime {
 public:
     using stream_pointer = std::shared_ptr<typename S::stream_type>;
@@ -245,14 +141,14 @@ public:
     endpoint_runtime(
         S& transport,
         nghttp3_conn* connection,
-        conn_context& context,
+        conn_context<Queue>& context,
         stream_map& streams)
         : transport_(transport), connection_(connection), context_(context), streams_(streams) {}
 
     endpoint_runtime(const endpoint_runtime&) = delete;
     auto operator=(const endpoint_runtime&) -> endpoint_runtime& = delete;
 
-    auto start() -> task<void> {
+    auto start() -> http::detail::operation<void> {
         if (context_.core.connection_error)
             std::rethrow_exception(context_.core.connection_error);
         if (started_)
@@ -291,16 +187,16 @@ public:
     // Stops the accept loop and every stream reader and waits for them to
     // finish. Exchanges still parked on this connection are woken with
     // http::stopped.
-    auto close() -> task<void> {
+    auto close() -> http::detail::operation<void> {
         scope_.request_stop();
         co_await scope_.join();
         fail_connection(context_, std::make_exception_ptr(http::stopped{}));
     }
 
-    auto flush() -> task<void> {
+    auto flush() -> http::detail::operation<void> {
         co_await flush_gate_.lock();
         try {
-            co_await flush_output(context_, connection_, streams_, scope_.stop_token());
+            co_await flush_output(scope_.stop_token());
             reap_closed_streams();
         } catch (...) {
             flush_gate_.unlock();
@@ -309,10 +205,12 @@ public:
         flush_gate_.unlock();
     }
 
-    auto shutdown() -> task<void> {
+    auto shutdown() -> http::detail::operation<void> {
         check(nghttp3_conn_submit_shutdown_notice(connection_), "submit_shutdown_notice");
         check(nghttp3_conn_shutdown(connection_), "shutdown");
         co_await flush();
+        // Closing the connection abandons unacknowledged stream data.
+        co_await http::detail::park_until{acknowledged_, [this] { return unacknowledged_ == 0; }};
         if (!context_.connection_close_started) {
             context_.connection_close_started = true;
             // RFC 9114 §8.1 — H3_NO_ERROR indicates a graceful connection
@@ -330,7 +228,143 @@ public:
     }
 
 private:
-    auto accept_loop() -> task<void> {
+    // Flushes each nghttp3_conn_writev_stream batch. Only bytes the transport
+    // accepted advance the nghttp3 write offset, and buffer release is awaited
+    // before spans can change. Each batch is copied, so nghttp3's retained
+    // chunks are released as soon as the transport accepts the copy; peer
+    // acknowledgements are awaited by children and never pace the writes.
+    auto flush_output(std::stop_token stop) -> http::detail::operation<void> {
+        std::int64_t sid = -1;
+        int fin = 0;
+        nghttp3_vec vec[8];
+        for (;;) {
+            auto n = nghttp3_conn_writev_stream(connection_, &sid, &fin, vec, 8);
+            if (n < 0) {
+                rethrow_callback_failure(context_);
+                // RFC 9114 §8 — the negative code means the connection must be
+                // closed; infer the H3 application error code (Section 8.1) and
+                // record it for the upper layer to carry on CONNECTION_CLOSE.
+                auto code = nghttp3_err_infer_quic_app_error_code(static_cast<int>(n));
+                record_connection_error(context_, connection_, code);
+                throw protocol_error{
+                    error_info{
+                        .condition = error_condition::malformed_frame,
+                        .exchange_identity = std::nullopt,
+                        .library_code = static_cast<int>(n),
+                    },
+                    close_connection{code},
+                    std::format("http/3: writev_stream failed ({})", n)};
+            }
+            rethrow_callback_failure(context_);
+            if (n == 0 && fin == 0) break;
+
+            auto it = streams_.find(sid);
+            if (it == streams_.end())
+                throw std::logic_error("http/3: write on an unknown stream");
+            // Held by value: an acknowledgement child can abandon the stream
+            // while this flush is suspended in a write.
+            auto stream = it->second;
+
+            // The read_data interface keeps each vec's bytes owned by the caller
+            // until acked; they are copied into one stable buffer per batch.
+            std::vector<std::byte> data;
+            auto count = static_cast<std::size_t>(n);
+            for (std::size_t i = 0; i < count; ++i) {
+                auto bytes = std::as_bytes(std::span{
+                    reinterpret_cast<const char*>(vec[i].base), vec[i].len});
+                data.insert(data.end(), bytes.begin(), bytes.end());
+            }
+
+            try {
+                auto remaining = std::span<const std::byte>{data};
+                // FIN is kept off the data-bearing writes. If a transport
+                // accepts a partial write, the FIN would otherwise be delivered
+                // before the final byte, closing the send side early. Data is
+                // drained first, then a zero-length FIN-only write is emitted
+                // exactly once when nghttp3 requested stream finalization.
+                while (!remaining.empty()) {
+                    auto result = co_await stream->async_write(remaining, false, stop);
+                    co_await std::move(result.buffer_release);
+                    if (result.accepted == 0)
+                        throw usage_error("transport: stream write made no progress");
+                    if (result.accepted > remaining.size())
+                        throw usage_error("transport: stream write accepted too many bytes");
+                    check(
+                        nghttp3_conn_add_write_offset(connection_, sid, static_cast<nghttp3_ssize>(result.accepted)),
+                        "add_write_offset");
+                    check(nghttp3_conn_add_ack_offset(connection_, sid, result.accepted), "add_ack_offset");
+                    await_acknowledgement(sid, std::move(result.acknowledgement), result.accepted, false);
+                    remaining = remaining.subspan(result.accepted);
+                }
+                if (fin != 0) {
+                    // nghttp3 reports a zero-byte write offset once
+                    // the FIN has been handed to the transport.
+                    auto result = co_await stream->async_write(std::span<const std::byte>{}, true, stop);
+                    co_await std::move(result.buffer_release);
+                    if (result.accepted != 0)
+                        throw usage_error("transport: FIN-only write accepted bytes");
+                    check(nghttp3_conn_add_write_offset(connection_, sid, 0), "add_write_offset");
+                    await_acknowledgement(sid, std::move(result.acknowledgement), 0, true);
+                }
+            } catch (const http::stream_reset& reset) {
+                abandon(sid, reset);
+            }
+        }
+    }
+
+    template <typename Acknowledgement>
+    void await_acknowledgement(std::int64_t sid, Acknowledgement acknowledgement, std::size_t accepted, bool fin) {
+        ++unacknowledged_;
+        scope_.spawn(acknowledge(sid, std::move(acknowledgement), accepted, fin));
+    }
+
+    // A FIN acknowledgement completes the stream's sending side; shutdown
+    // waits for every acknowledgement before closing the connection.
+    template <typename Acknowledgement>
+    auto acknowledge(std::int64_t sid, Acknowledgement acknowledgement, std::size_t accepted, bool fin)
+        -> http::detail::operation<void>
+    {
+        try {
+            auto acknowledged = co_await std::move(acknowledgement);
+            if (acknowledged > accepted)
+                throw usage_error("transport: stream write acknowledged too many bytes");
+            if (fin && streams_.contains(sid)) {
+                {
+                    http::detail::wake_scope scope{wakeups_};
+                    context_.inputs[sid].fin_acknowledged = true;
+                    if (auto it = context_.core.outbound_bodies.find(sid); it != context_.core.outbound_bodies.end()) {
+                        it->second->finished = true;
+                        it->second->resume_ack_waiter();
+                    }
+                    close_finished_stream(context_, connection_, sid);
+                }
+                co_await http::detail::dispatch_wakeups{wakeups_};
+                reap_closed_streams();
+            }
+        } catch (const http::stream_reset& reset) {
+            abandon(sid, reset);
+        } catch (...) {
+            if (!scope_.stop_requested())
+                fail_connection(context_, std::current_exception());
+        }
+        if (--unacknowledged_ == 0)
+            acknowledged_.resume();
+    }
+
+    // RFC 9114 §4.1.1 — the peer abandoned this one stream (STOP_SENDING);
+    // close it at the sole protocol owner and keep the other streams running.
+    // Abandon the retained body chunk so a pump_outbound_body parked on ACK
+    // wakes and exits instead of waiting for an ACK that can no longer arrive.
+    void abandon(std::int64_t sid, const http::stream_reset& reset) {
+        if (streams_.erase(sid) == 0)
+            return;
+        if (auto it = context_.core.outbound_bodies.find(sid); it != context_.core.outbound_bodies.end())
+            terminate_outbound_body(*it->second);
+        if (nghttp3_conn_close_stream(connection_, sid, reset.error_code.value) != 0)
+            mark_stream_closed(context_, sid, reset.error_code.value);
+    }
+
+    auto accept_loop() -> http::detail::operation<void> {
         try {
             auto& stop = scope_.stop_token();
             while (!stop.stop_requested()) {
@@ -343,7 +377,7 @@ private:
         }
     }
 
-    auto read_stream_guarded(stream_pointer stream, bool peer_initiated) -> task<void> {
+    auto read_stream_guarded(stream_pointer stream, bool peer_initiated) -> http::detail::operation<void> {
         auto stream_id = to_stream_id(stream->identifier());
         std::exception_ptr failure;
         try {
@@ -428,7 +462,7 @@ private:
         fail_connection(context_, std::move(failure));
     }
 
-    auto read_stream(stream_pointer stream, bool peer_initiated) -> task<void> {
+    auto read_stream(stream_pointer stream, bool peer_initiated) -> http::detail::operation<void> {
         auto stream_id = to_stream_id(stream->identifier());
         auto unidirectional = peer_initiated
             ? accepted_stream_is_unidirectional(
@@ -470,6 +504,7 @@ private:
                     it = context_.deferred_consumption.erase(it);
                 }
                 if (size == 0) {
+                    close_finished_stream(context_, connection_, stream_id);
                     if (auto it = context_.core.streams.find(stream_id);
                         it != context_.core.streams.end())
                         it->second->core.resume_waiter();
@@ -481,6 +516,7 @@ private:
             if (input_failure)
                 std::rethrow_exception(input_failure);
             if (size == 0) {
+                reap_closed_streams();
                 // RFC 9114 §4.1 — "If a client-initiated stream terminates
                 // without enough of the HTTP message to provide a complete
                 // response, the server SHOULD abort its response stream with
@@ -513,12 +549,15 @@ private:
         std::erase_if(streams_, [&](const auto& entry) {
             if (connection_lifetime(entry.first))
                 return false;
+            close_finished_stream(context_, connection_, entry.first);
             auto it = context_.core.streams.find(entry.first);
-            if (it != context_.core.streams.end() && !it->second->core.closed)
+            auto input = context_.inputs.find(entry.first);
+            auto finished = input != context_.inputs.end() && input->second.finished;
+            if (!finished && it != context_.core.streams.end() && !it->second->core.closed)
                 return false;
             // A server request stream whose state was released early keeps its
             // handle: the response may still be written through it.
-            if (it == context_.core.streams.end() && !context_.is_client)
+            if (!finished && it == context_.core.streams.end() && !context_.is_client)
                 return false;
             context_.inputs.erase(entry.first);
             return true;
@@ -527,14 +566,16 @@ private:
 
     S& transport_;
     nghttp3_conn* connection_;
-    conn_context& context_;
+    conn_context<Queue>& context_;
     stream_map& streams_;
     std::unordered_set<std::int64_t> bound_streams_{};
-    flush_gate flush_gate_{};
-    http::detail::wake_queue wakeups_{};
+    flush_gate<Queue> flush_gate_{};
+    http::detail::wake_queue<Queue> wakeups_{};
+    std::size_t unacknowledged_{0};
+    http::detail::waiter_slot<Queue> acknowledged_{};
     bool started_{false};
     // Declared last: destroyed first, while the state its children use lives.
-    http::task_scope scope_{};
+    http::detail::operation_scope scope_{};
 };
 
 } // namespace detail

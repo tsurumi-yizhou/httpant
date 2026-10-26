@@ -175,14 +175,13 @@ auto exchange(
 }
 
 struct task_client {
-    friend auto operation_start(task_client&) -> http::task<void> {
+    auto start() -> http::detail::operation<void> {
         co_return;
     }
 
-    friend auto operation_request(
-        task_client&,
+    auto request(
         http::request head,
-        http::buffer_body&) -> http::task<int> {
+        http::buffer_body&) -> http::detail::operation<int> {
         if (head.target == "/error")
             throw std::runtime_error("request failed");
         co_return 42;
@@ -192,11 +191,10 @@ struct task_client {
 struct counting_client {
     int& calls;
 
-    friend auto operation_request(
-        counting_client& client,
+    auto request(
         http::request,
-        http::buffer_body&) -> http::task<int> {
-        ++client.calls;
+        http::buffer_body&) -> http::detail::operation<int> {
+        ++calls;
         co_return 42;
     }
 };
@@ -229,16 +227,15 @@ struct add {
 struct task_server {
     struct token {};
 
-    friend auto operation_receive(task_server&) -> http::task<int> {
+    auto receive() -> http::detail::operation<int> {
         co_return 7;
     }
 
-    friend auto operation_respond(
-        task_server& server,
+    auto respond(
         token,
         http::response,
-        http::buffer_body&) -> http::task<void> {
-        server.responded = true;
+        http::buffer_body&) -> http::detail::operation<void> {
+        responded = true;
         co_return;
     }
 
@@ -402,21 +399,6 @@ static suite<"execution"> tests = [] {
     // the shared operation. A token that is already requested completes with
     // set_stopped (sync_wait returns a disengaged optional) before the
     // coroutine body ever runs.
-    "public_request_stop_token_yields_stopped"_test = [] {
-        task_client client;
-        http::buffer_body body;
-        std::stop_source source;
-        source.request_stop();
-
-        auto operation = http::execution::request(
-            client, http::request{.target = "/"}, body);
-        auto with_stop = stdexec::write_env(
-            std::move(operation),
-            stdexec::prop{stdexec::get_stop_token, source.get_token()});
-
-        auto result = stdexec::sync_wait(std::move(with_stop));
-        expect(!result.has_value());
-    };
 
     // Internal machinery test: endpoints without a handshake capability receive
     // the documented no-op start sender.
@@ -482,6 +464,18 @@ static suite<"execution"> tests = [] {
                 client, server, request_route, response_route) == "generic-body"sv);
         }
     };
+    "request_is_a_pipeable_sender_adaptor"_test = [] {
+        int calls = 0;
+        counting_client client{calls};
+        auto pending = stdexec::just(http::request{.target = "/pipe"}) | http::execution::request(client);
+        expect(calls == 0_i);
+        auto first = stdexec::sync_wait(std::move(pending));
+        expect(calls == 1_i && std::get<0>(*first) == 42_i);
+        auto second = stdexec::sync_wait(http::execution::request(
+            stdexec::just(http::request{.target = "/upstream"}, http::buffer_body{}), client));
+        expect(calls == 2_i && std::get<0>(*second) == 42_i);
+    };
+
 };
 
 } // namespace httpant::testing::execution

@@ -11,7 +11,8 @@ export namespace http::v3 {
 
 namespace detail {
 
-inline void rethrow_callback_failure(conn_context& ctx) {
+template <template <class> class Queue>
+inline void rethrow_callback_failure(conn_context<Queue>& ctx) {
     if (!ctx.core.pending_callback_failure) return;
     auto failure = std::exchange(ctx.core.pending_callback_failure, {});
     std::rethrow_exception(failure);
@@ -56,7 +57,8 @@ inline auto try_decode_varint(std::span<const std::byte> src, std::size_t& consu
 }
 
 // RFC 9114 §7.1 — "A frame payload that contains additional bytes after the identified fields or a frame payload that terminates before the end of the identified fields MUST be treated as a connection error of type H3_FRAME_ERROR."
-inline auto decode_exact_varint(conn_context& ctx, nghttp3_conn* conn, std::span<const std::byte> src, std::string_view what) -> std::uint64_t {
+template <template <class> class Queue>
+inline auto decode_exact_varint(conn_context<Queue>& ctx, nghttp3_conn* conn, std::span<const std::byte> src, std::string_view what) -> std::uint64_t {
     std::size_t consumed = 0;
     std::uint64_t value = 0;
     if (!try_decode_varint(src, consumed, value) || consumed != src.size())
@@ -106,7 +108,8 @@ inline auto try_pop_frame(std::vector<std::byte>& buffer, parsed_frame& frame) -
 // exchanges keep running. Only errors that affect the whole connection
 // (nghttp3_err_is_fatal, plus connection-wide states like QPACK corruption)
 // escalate to a connection error.
-inline auto forward_stream_input(conn_context& ctx, nghttp3_conn* conn, std::int64_t stream_id, std::span<const std::byte> data, bool fin) -> std::size_t {
+template <template <class> class Queue>
+inline auto forward_stream_input(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t stream_id, std::span<const std::byte> data, bool fin) -> std::size_t {
     static constexpr std::array<std::byte, 1> empty{std::byte{0}};
     auto bytes = data.empty() ? std::span<const std::byte>{empty.data(), 0} : data;
     auto consumed = nghttp3_conn_read_stream(
@@ -118,7 +121,7 @@ inline auto forward_stream_input(conn_context& ctx, nghttp3_conn* conn, std::int
     if (consumed < 0) {
         rethrow_callback_failure(ctx);
         auto liberr = static_cast<int>(consumed);
-        auto wire_code = nghttp3_err_infer_quic_app_error_code(liberr);
+        auto code = nghttp3_err_infer_quic_app_error_code(liberr);
         if (liberr == NGHTTP3_ERR_MALFORMED_HTTP_HEADER ||
             liberr == NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING) {
             // RFC 9114 §4.1.2 — "Malformed requests or responses that are
@@ -157,7 +160,7 @@ inline auto forward_stream_input(conn_context& ctx, nghttp3_conn* conn, std::int
         // must be closed; map the library error to its H3 application error
         // code (Section 8.1) and record it so the upper layer can carry it on
         // the QUIC CONNECTION_CLOSE.
-        record_connection_error(ctx, conn, wire_code);
+        record_connection_error(ctx, conn, code);
         auto condition = liberr == NGHTTP3_ERR_QPACK_DECOMPRESSION_FAILED ||
                 liberr == NGHTTP3_ERR_QPACK_ENCODER_STREAM_ERROR ||
                 liberr == NGHTTP3_ERR_QPACK_DECODER_STREAM_ERROR
@@ -165,21 +168,19 @@ inline auto forward_stream_input(conn_context& ctx, nghttp3_conn* conn, std::int
             : error_condition::library_failure;
         throw protocol_error{
             error_info{
-                .version = protocol_version::http3,
-                .scope = error_scope::connection,
                 .condition = condition,
                 .exchange_identity = std::nullopt,
                 .library_code = liberr,
-                .retryable = false,
             },
-            close_connection{error_code{wire_code}},
+            close_connection{code},
             std::format("http/3: read_stream failed ({})", nghttp3_strerror(liberr))};
     }
     rethrow_callback_failure(ctx);
     return static_cast<std::size_t>(consumed);
 }
 
-inline auto process_control_stream(conn_context& ctx, nghttp3_conn* conn, std::int64_t stream_id, stream_input_state& input) -> std::size_t {
+template <template <class> class Queue>
+inline auto process_control_stream(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t stream_id, stream_input_state& input) -> std::size_t {
     std::vector<std::byte> forward;
     std::size_t consumed = 0;
     while (true) {
@@ -269,7 +270,8 @@ inline auto process_control_stream(conn_context& ctx, nghttp3_conn* conn, std::i
     return consumed;
 }
 
-inline auto process_request_stream(conn_context& ctx, nghttp3_conn* conn, std::int64_t stream_id, stream_input_state& input) -> std::size_t {
+template <template <class> class Queue>
+inline auto process_request_stream(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t stream_id, stream_input_state& input) -> std::size_t {
     std::vector<std::byte> forward;
     std::size_t consumed = 0;
     while (true) {
@@ -333,7 +335,8 @@ inline auto process_request_stream(conn_context& ctx, nghttp3_conn* conn, std::i
 // control would be inflated (RFC 9114 §6.1 / [QUIC-TRANSPORT] §4.1).
 // |unidirectional| is the direction declared by the stream handle's access()
 // (accepted_stream_is_unidirectional), not a guess from the numeric stream ID.
-inline auto process_input(conn_context& ctx, nghttp3_conn* conn, std::int64_t stream_id, bool unidirectional, std::span<const std::byte> data, bool fin) -> std::size_t {
+template <template <class> class Queue>
+inline auto process_input(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t stream_id, bool unidirectional, std::span<const std::byte> data, bool fin) -> std::size_t {
     auto& input = ctx.inputs[stream_id];
     append_bytes(input.buffer, data);
     input.closed = input.closed || fin;
@@ -437,13 +440,14 @@ inline auto process_input(conn_context& ctx, nghttp3_conn* conn, std::int64_t st
     return consumed;
 }
 
+template <template <class> class Queue>
 inline auto make_callbacks() -> nghttp3_callbacks {
     nghttp3_callbacks cbs{};
 
     cbs.stream_close = [](nghttp3_conn*, std::int64_t stream_id,
                           std::uint64_t app_error_code,
                           void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             mark_stream_closed(ctx, stream_id, app_error_code);
         });
@@ -451,7 +455,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
     cbs.acked_stream_data = [](nghttp3_conn*, std::int64_t stream_id,
                                std::uint64_t datalen, void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             auto it = ctx.core.outbound_bodies.find(stream_id);
             if (it == ctx.core.outbound_bodies.end())
@@ -473,7 +477,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
         nghttp3_conn*,
         const nghttp3_proto_settings* settings,
         void* ud) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             ctx.peer_decoder_capacity = settings->qpack_max_dtable_capacity;
             ctx.peer_blocked_streams = settings->qpack_blocked_streams;
@@ -482,7 +486,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
     };
 
     cbs.shutdown = [](nghttp3_conn*, std::int64_t id, void* ud) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             ctx.core.goaway_received = true;
             auto identifier = static_cast<std::uint64_t>(id);
@@ -508,7 +512,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
                          std::int32_t, nghttp3_rcbuf* name,
                          nghttp3_rcbuf* value, std::uint8_t,
                          void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             auto it = ctx.core.streams.find(stream_id);
             if (it == ctx.core.streams.end()) return;
@@ -525,19 +529,16 @@ inline auto make_callbacks() -> nghttp3_callbacks {
                     ctx, conn, stream_id, NGHTTP3_H3_EXCESSIVE_LOAD);
                 throw protocol_error{
                     error_info{
-                        .version = protocol_version::http3,
-                        .scope = error_scope::stream,
                         .condition = error_condition::resource_limit,
                         .exchange_identity = static_cast<std::uint64_t>(stream_id),
                         .library_code = std::nullopt,
-                        .retryable = false,
                     },
-                    reset_stream{error_code{NGHTTP3_H3_EXCESSIVE_LOAD}},
+                    reset_stream{NGHTTP3_H3_EXCESSIVE_LOAD},
                     "http/3: field section exceeds configured maximum"};
             }
             it->second->field_section_size += entry_size;
             if (n == ":status") {
-                if (auto status = http::detail::parse_status(v)) {
+                if (auto status = http::status::parse(v)) {
                     it->second->core.status_code = *status;
                 } else {
                     // RFC 9114 §4.1.2 — a :status outside the 100-599 range
@@ -558,7 +559,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
     cbs.end_headers = [](nghttp3_conn* conn, std::int64_t stream_id,
                          int, void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             auto it = ctx.core.streams.find(stream_id);
             if (it == ctx.core.streams.end())
@@ -569,12 +570,12 @@ inline auto make_callbacks() -> nghttp3_callbacks {
             // §15.2: informational (1xx) header blocks precede the final response
             // on the same stream and are not the final response, so they are
             // discarded and the wait for the final header block continues.
-            // method_token is only set on request streams (server side), where
+            // The method is only set on request streams (server side), where
             // :status never appears, so this check is client-response specific.
-            if (stream.core.decoded.method_token.empty() &&
+            if (!stream.core.decoded.method &&
                 http::is_informational(stream.core.status_code)) {
                 stream.core.decoded = {};
-                stream.core.status_code = http::status{0};
+                stream.core.status_code = {};
                 return;
             }
             // RFC 9114 §4.3.1 — "An OPTIONS request that does not include a
@@ -588,9 +589,9 @@ inline auto make_callbacks() -> nghttp3_callbacks {
             // requests or responses that are detected MUST be treated as a
             // stream error of type H3_MESSAGE_ERROR") and must never be
             // delivered to the application.
-            if (!stream.core.decoded.method_token.empty() &&
+            if (stream.core.decoded.method &&
                 stream.core.decoded.path == "*" &&
-                stream.core.decoded.method_token != "OPTIONS") {
+                *stream.core.decoded.method != http::method::OPTIONS) {
                 throw make_stream_message_error(
                     ctx, conn, stream_id, NGHTTP3_H3_MESSAGE_ERROR,
                     std::nullopt,
@@ -598,8 +599,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
             }
             // A method token longer than http::method can hold is treated as
             // malformed, as on HTTP/2.
-            if (!stream.core.decoded.method_token.empty() &&
-                !http::method::parse(stream.core.decoded.method_token)) {
+            if (stream.core.decoded.method_overflow) {
                 throw make_stream_message_error(
                     ctx, conn, stream_id, NGHTTP3_H3_MESSAGE_ERROR,
                     std::nullopt,
@@ -612,7 +612,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
             // case-insensitive, default port omitted) so a mismatched request
             // is a typed H3_MESSAGE_ERROR, not a delivered request with
             // ambiguous authority.
-            if (!stream.core.decoded.method_token.empty() &&
+            if (stream.core.decoded.method &&
                 !stream.core.decoded.authority.empty()) {
                 if (auto host = http::find_header(stream.core.decoded.regular, "host")) {
                     if (!http::detail::same_origin(
@@ -628,7 +628,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
                 }
             }
             stream.core.headers_done = true;
-            if (!stream.core.decoded.method_token.empty() &&
+            if (stream.core.decoded.method &&
                 !stream.core.delivered) {
                 stream.core.delivered = true;
                 ctx.core.receive_queue_push(it->second);
@@ -641,7 +641,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
     cbs.recv_data = [](nghttp3_conn*, std::int64_t stream_id,
                        const std::uint8_t* data, std::size_t len,
                        void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             auto it = ctx.core.streams.find(stream_id);
             if (it != ctx.core.streams.end()) {
@@ -655,7 +655,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
     cbs.deferred_consume = [](nghttp3_conn*, std::int64_t stream_id,
                               std::size_t consumed, void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             ctx.deferred_consumption[stream_id] += consumed;
         });
@@ -663,7 +663,7 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
     cbs.end_stream = [](nghttp3_conn*, std::int64_t stream_id,
                         void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             if (auto it = ctx.core.streams.find(stream_id); it != ctx.core.streams.end()) {
                 it->second->core.complete = true;
@@ -675,10 +675,10 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
     cbs.begin_headers = [](nghttp3_conn*, std::int64_t stream_id,
                            void* ud, void*) -> int {
-        auto& ctx = *static_cast<conn_context*>(ud);
+        auto& ctx = *static_cast<conn_context<Queue>*>(ud);
         return http::detail::callback_boundary(ctx, NGHTTP3_ERR_CALLBACK_FAILURE, [&] {
             if (!ctx.core.streams.contains(stream_id)) {
-                auto sd = std::make_shared<stream_data>();
+                auto sd = std::make_shared<stream_data<Queue>>();
                 sd->core.id = stream_id;
                 ctx.core.streams[stream_id] = sd;
             }
@@ -691,14 +691,14 @@ inline auto make_callbacks() -> nghttp3_callbacks {
 
 } // namespace detail
 
-template <stream_factory S>
+template <stream_factory S, template <class> class Queue = http::queues::local>
 class body_reader {
 public:
     body_reader() = default;
     body_reader(
-        std::shared_ptr<detail::stream_data> stream,
+        std::shared_ptr<detail::stream_data<Queue>> stream,
         std::shared_ptr<typename S::stream_type> transport,
-        detail::conn_context& context)
+        detail::conn_context<Queue>& context)
         : stream_(std::move(stream)), transport_(std::move(transport)), context_(&context) {}
     body_reader(const body_reader&) = delete;
     auto operator=(const body_reader&) -> body_reader& = delete;
@@ -719,7 +719,7 @@ public:
 
     auto async_read(
         std::span<std::byte> output,
-        std::stop_token stop) -> task<std::size_t>
+        std::stop_token stop) -> http::detail::operation<std::size_t>
     {
         if (!stream_ || !transport_)
             co_return 0;
@@ -735,15 +735,12 @@ public:
                 // aborted-request path. The connection keeps running.
                 throw protocol_error{
                     error_info{
-                        .version = protocol_version::http3,
-                        .scope = error_scope::stream,
                         .condition = error_condition::stream_reset,
                         .exchange_identity =
                             static_cast<std::uint64_t>(stream_->core.id),
                         .library_code = std::nullopt,
-                        .retryable = false,
                     },
-                    reset_stream{error_code{stream_->close_error_code}},
+                    reset_stream{stream_->close_error_code},
                     std::format("http/3: body stream aborted (0x{:x})",
                                 stream_->close_error_code)};
             }
@@ -785,9 +782,9 @@ private:
         context_ = nullptr;
     }
 
-    std::shared_ptr<detail::stream_data> stream_{};
+    std::shared_ptr<detail::stream_data<Queue>> stream_{};
     std::shared_ptr<typename S::stream_type> transport_{};
-    detail::conn_context* context_{nullptr};
+    detail::conn_context<Queue>* context_{nullptr};
 
 };
 

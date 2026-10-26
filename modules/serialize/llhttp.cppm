@@ -106,11 +106,6 @@ inline auto serialize_head(const response& res) -> std::vector<std::byte> {
     // CR/LF/NUL here would inject a new status line or header section.
     if (detail::has_crlf_nul(res.reason))
         throw usage_error("http/1.1: CR/LF/NUL in outbound reason phrase");
-    // RFC 9110 §15 — "All valid status codes are within the range of 100 to
-    // 599, inclusive." An invalid code would produce an invalid status-line;
-    // HTTP/2 and HTTP/3 enforce the same bound on their send paths.
-    if (!http::detail::is_valid_status(res.status))
-        throw usage_error("http/1.1: response status outside 100-599");
     detail::validate_outbound_fields(res.fields);
 
     // RFC 9112 §4 — status-line = HTTP-version SP status-code SP reason-phrase.
@@ -122,7 +117,9 @@ inline auto serialize_head(const response& res) -> std::vector<std::byte> {
         size += h.name.size() + 2 + h.value.size() + 2;
     raw.reserve(size);
     detail::append_text(raw, "HTTP/1.1 ");
-    detail::append_text(raw, std::format("{}", res.status));
+    std::array<char, 3> status;
+    auto* status_end = std::to_chars(status.data(), status.data() + status.size(), res.status.code()).ptr;
+    detail::append_text(raw, {status.data(), status_end});
     detail::append_text(raw, " ");
     detail::append_text(raw, reason);
     detail::append_text(raw, "\r\n");
@@ -196,9 +193,12 @@ inline void append_framed_chunk(std::vector<std::byte>& out, std::span<const std
         return;
     }
     // RFC 9112 §7.1 — "chunk = chunk-size [ chunk-ext ] CRLF chunk-data CRLF".
-    auto hex = std::format("{:x}\r\n", chunk.size());
-    out.reserve(out.size() + hex.size() + chunk.size() + 2);
+    std::array<char, 2 * sizeof(std::size_t)> digits;
+    auto* end = std::to_chars(digits.data(), digits.data() + digits.size(), chunk.size(), 16).ptr;
+    std::string_view hex{digits.data(), end};
+    out.reserve(out.size() + hex.size() + chunk.size() + 4);
     out.append_range(std::as_bytes(std::span{hex}));
+    append_text(out, "\r\n");
     out.insert(out.end(), chunk.begin(), chunk.end());
     out.append_range(std::as_bytes(std::span{std::string_view{"\r\n"}}));
 }
@@ -229,7 +229,7 @@ inline void finish_framing(std::vector<std::byte>& out, framing f, std::uint64_t
 // the request-side equivalent before the head is emitted.
 template <byte_stream S, body_stream Body>
 inline auto stream_body(S& transport, Body& body, framing f, std::uint64_t content_length,
-                        bool close_delimited) -> task<void> {
+                        bool close_delimited) -> http::detail::operation<void> {
     auto& stop = co_await current_stop_token();
     if (f == framing::none && !close_delimited) {
         // Consume the body so the caller's body lifecycle completes; no bytes
@@ -241,6 +241,7 @@ inline auto stream_body(S& transport, Body& body, framing f, std::uint64_t conte
     }
     std::array<std::byte, io_buffer_size> buf;
     std::uint64_t remaining = content_length;
+    std::vector<std::byte> framed;
     for (;;) {
         auto n = co_await body.async_read(buf, stop);
         if (n == 0) break;
@@ -251,22 +252,29 @@ inline auto stream_body(S& transport, Body& body, framing f, std::uint64_t conte
                 transport, std::span<const std::byte>{buf.data(), n});
             continue;
         }
-        std::vector<std::byte> framed;
+        if (f == framing::content_length) {
+            if (n > remaining)
+                throw usage_error("http/1.1: body exceeds content-length");
+            remaining -= n;
+            co_await http::detail::write_all(transport, std::span<const std::byte>{buf.data(), n});
+            continue;
+        }
+        framed.clear();
         append_framed_chunk(framed, std::span<const std::byte>{buf.data(), n}, f, remaining);
         co_await http::detail::write_all(
             transport, std::span<const std::byte>{framed});
     }
-    std::vector<std::byte> term;
-    finish_framing(term, f, remaining);
-    if (!term.empty())
+    framed.clear();
+    finish_framing(framed, f, remaining);
+    if (!framed.empty())
         co_await http::detail::write_all(
-            transport, std::span<const std::byte>{term});
+            transport, std::span<const std::byte>{framed});
 }
 
 // Drain a body_stream into an in-memory buffer (used by the buffered
 // serialize() helpers; the streaming write path streams instead).
 template <body_stream Body>
-inline auto drain_body(Body& body) -> task<std::vector<std::byte>> {
+inline auto drain_body(Body& body) -> http::detail::operation<std::vector<std::byte>> {
     auto& stop = co_await current_stop_token();
     std::vector<std::byte> out;
     std::array<std::byte, io_buffer_size> buf;
@@ -311,7 +319,7 @@ inline auto drain_body(Body& body) -> task<std::vector<std::byte>> {
 
 // Assemble a fully buffered message: head bytes followed by the framed body.
 template <byte_stream S, body_stream Body>
-inline auto write_request(S& transport, const request& head, Body& body) -> task<void> {
+inline auto write_request(S& transport, const request& head, Body& body) -> http::detail::operation<void> {
     auto f = request_framing(head);
     if (f == framing::none) {
         // RFC 9112 §6.3 item 7 — for a request without Content-Length or
@@ -340,7 +348,7 @@ inline auto write_request(S& transport, const request& head, Body& body) -> task
 }
 
 template <byte_stream S, body_stream Body>
-inline auto write_response(S& transport, const response& head, Body& body) -> task<void> {
+inline auto write_response(S& transport, const response& head, Body& body) -> http::detail::operation<void> {
     auto data = serialize_head(head);
     co_await http::detail::write_all(
         transport, std::span<const std::byte>{data.data(), data.size()});
@@ -362,7 +370,7 @@ inline auto write_response(S& transport, const response& head, Body& body) -> ta
 // has no content either. Only the head is written, so no body framing is
 // applied or validated.
 template <byte_stream S>
-inline auto write_response_head(S& transport, const response& head) -> task<void> {
+inline auto write_response_head(S& transport, const response& head) -> http::detail::operation<void> {
     // RFC 9112 §6.1 — "A sender MUST NOT send a Content-Length header field
     // in any message that contains a Transfer-Encoding header field." The
     // bodyless response path bypasses write_response/response_framing, so the
@@ -401,7 +409,7 @@ inline auto write_response_head(S& transport, const response& head) -> task<void
 // (RFC 9110 §8.6) when the caller supplied neither Content-Length nor
 // Transfer-Encoding.
 template <body_stream Body>
-inline auto serialize_request(const request& head, Body& body) -> task<std::vector<std::byte>> {
+inline auto serialize_request(const request& head, Body& body) -> http::detail::operation<std::vector<std::byte>> {
     auto body_buf = co_await drain_body(body);
     auto f = request_framing(head);
     http::request effective = head;
@@ -416,7 +424,7 @@ inline auto serialize_request(const request& head, Body& body) -> task<std::vect
 }
 
 template <body_stream Body>
-inline auto serialize_response(const response& head, Body& body) -> task<std::vector<std::byte>> {
+inline auto serialize_response(const response& head, Body& body) -> http::detail::operation<std::vector<std::byte>> {
     auto body_buf = co_await drain_body(body);
     auto f = response_framing(head);
     http::response effective = head;
@@ -436,22 +444,22 @@ inline auto serialize_response(const response& head, Body& body) -> task<std::ve
 // message's Content-Length / Transfer-Encoding (RFC 9112 §6.3, §7.1). Returns a
 // task producing the fully buffered wire bytes.
 template <body_stream Body>
-inline auto serialize(const request& req, Body& body) -> task<std::vector<std::byte>> {
+inline auto serialize(const request& req, Body& body) -> http::detail::operation<std::vector<std::byte>> {
     return detail::serialize_request(req, body);
 }
 
 template <body_stream Body>
-inline auto serialize(const response& res, Body& body) -> task<std::vector<std::byte>> {
+inline auto serialize(const response& res, Body& body) -> http::detail::operation<std::vector<std::byte>> {
     return detail::serialize_response(res, body);
 }
 
 // Convenience overload for a message without a body.
-inline auto serialize(const request& req) -> task<std::vector<std::byte>> {
+inline auto serialize(const request& req) -> http::detail::operation<std::vector<std::byte>> {
     http::buffer_body empty;
     co_return co_await detail::serialize_request(req, empty);
 }
 
-inline auto serialize(const response& res) -> task<std::vector<std::byte>> {
+inline auto serialize(const response& res) -> http::detail::operation<std::vector<std::byte>> {
     http::buffer_body empty;
     co_return co_await detail::serialize_response(res, empty);
 }

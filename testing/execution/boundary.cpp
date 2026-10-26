@@ -11,7 +11,7 @@ namespace {
 enum class channel { value, error, stopped };
 
 struct immediate_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<
         stdexec::set_value_t(int), stdexec::set_error_t(std::exception_ptr),
         stdexec::set_stopped_t()>;
@@ -20,7 +20,7 @@ struct immediate_sender {
 
     template <typename R>
     struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         R receiver;
         channel result;
         void start() noexcept {
@@ -47,11 +47,11 @@ struct throwing_value {
 };
 
 struct throwing_value_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<stdexec::set_value_t(throwing_value)>;
     template <typename R>
     struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         R receiver;
         void start() noexcept { stdexec::set_value(std::move(receiver), throwing_value{}); }
     };
@@ -71,14 +71,14 @@ struct thread_control {
 };
 
 struct threaded_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = immediate_sender::completion_signatures;
     thread_control* control;
     bool early;
     channel result{channel::value};
     template <typename R>
     struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         R receiver;
         thread_control* control;
         bool early;
@@ -203,12 +203,12 @@ struct cleanup {
 // connection or protocol state is shared here. Registration itself cannot
 // resume the coroutine before the generic sender awaiter's handshake.
 struct cancel_sender {
-    using sender_concept = stdexec::sender_tag;
+    using sender_concept = stdexec::sender_t;
     using completion_signatures = stdexec::completion_signatures<
         stdexec::set_value_t(int), stdexec::set_stopped_t()>;
     template <typename R>
     struct operation {
-        using operation_state_concept = stdexec::operation_state_tag;
+        using operation_state_concept = stdexec::operation_state_t;
         struct cancel {
             operation* self;
             void operator()() const noexcept { stdexec::set_stopped(std::move(self->receiver)); }
@@ -350,6 +350,25 @@ static suite<"execution boundary"> boundary_tests = [] {
         expect(control.operation_destructions.load() == 1_i);
     };
 
+    "inactive_and_pre_stopped_tokens_do_not_register_a_bridge_callback"_test = [] {
+        for (bool pre_stopped : {false, true}) {
+            std::stop_source source{std::nostopstate};
+            if (pre_stopped) {
+                source = std::stop_source{};
+                source.request_stop();
+            }
+            observation observed;
+            int calls = 0;
+            auto factory = [&]() -> http::task<int> { ++calls; co_return 42; };
+            auto state = stdexec::connect(http::defer(factory), token_receiver<custom_token>{
+                custom_token{source.get_token(), nullptr, true}, &observed});
+            stdexec::start(state);
+            expect(observed.completions == 1_i);
+            expect(observed.result == (pre_stopped ? channel::stopped : channel::value));
+            expect(calls == (pre_stopped ? 0 : 1));
+        }
+    };
+
     "bridge_attach_failure_and_registration_stop_complete_once"_test = [] {
         for (bool fail_attach : {true, false}) {
             std::stop_source source;
@@ -454,7 +473,7 @@ static suite<"execution boundary"> boundary_tests = [] {
 
     "serialized_waiter_stop_and_deferred_wake_claim_once"_test = [] {
         http::detail::waiter_slot slot;
-        http::detail::wake_queue queue;
+        http::detail::wake_queue<> queue;
         std::stop_source source;
         int resumptions = 0;
         bool cancelled = false;

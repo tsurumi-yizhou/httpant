@@ -162,14 +162,6 @@ static suite<"caching"> caching_suite = [] {
                                                instant(1), instant(2));
         expect(!not_modified.has_value());
         expect(not_modified.error() == http::storage_rejection::uncacheable_status);
-        // RFC 9110 §15 — "All valid status codes are within the range of 100
-        // to 599, inclusive." — a code outside that range is invalid and
-        // cannot be final either.
-        auto invalid = http::plan_storage(http::cache_kind::private_, request,
-                                          response_with("max-age=60", 600),
-                                          instant(1), instant(2));
-        expect(!invalid.has_value());
-        expect(invalid.error() == http::storage_rejection::uncacheable_status);
     };
 
     "response_no_store_and_vary_all_reject_storage"_test = [] {

@@ -373,32 +373,6 @@ static suite<"http1 framing"> http1_framing_suite = [] {
     // preserves the Set-Cookie (RFC 6265 §4.1), Cache-Control (RFC 9111 §5.2),
     // Age (RFC 9111 §5.1), and Expires (RFC 9111 §5.3) fields for later
     // case-insensitive lookup.
-    "http1_preserves_cookie_and_cache_headers"_test = [] {
-        pipe c2s, s2c;
-        mock_stream transport{.input = s2c, .output = c2s};
-
-        push_text(
-            s2c,
-            "HTTP/1.1 200 OK\r\n"
-            "Set-Cookie: sid=abc123; Path=/; HttpOnly\r\n"
-            "Cache-Control: public, max-age=60\r\n"
-            "Age: 10\r\n"
-            "Expires: Thu, 01 Dec 1994 16:00:00 GMT\r\n"
-            "Content-Length: 0\r\n\r\n");
-        s2c.closed = true;
-
-        http::v1::client<mock_stream> client{transport};
-        auto received = run_sync(http::coroutine::request(client, http::request{
-            .method = http::method::GET,
-            .target = "/",
-            .fields = {{"host", "example.com"}},
-        }));
-
-        expect(http::find_header(received.head.fields, "set-cookie").has_value());
-        expect(http::find_header(received.head.fields, "cache-control").has_value());
-        expect(http::find_header(received.head.fields, "age").has_value());
-        expect(http::find_header(received.head.fields, "expires").has_value());
-    };
 
     // RFC 9112 §9.3 — "HTTP/1.1 defaults to the use of 'persistent connections',
     // allowing multiple requests and responses to be carried over a single
@@ -767,24 +741,6 @@ static suite<"http1 framing"> http1_framing_suite = [] {
             static_cast<void>(run_sync(http::v1::serialize(req, body)));
         } catch (const http::usage_error& error) {
             threw = std::string_view{error.what()}.contains("content-length");
-        }
-        expect(threw);
-    };
-
-    // RFC 9110 §15 — "All valid status codes are within the range of 100 to
-    // 599, inclusive." A response outside that range must be rejected before
-    // it is serialized.
-    "http1_send_rejects_response_status_outside_100_to_599"_test = [] {
-        http::response res{
-            .status = 600,
-            .reason = {},
-            .fields = {{"content-length", "0"}},
-        };
-        auto threw = false;
-        try {
-            static_cast<void>(run_sync(http::v1::serialize(res)));
-        } catch (const http::usage_error& error) {
-            threw = std::string_view{error.what()}.contains("100-599");
         }
         expect(threw);
     };

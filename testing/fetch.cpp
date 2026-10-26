@@ -27,6 +27,16 @@ void push_final_h2_response(async_pipe& s2c) {
     push_http2_frame(s2c, 0x01, 0x05, 1, block);
 }
 
+struct sender_transport {
+    mock_stream& inner;
+    auto read_some(std::span<std::byte> buffer) {
+        return stdexec::then(stdexec::just(), [this, buffer] { return inner.async_read(buffer, {}).await_resume(); });
+    }
+    auto write_some(std::span<const std::byte> buffer) {
+        return stdexec::then(stdexec::just(), [this, buffer] { return inner.async_write(buffer, {}).await_resume(); });
+    }
+};
+
 } // namespace
 
 static suite<"fetch"> fetch_suite = [] {
@@ -91,7 +101,8 @@ static suite<"fetch"> fetch_suite = [] {
             pipe c2s, s2c;
             serve(s2c);
             mock_stream transport{.input = s2c, .output = c2s};
-            auto result = run_sync(http::coroutine::fetch<http::protocol_version::http1>(transport, request(), "text body"sv));
+            http::v1::client client{transport};
+            auto result = run_sync(http::coroutine::fetch(client, request(), "text body"sv));
             expect(result.text() == "ok"sv);
             expect(bytes_to_string(c2s.buffer).ends_with("\r\n\r\ntext body"));
         }
@@ -99,10 +110,11 @@ static suite<"fetch"> fetch_suite = [] {
             pipe c2s, s2c;
             serve(s2c);
             mock_stream transport{.input = s2c, .output = c2s};
+            http::v1::client client{transport};
             http::buffer_body streamed{std::vector<std::byte>{std::byte{'x'}, std::byte{'y'}}};
             auto head = request();
             head.fields.push_back({"content-length", "2"});
-            auto result = run_sync(http::coroutine::fetch<http::protocol_version::http1>(transport, std::move(head), streamed));
+            auto result = run_sync(http::coroutine::fetch(client, std::move(head), streamed));
             expect(result.text() == "ok"sv);
             expect(bytes_to_string(c2s.buffer).ends_with("\r\n\r\nxy"));
         }
@@ -110,32 +122,20 @@ static suite<"fetch"> fetch_suite = [] {
             pipe c2s, s2c;
             serve(s2c);
             mock_stream transport{.input = s2c, .output = c2s};
+            http::v1::client client{transport};
             auto outcome = stdexec::sync_wait(
-                http::execution::fetch<http::protocol_version::http1>(transport, request()));
+                http::execution::fetch(client, request()));
             expect(outcome.has_value());
             expect(std::get<0>(*outcome).text() == "ok"sv);
         }
     };
 
+    // RFC 7301 — ALPN identifiers are constants of the client type, which is the
+    // protocol: nothing maps a version value to a string at run time.
     "alpn_identifiers"_test = [] {
-        expect(http::alpn(http::protocol_version::http1).empty());
-        expect(http::alpn(http::protocol_version::http2) == "h2"sv);
-        expect(http::alpn(http::protocol_version::http3) == "h3"sv);
-    };
-
-    // A byte stream runs HTTP/1.1 and HTTP/2; a stream factory runs
-    // HTTP/3; the other pairings have no client.
-    "client_selection_by_connection_kind_and_version"_test = [] {
-        using http::protocol_version;
-        expect(std::same_as<http::client_t<mock_stream, protocol_version::http1>,
-                            http::v1::client<mock_stream>>);
-        expect(std::same_as<http::client_t<mock_stream, protocol_version::http2>,
-                            http::v2::client<mock_stream>>);
-        expect(std::same_as<http::client_t<mock_stream_factory, protocol_version::http3>,
-                            http::v3::client<mock_stream_factory>>);
-        expect(!http::has_client<mock_stream, protocol_version::http3>);
-        expect(!http::has_client<mock_stream_factory, protocol_version::http1>);
-        expect(!http::has_client<mock_stream_factory, protocol_version::http2>);
+        expect(std::string_view{http::v1::client<mock_stream>::alpn}.empty());
+        expect(http::v2::client<mock_stream>::alpn == "h2"sv);
+        expect(http::v3::client<mock_stream_factory>::alpn == "h3"sv);
     };
 
     // RFC 9112 §3.2 — an HTTP/1.1 request has exactly one Host field; fetch
@@ -145,10 +145,10 @@ static suite<"fetch"> fetch_suite = [] {
         pipe c2s, s2c;
         push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
         mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
 
         const auto payload = std::as_bytes(std::span{"ab", 2});
-        auto result = run_sync(http::coroutine::fetch<http::protocol_version::http1>(
-            transport, request_for("/order"), payload));
+        auto result = run_sync(http::coroutine::fetch(client, request_for("/order"), payload));
 
         expect(result.head.status == 200_u);
         expect(result.text() == "hello"sv);
@@ -159,23 +159,20 @@ static suite<"fetch"> fetch_suite = [] {
         expect(sent.ends_with("\r\n\r\nab"));
     };
 
-    // The same call over HTTP/2: only the version argument and the connection
-    // differ. fetch closes and destroys its client when it returns, and here
-    // that happens in the coroutine the reader woke, so this is also the
-    // regression test for joining a reader from one of its own wake-ups.
-    "fetch_http2_and_the_client_dies_inside_the_wakeup"_test = [] {
+    // Closing from the application's response wake-up must join the reader.
+    "fetch_http2_closes_at_the_callers_scope_boundary"_test = [] {
         async_pipe c2s{};
         async_pipe s2c{};
         async_mock_stream transport{.input = s2c, .output = c2s};
+        http::v2::client client{transport};
         push_http2_settings_frame(s2c);
 
-        auto pending = http::coroutine::fetch<http::protocol_version::http2>(
-            transport, request_for("/h2"));
+        auto pending = http::coroutine::scoped(client, [](auto& endpoint) -> http::task<http::fetched> {
+            co_return co_await http::coroutine::fetch(endpoint, request_for("/h2"));
+        });
         pending.start();
         expect(!pending.done());
-
-        push_final_h2_response(s2c);  // wakes the request from inside the reader
-
+        push_final_h2_response(s2c);
         expect(pending.done());
         auto result = run_sync(std::move(pending));
         expect(result.head.status == 200_u);
@@ -190,13 +187,14 @@ static suite<"fetch"> fetch_suite = [] {
                   "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                   "Connection: Upgrade\r\nX-Probe: 1\r\n\r\nFIRST-BYTES");
         mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
 
         http::request head{.method = http::method::GET,
                            .target = "/ws",
                            .scheme = "https",
                            .authority = "example.com",
                            .fields = {{"upgrade", "websocket"}, {"connection", "Upgrade"}}};
-        auto result = run_sync(http::coroutine::upgrade(transport, std::move(head)));
+        auto result = run_sync(http::coroutine::upgrade(client, std::move(head)));
 
         expect(result.switched);
         expect(result.head.status == 101_u);
@@ -211,19 +209,41 @@ static suite<"fetch"> fetch_suite = [] {
     // says what it answered and no bytes are handed over.
     "upgrade_refused_is_not_a_switch"_test = [] {
         pipe c2s, s2c;
-        push_text(s2c, "HTTP/1.1 426 Upgrade Required\r\nContent-Length: 0\r\n\r\n");
+        push_text(s2c, "HTTP/1.1 426 Upgrade Required\r\nContent-Length: 6\r\n\r\nDenied"
+                       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
         mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
 
         http::request head{.method = http::method::GET,
                            .target = "/ws",
                            .scheme = "https",
                            .authority = "example.com",
                            .fields = {{"upgrade", "websocket"}, {"connection", "Upgrade"}}};
-        auto result = run_sync(http::coroutine::upgrade(transport, std::move(head)));
+        auto result = run_sync(http::coroutine::upgrade(client, std::move(head)));
 
         expect(!result.switched);
         expect(result.head.status == 426_u);
         expect(result.pending.empty());
+        expect(bytes_to_string(result.body) == "Denied"sv);
+        auto next = run_sync(http::coroutine::fetch(client,
+            http::request{.method = http::method::GET, .target = "/", .authority = "example.com"}));
+        expect(next.text() == "OK"sv);
+    };
+
+    "refused_upgrade_obeys_the_response_body_limit"_test = [] {
+        pipe c2s, s2c;
+        push_text(s2c, "HTTP/1.1 426 Upgrade Required\r\nContent-Length: 6\r\n\r\nDenied");
+        mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
+        bool limited = false;
+        try {
+            run_sync(http::coroutine::upgrade(client,
+                http::request{.method = http::method::GET, .target = "/ws", .authority = "example.com"},
+                {.body_limit = 3}));
+        } catch (const http::protocol_error&) {
+            limited = true;
+        }
+        expect(limited);
     };
 
     // The application closes and destroys the client from the continuation of
@@ -285,20 +305,84 @@ static suite<"fetch"> fetch_suite = [] {
         expect(stopped);
     };
 
-    // fetch buffers the whole body, so its bound is a template argument.
-    "fetch_enforces_its_compile_time_body_limit"_test = [] {
+    // The buffer limit is a plain policy value of this fetch operation.
+    "fetch_enforces_its_body_limit"_test = [] {
         pipe c2s, s2c;
         push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789");
         mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
         auto limited = false;
         try {
             static_cast<void>(run_sync(
-                http::coroutine::fetch<http::protocol_version::http1, 4>(transport, request_for("/big"))));
+                http::coroutine::fetch(client, request_for("/big"), http::fetch_options{.body_limit = 4})));
         } catch (const http::protocol_error& failure) {
             limited = failure.info().condition == http::error_condition::resource_limit;
         }
         expect(limited);
     };
+    "fetch_sender_forms_share_the_callers_connection"_test = [] {
+        pipe c2s, s2c;
+        for (int i = 0; i < 3; ++i)
+            push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        mock_stream transport{.input = s2c, .output = c2s};
+        http::v1::client client{transport};
+        int prepared = 0;
+        auto input = stdexec::then(stdexec::just(), [&] {
+            ++prepared;
+            return request_for("/pipe");
+        });
+        auto piped = std::move(input) | http::execution::fetch(client);
+        expect(prepared == 0_i && c2s.buffer.empty());
+        auto first = stdexec::sync_wait(std::move(piped));
+        expect(prepared == 1_i && std::get<0>(*first).text() == "ok"sv);
+        auto second = stdexec::sync_wait(http::execution::fetch(stdexec::just(request_for("/upstream")), client));
+        expect(std::get<0>(*second).text() == "ok"sv);
+        auto third = stdexec::sync_wait(http::execution::fetch(client, request_for("/direct")));
+        expect(std::get<0>(*third).text() == "ok"sv);
+        auto sent = bytes_to_string(c2s.buffer);
+        expect(sent.find("/pipe") != std::string::npos && sent.find("/upstream") != std::string::npos &&
+               sent.find("/direct") != std::string::npos);
+    };
+
+    "fetch_owns_text_before_the_sender_or_task_starts"_test = [] {
+        for (bool sender : {false, true}) {
+            pipe c2s, s2c;
+            push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            mock_stream transport{.input = s2c, .output = c2s};
+            http::v1::client client{transport};
+            std::string payload = "original";
+            if (sender) {
+                auto pending = http::execution::fetch(client, request_for("/owned"), std::string_view{payload});
+                payload.assign("modified");
+                static_cast<void>(stdexec::sync_wait(std::move(pending)));
+            } else {
+                auto pending = http::coroutine::fetch(client, request_for("/owned"), std::string_view{payload});
+                payload.assign("modified");
+                static_cast<void>(run_sync(std::move(pending)));
+            }
+            expect(bytes_to_string(c2s.buffer).ends_with("\r\n\r\noriginal"));
+        }
+    };
+
+    "both_http_stacks_use_sender_native_streams"_test = [] {
+        for (bool sender : {false, true}) {
+            pipe c2s, s2c;
+            push_text(s2c, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+            mock_stream mock{.input = s2c, .output = c2s};
+            sender_transport transport{mock};
+            http::stream stream{transport};
+            static_assert(http::byte_stream<decltype(stream)>);
+            http::v1::client client{stream};
+            if (sender) {
+                auto value = stdexec::sync_wait(stdexec::just(request_for("/sender")) | http::execution::fetch(client));
+                expect(std::get<0>(*value).text() == "hello"sv);
+            } else {
+                auto value = run_sync(http::coroutine::fetch(client, request_for("/coroutine")));
+                expect(value.text() == "hello"sv);
+            }
+        }
+    };
+
 };
 
 } // namespace httpant::testing

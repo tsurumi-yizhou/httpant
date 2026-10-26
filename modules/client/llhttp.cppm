@@ -16,6 +16,12 @@ export namespace http::v1 {
 template <byte_stream S>
 class client {
 public:
+    // HTTP/1.1 is the protocol of a connection when no ALPN was negotiated, so
+    // it offers no identifier (RFC 7301). Its requests carry the authority in a
+    // Host field, not in :authority.
+    static constexpr std::string_view alpn = "";
+    static constexpr bool uses_host_field = true;
+
     explicit client(S& transport) : transport_(transport) {}
 
     using response_body = body_reader<HTTP_RESPONSE, S>;
@@ -23,10 +29,10 @@ public:
     // Send the head, stream the body, and return the response head plus a lazy
     // body reader. Pass an http::buffer_body (or any body_stream) for the body;
     // omit it for a request without content.
-private:
+public:
     template <body_stream Body>
-    auto operation_request(http::request head, Body& body)
-        -> task<http::received<http::response, response_body>> {
+    auto request(http::request head, Body& body)
+        -> http::detail::operation<http::received<http::response, response_body>> {
         // RFC 9112 §9.6 — a client must not send further requests on a closed
         // connection, and a 101 switches the connection to another protocol.
         if (closed_ || parser_.connection_closed())
@@ -59,10 +65,10 @@ private:
                 co_await parser_.read_headers(transport_);
                 auto status = parser_.state().status_code;
                 // RFC 9110 §15 — "All valid status codes are within the range
-                // of 100 to 599, inclusive." llhttp accepts any three-digit
-                // status, so the semantic bound is enforced here before the
-                // response can reach the application.
-                if (!http::detail::is_valid_status(status))
+                // of 100 to 599, inclusive." llhttp frames any three-digit
+                // status, so a value the typed status cannot hold is a
+                // malformed response.
+                if (parser_.state().status_overflow)
                     throw detail::protocol_violation(
                         "http/1.1: response status outside 100-599");
                 // RFC 9110 §9.3.2 — a HEAD response ends at the header section;
@@ -89,15 +95,12 @@ private:
             // received, the recipient MUST consider the message to be incomplete
             // and close the connection." A malformed response leaves the
             // connection unusable, so the action is an unconditional close.
-            if (failure.info().version == protocol_version::http1 &&
-                failure.info().condition == error_condition::malformed_message) {
+            if (failure.info().condition == error_condition::malformed_message) {
                 closed_ = true;
-                // The malformed response leaves the connection unusable, so
-                // the failure is re-scoped from message to connection.
-                auto info = failure.info();
-                info.scope = error_scope::connection;
+                // The malformed response leaves the connection unusable, so the
+                // failure is re-scoped from message to connection by its action.
                 throw protocol_error{
-                    info,
+                    failure.info(),
                     close_connection{std::nullopt},
                     failure.what()};
             }
@@ -153,13 +156,11 @@ private:
 
     // HTTP/1.1 runs nothing beside the application, so there is nothing to
     // start or to join.
-    friend auto operation_start(client&) -> task<void> { co_return; }
-    friend auto operation_close(client&) -> task<void> { co_return; }
-
-    template <body_stream Body>
-    friend auto operation_request(client& endpoint, http::request head, Body& body)
-        -> task<http::received<http::response, response_body>> {
-        return endpoint.operation_request(std::move(head), body);
+    auto start() -> http::detail::operation<void> {
+        co_return;
+    }
+    auto close() -> http::detail::operation<void> {
+        co_return;
     }
 
 public:

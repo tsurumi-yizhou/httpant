@@ -9,6 +9,11 @@ import :session.core;
 
 export namespace http::v2 {
 
+// The engine's diagnostic prefix. Every message this layer builds starts with it,
+// and it is the one place the string lives: the builders below take it as a
+// template argument, so no call can pass the wrong one.
+inline constexpr literal error_prefix{"http/2: "};
+
 // RFC 9113 §6.5.2 — SETTINGS identifiers are stable 16-bit wire values.
 enum class setting_name : std::uint16_t {
     header_table_size = 0x01,
@@ -91,15 +96,13 @@ using session_handle =
 inline auto make_error(std::string_view op, int rc) -> protocol_error {
     return protocol_error{
         error_info{
-            .version = protocol_version::http2,
             .scope = error_scope::implementation,
             .condition = error_condition::library_failure,
             .exchange_identity = std::nullopt,
             .library_code = rc,
-            .retryable = false,
         },
         no_action{},
-        std::format("http/2: {} failed ({})", op, rc)};
+        std::format("{}{} failed ({})", error_prefix.view(), op, rc)};
 }
 
 inline void check(int rc, std::string_view op) {
@@ -112,11 +115,10 @@ inline void check(int rc, std::string_view op) {
 inline auto make_goaway_rejection(std::optional<std::uint64_t> exchange)
     -> protocol_error
 {
-    return http::detail::make_goaway_rejection(
-        protocol_version::http2, exchange, "http/2: ");
+    return http::detail::make_goaway_rejection<error_prefix>(exchange);
 }
 
-[[nodiscard]] inline auto wire_code_from_library_code(int code) -> std::uint32_t {
+[[nodiscard]] inline auto reset_code_from_library_code(int code) -> std::uint32_t {
     switch (code) {
         case NGHTTP2_ERR_FRAME_SIZE_ERROR: return NGHTTP2_FRAME_SIZE_ERROR;
         case NGHTTP2_ERR_HEADER_COMP: return NGHTTP2_COMPRESSION_ERROR;
@@ -132,7 +134,7 @@ inline auto make_goaway_rejection(std::optional<std::uint64_t> exchange)
 // The typed condition matching a wire error code (RFC 9113 §7): compression
 // failures and rate-limit rejections are distinguished from generic frame
 // violations.
-[[nodiscard]] inline auto condition_from_wire_code(std::uint32_t code) -> error_condition {
+[[nodiscard]] inline auto condition_from_reset_code(std::uint32_t code) -> error_condition {
     switch (code) {
         case NGHTTP2_COMPRESSION_ERROR: return error_condition::compression_failure;
         case NGHTTP2_ENHANCE_YOUR_CALM: return error_condition::resource_limit;
@@ -151,8 +153,10 @@ inline auto check_stream_id(int id, std::string_view op) -> int {
 // shared stream_state_core holds the lifecycle flags, decoded fields, and the
 // three waiter slots; the body storage, credit bookkeeping, and reset-code pair
 // are engine-specific and stay here.
+template <template <class> class Queue = http::queues::local>
 struct stream_data {
-    http::detail::stream_state_core<std::int32_t> core{};
+    http::detail::stream_state_core<std::int32_t, Queue> core{};
+    bool notification_pending{false};
     http::detail::byte_cursor body{};
     // Flow-control credit for buffered body bytes is returned exactly once:
     // either as the application consumes (body_reader) or — for bytes never
@@ -192,51 +196,36 @@ struct stream_data {
     std::string_view incomplete_message) {
     if (peer_reset_code) {
         auto code = *peer_reset_code;
-        throw http::detail::make_protocol_error(
+        throw http::detail::make_protocol_error<error_prefix>(
             error_info{
-                .version = protocol_version::http2,
-                .scope = error_scope::stream,
                 .condition = error_condition::stream_reset,
                 .exchange_identity = static_cast<std::uint64_t>(stream_id),
                 .library_code = std::nullopt,
-                // RFC 9113 §8.7 — "The REFUSED_STREAM error code can be included
-                // in a RST_STREAM frame to indicate that the stream is being
-                // closed prior to any processing having occurred. Any request
-                // that was sent on the reset stream can be safely retried."
-                .retryable = code == NGHTTP2_REFUSED_STREAM,
             },
-            reset_stream{error_code{code}},
-            "http/2: ",
+            reset_stream{code},
             peer_reset_message);
     }
     if (local_reset_code) {
         auto code = *local_reset_code;
-        throw http::detail::make_protocol_error(
+        throw http::detail::make_protocol_error<error_prefix>(
             error_info{
-                .version = protocol_version::http2,
-                .scope = error_scope::stream,
                 .condition = error_condition::malformed_message,
                 .exchange_identity = static_cast<std::uint64_t>(stream_id),
                 .library_code = std::nullopt,
-                .retryable = false,
             },
-            reset_stream{error_code{code}},
-            "http/2: ",
+            reset_stream{code},
             local_reset_message);
     }
     // The peer closed the stream cleanly before the message was complete;
     // the stream is already gone, so no action is left.
-    throw http::detail::make_protocol_error(
+    throw http::detail::make_protocol_error<error_prefix>(
         error_info{
-            .version = protocol_version::http2,
             .scope = error_scope::stream,
             .condition = error_condition::peer_closed,
             .exchange_identity = static_cast<std::uint64_t>(stream_id),
             .library_code = std::nullopt,
-            .retryable = false,
         },
         no_action{},
-        "http/2: ",
         incomplete_message);
 }
 
@@ -248,7 +237,8 @@ struct stream_data {
 // (e.g. a malformed peer message reset with RST_STREAM PROTOCOL_ERROR per
 // RFC 9113 §8.1.1) is equally typed, with the code that went on the wire —
 // mirroring the RFC 9114 §4.1.2 malformed-message treatment in v3.
-[[noreturn]] inline void throw_stream_abort(const stream_data& stream) {
+template <template <class> class Queue>
+[[noreturn]] inline void throw_stream_abort(const stream_data<Queue>& stream) {
     throw_reset_failure(
         stream.core.id,
         stream.peer_reset_code,
@@ -266,8 +256,62 @@ struct stream_data {
 // nghttp2_session_resume_data fails with NGHTTP2_ERR_INVALID_ARGUMENT when no
 // deferred data exists, so a resume is only issued while the provider has
 // deferred.
+// ─── Erased, non-allocating callbacks ────────────────────────
+//
+// Two engine callbacks outlive the call that installs them: the per-stream
+// flow-control credit return (the endpoint runtime and a stream id) and the
+// outbound data provider (a body bridge). The caller knows both exactly at the
+// construction site and the target outlives the callback, so they are erased
+// here as a small target plus a function pointer: the generality of a
+// type-erased callable without a heap-allocated closure or its indirect
+// ownership.
+class credit_return {
+public:
+    // The engine outlives the reader that holds this call: the connection owns
+    // both the runtime and the stream.
+    template <typename Engine>
+    credit_return(Engine& engine, std::int32_t stream_id) noexcept {
+        static_assert(sizeof(slot<Engine>) <= sizeof(target_));
+        static_assert(alignof(slot<Engine>) <= alignof(void*));
+        ::new (static_cast<void*>(target_.data())) slot<Engine>{&engine, stream_id};
+        call_ = &slot<Engine>::call;
+    }
+
+    auto operator()(std::size_t n) const -> http::detail::operation<void> {
+        return call_(target_.data(), n);
+    }
+
+private:
+    template <typename Engine>
+    struct slot {
+        Engine* engine;
+        std::int32_t stream_id;
+        static auto call(const void* self, std::size_t n) -> http::detail::operation<void> {
+            auto* target = static_cast<const slot*>(self);
+            return target->engine->return_credit(target->stream_id, n);
+        }
+    };
+
+    alignas(void*) std::array<std::byte, 2 * sizeof(void*)> target_{};
+    http::detail::operation<void> (*call_)(const void*, std::size_t);
+};
+
+// The outbound-body data provider, erased once so the per-stream registry can
+// hold any body type. The state and its bridge share one allocation; this
+// pointer addresses the bridge inside the owning outbound state.
+struct outbound_reader {
+    void* bridge{};
+    auto (*read)(void*, std::uint8_t*, std::size_t, bool&) -> std::optional<std::size_t> = nullptr;
+
+    auto operator()(std::uint8_t* destination, std::size_t size, bool& eof) const
+        -> std::optional<std::size_t> {
+        return read(bridge, destination, size, eof);
+    }
+    explicit operator bool() const noexcept { return read != nullptr; }
+};
+
 struct outbound_body_state {
-    std::function<std::optional<std::size_t>(std::uint8_t*, std::size_t, bool&)> read{};
+    outbound_reader read{};
     bool deferred{false};
 };
 
@@ -295,7 +339,7 @@ struct push_data {
     // stream_data.
     bool locally_aborted{false};
     http::detail::decoded_fields request{};
-    http::status status_code{0};
+    http::status status_code{};
     http::detail::decoded_fields response{};
     std::vector<std::byte> body{};
     // RFC 9113 §6.4 — "RST_STREAM (type=0x3) ... contains a single unsigned,
@@ -315,7 +359,9 @@ struct push_data {
 inline auto make_pushed_exchange(const push_data& push) -> v2::pushed_exchange {
     return v2::pushed_exchange{
         .promised_request = http::request{
-            .method = *http::method::parse(push.request.method_token),
+            // A push promise reaches the caller only after the parse layer checked
+            // that its :method is representable (see decoded_fields).
+            .method = *push.request.method,
             .target = push.request.path,
             .scheme = push.request.scheme,
             .authority = push.request.authority,
@@ -364,25 +410,29 @@ struct aborted_push {
         "http/2: pushed stream closed before complete response");
 }
 
+template <template <class> class Queue = http::queues::local>
 struct session_context {
     // The shared connection core holds the per-stream / per-outbound-body
     // registries, the server receive queue, the GOAWAY flag and boundary, the
     // connection-error latch, the callback-failure slot, and the receive()
     // waiter. Engine-specific state (push machinery, settings generations,
     // GOAWAY richness, the output buffer, the handshake waiter) stays here.
-    http::detail::connection_core<std::int32_t, stream_data, outbound_body_state> core{};
+    http::detail::connection_core<std::int32_t, stream_data<Queue>, outbound_body_state, Queue> core{};
     std::unordered_map<std::int32_t, std::shared_ptr<push_data>> pushed_streams{};
     std::vector<std::byte> outbuf{};
-    std::deque<completed_push> completed_pushes{};
-    std::deque<aborted_push> aborted_pushes{};
+    std::vector<std::byte> spare_outbuf{};
+    std::vector<std::int32_t> changed_streams{};
+    bool notify_all_streams{false};
+    http::queues::buffer<completed_push, Queue> completed_pushes{};
+    http::queues::buffer<aborted_push, Queue> aborted_pushes{};
     // RFC 9113 §6.5 — "ACK (0x01): When set, the ACK flag indicates that this frame
     // acknowledges receipt and application of the peer's SETTINGS frame." The peer's
     // initial non-ACK SETTINGS and the ACK of our local SETTINGS are distinct states.
     bool peer_initial_settings_received{false};
     std::uint64_t next_settings_sequence{1};
     std::uint64_t acknowledged_settings_sequence{0};
-    std::deque<settings_ticket> unsent_settings{};
-    std::deque<settings_ticket> pending_settings{};
+    http::queues::buffer<settings_ticket, Queue> unsent_settings{};
+    http::queues::buffer<settings_ticket, Queue> pending_settings{};
     std::int32_t goaway_last_stream_id{0};
     // RFC 9113 §6.8 — the error code in the peer's GOAWAY; it diagnoses
     // why the connection is being closed when the transport reaches EOF.
@@ -413,38 +463,63 @@ struct session_context {
     std::optional<std::string> origin_authority{};
     // Single-waiter slot (waiter_slot): at most one coroutine may park on it;
     // parking a second throws std::logic_error (asserted at the awaiter).
-    http::detail::waiter_slot handshake_waiter{};
+    http::detail::waiter_slot<Queue> handshake_waiter{};
 };
 
-inline auto reserve_settings_ticket(session_context& ctx) -> settings_ticket {
+template <template <class> class Queue>
+inline auto reserve_settings_ticket(session_context<Queue>& ctx) -> settings_ticket {
     auto ticket = settings_ticket{ctx.next_settings_sequence++};
     ctx.unsent_settings.push_back(ticket);
     return ticket;
 }
 
-inline void rethrow_connection_error(const session_context& ctx) {
+template <template <class> class Queue>
+inline void rethrow_connection_error(const session_context<Queue>& ctx) {
     if (ctx.core.connection_error)
         std::rethrow_exception(ctx.core.connection_error);
 }
 
-inline void notify_waiters(session_context& ctx) noexcept {
+template <template <class> class Queue>
+inline void mark_stream_changed(session_context<Queue>& ctx, std::int32_t stream_id) {
+    if (auto it = ctx.core.streams.find(stream_id); it != ctx.core.streams.end() && !it->second->notification_pending) {
+        ctx.changed_streams.push_back(stream_id);
+        it->second->notification_pending = true;
+    }
+}
+
+template <template <class> class Queue>
+inline void notify_waiters(session_context<Queue>& ctx, nghttp2_session* session) noexcept {
     if (ctx.peer_initial_settings_received || ctx.core.connection_error)
         ctx.handshake_waiter.resume();
     if (!ctx.core.receive_queue_empty() || ctx.core.connection_error)
         ctx.core.receive_waiter.resume();
-    for (auto& stream : ctx.core.streams | std::views::values) {
-        // RFC 9113 §6.8 — "If the receiver of the GOAWAY has sent data on
-        // streams with a higher stream identifier than what is indicated in
-        // the GOAWAY frame, those streams are not or will not be processed." —
-        // a suspended exchange above the boundary must wake and fail instead
-        // of hanging until the transport closes.
-        bool goaway_rejected = ctx.core.goaway_received &&
-            stream->core.id > ctx.goaway_last_stream_id;
-        http::detail::wake_stream_conditions(
-            stream->core,
-            !stream->body.empty(),
-            goaway_rejected,
-            ctx.core.connection_error != nullptr);
+    auto notify = [&](stream_data<Queue>& stream) {
+        stream.notification_pending = false;
+        bool goaway_rejected = ctx.core.goaway_received && stream.core.id > ctx.goaway_last_stream_id;
+        bool capacity_ready = stream.core.capacity_waiter.waiting() &&
+            nghttp2_session_get_remote_window_size(session) > 0 &&
+            nghttp2_session_get_stream_remote_window_size(session, stream.core.id) > 0;
+        http::detail::wake_stream_conditions(stream.core, !stream.body.empty(), goaway_rejected,
+                                            ctx.core.connection_error != nullptr, capacity_ready);
+    };
+    if (std::exchange(ctx.notify_all_streams, false) || ctx.core.connection_error) {
+        ctx.changed_streams.clear();
+        for (auto it = ctx.core.streams.begin(); it != ctx.core.streams.end();) {
+            auto closed = it->second->core.closed;
+            notify(*it->second);
+            if (closed) it = ctx.core.streams.erase(it);
+            else ++it;
+        }
+    } else {
+        while (!ctx.changed_streams.empty()) {
+            auto id = ctx.changed_streams.back();
+            ctx.changed_streams.pop_back();
+            if (auto it = ctx.core.streams.find(id); it != ctx.core.streams.end()) {
+                auto closed = it->second->core.closed;
+                notify(*it->second);
+                if (closed) ctx.core.streams.erase(it);
+            }
+        }
     }
 }
 
@@ -452,23 +527,26 @@ inline void notify_waiters(session_context& ctx) noexcept {
 // makes the condition true or fails the connection; a stop request on the
 // waiting chain resumes it with http::stopped. The caller re-checks the
 // connection state after every wake.
-inline auto handshake_ready(session_context& context) {
+template <template <class> class Queue>
+inline auto handshake_ready(session_context<Queue>& context) {
     return http::detail::park_until{context.handshake_waiter, [&context] {
         return context.peer_initial_settings_received ||
                context.core.connection_error != nullptr;
     }};
 }
 
-inline auto response_headers(session_context& context, const std::shared_ptr<stream_data>& stream) {
+template <template <class> class Queue>
+inline auto response_headers(session_context<Queue>& context, const std::shared_ptr<stream_data<Queue>>& stream) {
     return http::detail::park_until{stream->core.headers_waiter, [&context, &stream] {
         return stream->core.headers_done || stream->core.aborted ||
                context.core.connection_error != nullptr;
     }};
 }
 
+template <template <class> class Queue>
 inline auto body_data(
-    session_context& context,
-    const std::shared_ptr<stream_data>& stream,
+    session_context<Queue>& context,
+    const std::shared_ptr<stream_data<Queue>>& stream,
     const std::stop_token& stop) {
     return http::detail::park_until{stream->core.body_waiter, [&context, &stream] {
         return !stream->body.empty() || stream->core.complete ||
@@ -479,11 +557,13 @@ inline auto body_data(
 // The send window is nghttp2 state, so the caller checks it; every received
 // frame batch wakes this waiter so a WINDOW_UPDATE restarts the send
 // (RFC 9113 §6.9).
-inline auto send_window(session_context&, const std::shared_ptr<stream_data>& stream) {
+template <template <class> class Queue>
+inline auto send_window(session_context<Queue>&, const std::shared_ptr<stream_data<Queue>>& stream) {
     return http::detail::park_until{stream->core.capacity_waiter, [] { return false; }};
 }
 
-inline auto next_request(session_context& context) {
+template <template <class> class Queue>
+inline auto next_request(session_context<Queue>& context) {
     return http::detail::park_until{context.core.receive_waiter, [&context] {
         return !context.core.receive_queue_empty() ||
                context.core.connection_error != nullptr;

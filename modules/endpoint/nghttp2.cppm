@@ -18,12 +18,13 @@ enum class endpoint_role {
     server,
 };
 
+template <template <class> class Queue>
 inline auto create_session(
     endpoint_role role,
-    session_context& context,
+    session_context<Queue>& context,
     const configuration& configuration) -> session_handle
 {
-    auto callbacks = create_callbacks();
+    auto callbacks = create_callbacks<Queue>();
 
     nghttp2_option* raw_option = nullptr;
     check(nghttp2_option_new(&raw_option), "option_new");
@@ -68,7 +69,8 @@ inline auto create_session(
     return session;
 }
 
-inline void flush_output(nghttp2_session* session, session_context& ctx) {
+template <template <class> class Queue>
+inline void flush_output(nghttp2_session* session, session_context<Queue>& ctx) {
     const std::uint8_t* data = nullptr;
     for (;;) {
         auto len = nghttp2_session_mem_send2(session, &data);
@@ -79,35 +81,41 @@ inline void flush_output(nghttp2_session* session, session_context& ctx) {
     }
 }
 
-inline auto write_and_clear(auto& transport, session_context& ctx) -> task<void> {
+template <template <class> class Queue>
+inline auto write_and_clear(auto& transport, session_context<Queue>& ctx) -> http::detail::operation<void> {
     if (!ctx.outbuf.empty()) {
         // Remove the batch from connection state before awaiting transport I/O.
         // A synchronous adapter can deliver a peer response immediately and
         // re-enter the endpoint driver; that nested flush must not resend this
         // already-accepted batch.
-        auto batch = std::exchange(ctx.outbuf, {});
+        auto batch = std::exchange(ctx.outbuf, std::move(ctx.spare_outbuf));
+        ctx.outbuf.clear();
         co_await http::detail::write_all(
             transport,
             std::span<const std::byte>{batch.data(), batch.size()});
+        batch.clear();
+        if (batch.capacity() > ctx.spare_outbuf.capacity())
+            ctx.spare_outbuf = std::move(batch);
     }
 }
 
-template <byte_stream S>
+template <byte_stream S, template <class> class Queue = http::queues::local>
 class endpoint_runtime {
 public:
     endpoint_runtime(
         S& transport,
         session_handle& session,
-        session_context& context)
+        session_context<Queue>& context)
         : transport_(transport), session_(session), context_(context) {}
 
     endpoint_runtime(const endpoint_runtime&) = delete;
     auto operator=(const endpoint_runtime&) -> endpoint_runtime& = delete;
 
-    auto start() -> task<void> {
+    auto start() -> http::detail::operation<void> {
         if (started_)
             co_return;
         started_ = true;
+        std::exception_ptr failure;
         try {
             co_await flush();
             scope_.spawn(read_loop());
@@ -119,17 +127,22 @@ public:
             // parked or later handshake()/request() fails fast with this error
             // instead of hanging. started_ stays true: a retry must neither
             // relaunch the driver nor silently succeed.
-            fail_connection(std::current_exception());
-            throw;
+            failure = std::current_exception();
+            fail_connection(failure);
+        }
+        if (failure) {
+            co_await http::detail::dispatch_wakeups{wakeups_};
+            std::rethrow_exception(failure);
         }
     }
 
     // Stops the reader and waits for it to finish. Exchanges still parked on
     // this connection are woken with http::stopped.
-    auto close() -> task<void> {
+    auto close() -> http::detail::operation<void> {
         scope_.request_stop();
         co_await scope_.join();
         fail_connection(std::make_exception_ptr(http::stopped{}));
+        co_await http::detail::dispatch_wakeups{wakeups_};
     }
 
     // RFC 9113 §3.4 — "The SETTINGS frames received from a peer as part of the
@@ -140,7 +153,7 @@ public:
     // §3.4 — "Clients and servers MUST treat an invalid connection preface as
     // a connection error (Section 5.4.1) of type PROTOCOL_ERROR" is enforced by
     // nghttp2 before that frame can arrive.
-    auto handshake() -> task<void> {
+    auto handshake() -> http::detail::operation<void> {
         while (!context_.peer_initial_settings_received) {
             // The driver latched a connection failure (e.g. EOF before the
             // peer's initial SETTINGS, RFC 9113 §3.4 — "Clients and servers
@@ -152,7 +165,7 @@ public:
         }
     }
 
-    auto flush() -> task<void> {
+    auto flush() -> http::detail::operation<void> {
         flush_output(session_.get(), context_);
         co_await write_and_clear(transport_, context_);
         if (context_.core.pending_callback_failure)
@@ -165,7 +178,7 @@ public:
     // credit return. Unlike flush(), a recorded connection error is not
     // delivered here: buffered body bytes must stay readable after the
     // connection died, and returning credit to a dead peer is pointless.
-    auto flush_credit() -> task<void> {
+    auto flush_credit() -> http::detail::operation<void> {
         if (context_.core.connection_error)
             co_return;
         flush_output(session_.get(), context_);
@@ -175,9 +188,9 @@ public:
     // RFC 9113 §6.9 — return flow-control credit as the application consumes
     // body bytes. nghttp2_session_consume cannot fail here: the stream id is
     // nonzero and automatic WINDOW_UPDATE is disabled (create_session).
-    auto return_credit(std::int32_t stream_id, std::size_t n) -> task<void> {
+    auto return_credit(std::int32_t stream_id, std::size_t n) -> http::detail::operation<void> {
         static_cast<void>(nghttp2_session_consume(session_.get(), stream_id, n));
-        co_await flush_credit();
+        return flush_credit();
     }
 
     // RFC 9113 §6.7 — "The PING frame (type=0x06) is a mechanism for measuring a minimal
@@ -187,7 +200,7 @@ public:
     // application-chosen; nghttp2 acknowledges PING frames received from the peer
     // automatically (§6.7, "Receivers of a PING frame that does not include an ACK flag MUST
     // send a PING frame with the ACK flag set in response, with an identical frame payload.").
-    auto ping() -> task<void> {
+    auto ping() -> http::detail::operation<void> {
         std::array<std::uint8_t, 8> opaque{};
         check(nghttp2_submit_ping(
             session_.get(), NGHTTP2_FLAG_NONE, opaque.data()), "submit_ping");
@@ -207,7 +220,7 @@ public:
     // requests on another connection." — the processed value is clamped to the
     // smallest last-stream-id already sent on this connection (if any), then
     // recorded, so repeated GOAWAYs stay monotone.
-    auto shutdown() -> task<void> {
+    auto shutdown() -> http::detail::operation<void> {
         auto processed = context_.last_processed_peer_stream_id;
         auto send = std::min(
             processed, context_.goaway_sent_last_stream_id.value_or(processed));
@@ -219,7 +232,7 @@ public:
     }
 
     auto update_settings(std::span<const setting> settings)
-        -> task<settings_ticket>
+        -> http::detail::operation<settings_ticket>
     {
         auto entries = make_settings(settings);
         check(nghttp2_submit_settings(
@@ -261,11 +274,10 @@ public:
     void expire(settings_ticket ticket) {
         if (ticket.sequence <= context_.acknowledged_settings_sequence)
             return;
-        auto pending = std::ranges::any_of(
-            context_.pending_settings,
-            [ticket](settings_ticket candidate) {
-                return candidate.sequence == ticket.sequence;
-            });
+        bool pending = false;
+        context_.pending_settings.each([&](settings_ticket candidate) {
+            pending = pending || candidate.sequence == ticket.sequence;
+        });
         if (!pending)
             return;
 
@@ -280,28 +292,29 @@ public:
         flush_output(session_.get(), context_);
         context_.core.connection_error = std::make_exception_ptr(protocol_error{
             error_info{
-                .version = protocol_version::http2,
-                .scope = error_scope::connection,
                 .condition = error_condition::timeout,
                 .exchange_identity = std::nullopt,
                 .library_code = std::nullopt,
-                .retryable = false,
             },
-            close_connection{error_code{code}},
+            close_connection{code},
             "http/2: SETTINGS acknowledgment timed out"});
-        notify_waiters(context_);
+        notify();
     }
 
     // Expire an unacknowledged SETTINGS generation (expire) and flush the
     // resulting GOAWAY. The protocol library owns no clock; an external timer
     // calls this with the ticket whose deadline elapsed.
-    auto expire_settings(settings_ticket ticket) -> task<void> {
+    auto expire_settings(settings_ticket ticket) -> http::detail::operation<void> {
         expire(ticket);
-        co_await flush();
+        std::exception_ptr failure;
+        try { co_await flush(); }
+        catch (...) { failure = std::current_exception(); }
+        co_await http::detail::dispatch_wakeups{wakeups_};
+        if (failure) std::rethrow_exception(failure);
     }
 
 private:
-    auto read_loop() -> task<void> {
+    auto read_loop() -> http::detail::operation<void> {
         std::exception_ptr failure;
         try {
             std::array<std::byte, io_buffer_size> buffer;
@@ -319,14 +332,11 @@ private:
                         : static_cast<std::uint32_t>(NGHTTP2_NO_ERROR);
                     throw protocol_error{
                         error_info{
-                            .version = protocol_version::http2,
-                            .scope = error_scope::connection,
                             .condition = error_condition::peer_closed,
                             .exchange_identity = std::nullopt,
                             .library_code = std::nullopt,
-                            .retryable = !context_.core.goaway_received,
                         },
-                        close_connection{error_code{code}},
+                        close_connection{code},
                         "http/2: connection closed by peer"};
                 }
 
@@ -345,27 +355,21 @@ private:
                 if (result < 0) {
                     // A fatal library return maps directly to the wire code for
                     // the GOAWAY we answer with — never to a stale recorded one.
-                    auto wire_code = wire_code_from_library_code(
+                    auto code = reset_code_from_library_code(
                         static_cast<int>(result));
                     static_cast<void>(
                         nghttp2_session_terminate_session(
-                            session_.get(), wire_code));
+                            session_.get(), code));
                     co_await flush();
                     throw protocol_error(error_info{
-                        .version = protocol_version::http2,
-                        .scope = error_scope::connection,
-                        .condition = condition_from_wire_code(wire_code),
+                        .condition = condition_from_reset_code(code),
                         .exchange_identity = std::nullopt,
                         .library_code = static_cast<int>(result),
-                        .retryable = false,
-                    }, close_connection{error_code{wire_code}},
+                    }, close_connection{code},
                         std::format("http/2: mem_recv failed ({})", result));
                 }
                 co_await flush();
-                {
-                    http::detail::wake_scope scope{wakeups_};
-                    notify_waiters(context_);
-                }
+                notify();
                 co_await http::detail::dispatch_wakeups{wakeups_};
                 if (!nghttp2_session_want_read(session_.get())) {
                     // nghttp2 terminates the session itself — answering with
@@ -378,14 +382,11 @@ private:
                         NGHTTP2_PROTOCOL_ERROR);
                     throw protocol_error{
                         error_info{
-                            .version = protocol_version::http2,
-                            .scope = error_scope::connection,
-                            .condition = condition_from_wire_code(code),
+                            .condition = condition_from_reset_code(code),
                             .exchange_identity = std::nullopt,
                             .library_code = context_.library_error_code,
-                            .retryable = false,
                         },
-                        close_connection{error_code{code}},
+                        close_connection{code},
                         "http/2: connection terminated after peer protocol violation"};
                 }
             }
@@ -408,16 +409,21 @@ private:
     void fail_connection(std::exception_ptr failure) noexcept {
         if (!context_.core.connection_error)
             context_.core.connection_error = std::move(failure);
-        notify_waiters(context_);
+        notify();
+    }
+
+    void notify() noexcept {
+        http::detail::wake_scope scope{wakeups_};
+        notify_waiters(context_, session_.get());
     }
 
     S& transport_;
     session_handle& session_;
-    session_context& context_;
-    http::detail::wake_queue wakeups_{};
+    session_context<Queue>& context_;
+    http::detail::wake_queue<Queue> wakeups_{};
     bool started_{false};
     // Declared last: destroyed first, while the state its reader uses lives.
-    http::task_scope scope_{};
+    http::detail::operation_scope scope_{};
 };
 
 // RFC 9113 §6.9 — "Flow control is directional with overall control provided
@@ -435,16 +441,25 @@ private:
 // only requeues a *deferred* stream, so without the wait the flush would spin
 // without progress. When the peer closes the stream mid-body the driver either
 // throws (client requests) or returns quietly (server responses).
-template <byte_stream S, body_stream Body>
+template <byte_stream S, body_stream Body, template <class> class Queue>
 inline auto stream_outbound_body(
-    endpoint_runtime<S>& runtime,
+    endpoint_runtime<S, Queue>& runtime,
     nghttp2_session* session,
-    session_context& ctx,
+    session_context<Queue>& ctx,
     std::int32_t stream_id,
-    std::shared_ptr<stream_data> sd,
+    std::shared_ptr<stream_data<Queue>> sd,
     outbound_body_state& outbound,
     body_bridge<Body>& bridge,
-    bool fail_on_close) -> task<void> {
+    bool fail_on_close) -> http::detail::operation<void> {
+    struct body_borrow {
+        body_bridge<Body>& bridge;
+        ~body_borrow() { if (!bridge.eof()) bridge.detach(); }
+    } borrow{bridge};
+    // The peer may close the stream while the initial headers are written.
+    if (sd->core.closed || sd->core.aborted) {
+        if (fail_on_close) throw_stream_abort(*sd);
+        co_return;
+    }
     for (;;) {
         auto body_eof = co_await bridge.refill();
         while (!body_eof && !send_window_available(session, stream_id)) {

@@ -10,6 +10,7 @@ export namespace http::v2 {
 
 namespace detail {
 
+template <template <class> class Queue = http::queues::local>
 inline auto create_callbacks() -> callbacks_handle {
     nghttp2_session_callbacks* raw_callbacks = nullptr;
     check(
@@ -23,7 +24,7 @@ inline auto create_callbacks() -> callbacks_handle {
            const std::uint8_t* name, std::size_t namelen,
            const std::uint8_t* value, std::size_t valuelen,
            std::uint8_t, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
                     // RFC 9113 §8.4.1 — "The PUSH_PROMISE frame includes a field block that contains
@@ -66,7 +67,7 @@ inline auto create_callbacks() -> callbacks_handle {
                         // as this endpoint's own abort, never attributed to the
                         // peer — mirroring the request/response treatment in the
                         // streams branch.
-                        auto status = http::detail::parse_status(v);
+                        auto status = http::status::parse(v);
                         if (!status) {
                             ctx.rejected_pushes.insert(frame->hd.stream_id);
                             push_it->second->locally_aborted = true;
@@ -76,13 +77,14 @@ inline auto create_callbacks() -> callbacks_handle {
                                 NGHTTP2_PROTOCOL_ERROR);
                             return 0;
                         }
-                        push_it->second->status_code = static_cast<http::status>(*status);
+                        push_it->second->status_code = *status;
                     }
                     return 0;
                 }
 
                 auto it = ctx.core.streams.find(frame->hd.stream_id);
                 if (it == ctx.core.streams.end()) return 0;
+                mark_stream_changed(ctx, frame->hd.stream_id);
                 auto n = std::string(reinterpret_cast<const char*>(name), namelen);
                 auto v = std::string(reinterpret_cast<const char*>(value), valuelen);
                 if (it->second->core.decoded.append(n, v) ==
@@ -91,7 +93,7 @@ inline auto create_callbacks() -> callbacks_handle {
                     // malformed: "a stream error (Section 5.4.2) of type
                     // PROTOCOL_ERROR". As above, the reset is submitted directly
                     // because a callback failure code maps to INTERNAL_ERROR.
-                    auto status = http::detail::parse_status(v);
+                    auto status = http::status::parse(v);
                     if (!status) {
                         it->second->core.aborted = true;
                         it->second->locally_aborted = true;
@@ -101,7 +103,7 @@ inline auto create_callbacks() -> callbacks_handle {
                             NGHTTP2_PROTOCOL_ERROR);
                         return 0;
                     }
-                    it->second->core.status_code = static_cast<http::status>(*status);
+                    it->second->core.status_code = *status;
                 }
                 return 0;
             });
@@ -109,8 +111,18 @@ inline auto create_callbacks() -> callbacks_handle {
 
     nghttp2_session_callbacks_set_on_frame_recv_callback(cbs,
         [](nghttp2_session* session, const nghttp2_frame* frame, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
+                if (frame->hd.stream_id != 0)
+                    mark_stream_changed(ctx, frame->hd.stream_id);
+                if (frame->hd.type == NGHTTP2_GOAWAY ||
+                    (frame->hd.type == NGHTTP2_WINDOW_UPDATE && frame->hd.stream_id == 0))
+                    ctx.notify_all_streams = true;
+                if (frame->hd.type == NGHTTP2_SETTINGS && (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
+                    for (const auto& setting : std::span{frame->settings.iv, frame->settings.niv})
+                        if (setting.settings_id == NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE)
+                            ctx.notify_all_streams = true;
+                }
                 if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
                     // RFC 9113 §8.4 — "Promised requests MUST be safe ... and cacheable ... Clients
                     // that receive a promised request that is not cacheable, that is not known to be
@@ -128,12 +140,13 @@ inline auto create_callbacks() -> callbacks_handle {
                         // are CONNECT requests." A pushed request is never CONNECT (§8.4 requires
                         // safety/cacheability), and §8.4 — "The server MUST include a value in the
                         // ":authority" pseudo-header field" — so all four are mandatory.
-                        bool missing_pseudo = push->request.method_token.empty() ||
+                        bool missing_pseudo = !push->request.method ||
                                               push->request.path.empty() ||
                                               push->request.scheme.empty() ||
                                               push->request.authority.empty();
-                        bool bad_method = push->request.method_token != "GET" &&
-                                          push->request.method_token != "HEAD";
+                        bool bad_method = push->request.method &&
+                                          *push->request.method != http::method::GET &&
+                                          *push->request.method != http::method::HEAD;
                         // RFC 9113 §8.4 — "A client MUST treat a PUSH_PROMISE for which the server is
                         // not authoritative as a stream error ... of type PROTOCOL_ERROR." (RFC 9113
                         // §10.1 — "HTTP/2 relies on the HTTP definition of authority"; RFC 9110 §4.2.2
@@ -180,7 +193,7 @@ inline auto create_callbacks() -> callbacks_handle {
                         // normalizes scheme/host case and the default port, which
                         // covers both normalization choices for http/https.
                         bool host_disagrees = false;
-                        if (!it->second->core.decoded.method_token.empty() &&
+                        if (it->second->core.decoded.method &&
                             !it->second->core.decoded.authority.empty()) {
                             if (auto host = http::find_header(
                                     it->second->core.decoded.regular, "host")) {
@@ -197,9 +210,8 @@ inline auto create_callbacks() -> callbacks_handle {
                         // PROTOCOL_ERROR) before this callback can see the frame.
                         // A method token longer than http::method can hold is
                         // treated as malformed as well.
-                        const auto& method_token = it->second->core.decoded.method_token;
                         bool unrepresentable_method =
-                            !method_token.empty() && !http::method::parse(method_token);
+                            it->second->core.decoded.method_overflow;
                         if (host_disagrees || unrepresentable_method) {
                             // RFC 9113 §8.1.1 — "Malformed requests or responses
                             // that are detected MUST be treated as a stream error
@@ -219,17 +231,17 @@ inline auto create_callbacks() -> callbacks_handle {
                         // has no content. Only the final header section
                         // completes the response; interim fields are discarded so
                         // they cannot leak into the final response.
-                        bool interim_response = it->second->core.decoded.method_token.empty() &&
+                        bool interim_response = !it->second->core.decoded.method &&
                             is_informational(it->second->core.status_code);
                         if (interim_response) {
                             it->second->core.decoded = {};
-                            it->second->core.status_code = 0;
+                            it->second->core.status_code = {};
                         } else {
                             it->second->core.headers_done = true;
                             // A request stream whose header section is complete becomes
                             // deliverable: the server surfaces it (with a lazy body
                             // reader) before the body arrives.
-                            if (!it->second->core.decoded.method_token.empty() &&
+                            if (it->second->core.decoded.method &&
                                 !it->second->core.delivered) {
                                 it->second->core.delivered = true;
                                 ctx.core.receive_queue_push(it->second);
@@ -270,7 +282,7 @@ inline auto create_callbacks() -> callbacks_handle {
                         // responses, including interim responses; otherwise, the response is
                         // malformed (Section 8.1.1)." — a pushed response without a :status is
                         // rejected with RST_STREAM instead of being delivered to take_push().
-                        if (push_it->second->status_code == 0) {
+                        if (push_it->second->status_code.empty()) {
                             auto stream_id = frame->hd.stream_id;
                             ctx.rejected_pushes.insert(stream_id);
                             // A bad :status value was already rejected in
@@ -312,7 +324,7 @@ inline auto create_callbacks() -> callbacks_handle {
     // the unsigned HTTP/2 wire code.
     nghttp2_session_callbacks_set_on_invalid_frame_recv_callback(cbs,
         [](nghttp2_session*, const nghttp2_frame*, int library_code, void* ud) noexcept -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 ctx.library_error_code = library_code;
                 return 0;
@@ -340,7 +352,7 @@ inline auto create_callbacks() -> callbacks_handle {
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs,
         [](nghttp2_session* session, std::uint8_t, std::int32_t stream_id,
            const std::uint8_t* data, std::size_t len, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (auto push_it = ctx.pushed_streams.find(stream_id);
                     push_it != ctx.pushed_streams.end()) {
@@ -352,6 +364,7 @@ inline auto create_callbacks() -> callbacks_handle {
 
                 auto it = ctx.core.streams.find(stream_id);
                 if (it != ctx.core.streams.end()) {
+                    mark_stream_changed(ctx, stream_id);
                     auto bytes = std::as_bytes(std::span{data, len});
                     it->second->body.append(bytes);
                 }
@@ -361,7 +374,7 @@ inline auto create_callbacks() -> callbacks_handle {
 
     nghttp2_session_callbacks_set_on_begin_headers_callback(cbs,
         [](nghttp2_session*, const nghttp2_frame* frame, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (frame->hd.type == NGHTTP2_PUSH_PROMISE) {
                     auto promised_stream_id = frame->push_promise.promised_stream_id;
@@ -394,14 +407,14 @@ inline auto create_callbacks() -> callbacks_handle {
                     // fields.
                     if (is_informational(push->status_code)) {
                         push->response = {};
-                        push->status_code = 0;
+                        push->status_code = {};
                     }
                     return 0;
                 }
 
                 if (frame->hd.type == NGHTTP2_HEADERS &&
                     frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
-                    auto sd = std::make_shared<stream_data>();
+                    auto sd = std::make_shared<stream_data<Queue>>();
                     sd->core.id = frame->hd.stream_id;
                     ctx.core.streams[sd->core.id] = sd;
                 }
@@ -412,7 +425,7 @@ inline auto create_callbacks() -> callbacks_handle {
     nghttp2_session_callbacks_set_on_stream_close_callback(cbs,
         [](nghttp2_session* session, std::int32_t stream_id,
            std::uint32_t error_code, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (auto push_it = ctx.pushed_streams.find(stream_id);
                     push_it != ctx.pushed_streams.end()) {
@@ -440,6 +453,7 @@ inline auto create_callbacks() -> callbacks_handle {
                     ctx.pushed_streams.erase(push_it);
                 }
                 if (auto it = ctx.core.streams.find(stream_id); it != ctx.core.streams.end()) {
+                    mark_stream_changed(ctx, stream_id);
                     it->second->core.closed = true;
                     // RFC 9113 §6.4 — "RST_STREAM (type=0x3) ... contains a single
                     // unsigned, 32-bit integer identifying the error code (Section 7)"
@@ -471,7 +485,7 @@ inline auto create_callbacks() -> callbacks_handle {
 
     nghttp2_session_callbacks_set_on_frame_send_callback(cbs,
         [](nghttp2_session*, const nghttp2_frame* frame, void* ud) -> int {
-            auto& ctx = *static_cast<session_context*>(ud);
+            auto& ctx = *static_cast<session_context<Queue>*>(ud);
             return http::detail::callback_boundary(ctx, NGHTTP2_ERR_CALLBACK_FAILURE, [&]() -> int {
                 if (frame->hd.type == NGHTTP2_SETTINGS &&
                     (frame->hd.flags & NGHTTP2_FLAG_ACK) == 0) {
@@ -501,17 +515,16 @@ inline auto create_callbacks() -> callbacks_handle {
 // (detail::create_session): flow-control credit returns through the credit
 // hook only as the application consumes (RFC 9113 §6.9), which bounds the
 // staging buffer by the advertised window.
+template <template <class> class Queue = http::queues::local>
 class body_reader {
 public:
-    using credit_return = std::function<task<void>(std::size_t)>;
-
     body_reader(
-        detail::session_context& context,
-        std::shared_ptr<detail::stream_data> stream,
-        credit_return credit)
+        detail::session_context<Queue>& context,
+        std::shared_ptr<detail::stream_data<Queue>> stream,
+        detail::credit_return credit)
         : context_(&context),
           stream_(std::move(stream)),
-          credit_(std::move(credit)) {}
+          credit_(credit) {}
 
     body_reader(const body_reader&) = delete;
     auto operator=(const body_reader&) -> body_reader& = delete;
@@ -520,7 +533,7 @@ public:
 
     auto async_read(
         std::span<std::byte> buf,
-        std::stop_token stop) -> task<std::size_t> {
+        std::stop_token stop) -> http::detail::operation<std::size_t> {
         for (;;) {
             if (!stream_->body.empty()) {
                 auto n = stream_->body.read(buf);
@@ -547,9 +560,9 @@ public:
     }
 
 private:
-    detail::session_context* context_;
-    std::shared_ptr<detail::stream_data> stream_;
-    credit_return credit_;
+    detail::session_context<Queue>* context_;
+    std::shared_ptr<detail::stream_data<Queue>> stream_;
+    detail::credit_return credit_;
 };
 
 } // namespace http::v2

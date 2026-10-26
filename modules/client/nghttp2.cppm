@@ -13,9 +13,14 @@ export namespace http::v2 {
 
 // ─── HTTP/2 client (RFC 9113) ─────────────────────────────────
 
-template <byte_stream S>
+template <byte_stream S, template <class> class Queue = http::queues::local>
 class client {
 public:
+    // RFC 7301 — the ALPN protocol identifier of HTTP/2 (RFC 9113 §3.1 — "h2").
+    // The authority goes in :authority, not in a Host field.
+    static constexpr std::string_view alpn = "h2";
+    static constexpr bool uses_host_field = false;
+
     explicit client(
         S& transport,
         configuration configuration = {})
@@ -31,8 +36,8 @@ public:
     client(client&&) = delete;
     auto operator=(client&&) -> client& = delete;
 
-private:
-    auto operation_start() -> task<void> {
+public:
+    auto start() -> http::detail::operation<void> {
         co_await runtime_.start();
         co_await runtime_.handshake();
     }
@@ -40,8 +45,8 @@ private:
     // Send the request head, stream the body, and return the response head plus
     // a lazy body reader once the response headers have arrived.
     template <body_stream Body>
-    auto operation_request(http::request head, Body& body)
-        -> task<http::received<http::response, body_reader>> {
+    auto request(http::request head, Body& body)
+        -> http::detail::operation<http::received<http::response, body_reader<Queue>>> {
         // RFC 9113 §6.8 — "Receivers of a GOAWAY frame MUST NOT open additional streams on the
         // connection, although a new connection can be established for new streams."
         if (ctx_.core.goaway_received)
@@ -49,8 +54,8 @@ private:
 
         // RFC 9113 §8.3.1 / §8.5 — request pseudo-fields and CONNECT omission
         // rules are shared HTTP semantics with HTTP/3; the message partition
-        // validates and orders one owned field block.
-        auto fields = http::detail::make_request_field_block(head);
+        // validates and orders the backend descriptors over this request.
+        auto fields = http::detail::make_request_field_block(head, detail::make_nv);
         if (!fields)
             throw usage_error(
                 std::string{"http/2: "} +
@@ -70,17 +75,12 @@ private:
             }
         }
 
-        std::vector<nghttp2_nv> nva;
-        nva.reserve(fields->size());
-        for (auto& field : *fields)
-            nva.push_back(detail::make_nv(field.name, field.value));
-
-        auto sd = std::make_shared<detail::stream_data>();
+        auto sd = std::make_shared<detail::stream_data<Queue>>();
 
         auto binding = detail::bind_outbound_body(body);
 
         auto stream_id = detail::check_stream_id(
-            nghttp2_submit_request2(session_.get(), nullptr, nva.data(), nva.size(),
+            nghttp2_submit_request2(session_.get(), nullptr, fields->data(), fields->size(),
                 &binding.provider, nullptr), "submit_request");
         sd->core.id = stream_id;
         ctx_.core.streams[stream_id] = sd;
@@ -123,55 +123,42 @@ private:
             .fields = std::move(sd->core.decoded.regular),
         };
 
-        co_return http::received<http::response, body_reader>{
+        co_return http::received<http::response, body_reader<Queue>>{
             .head = std::move(head_out),
-            .body = body_reader{ctx_, sd,
-                [this, stream_id](std::size_t n) -> task<void> {
-                    co_await runtime_.return_credit(stream_id, n);
-                }},
+            .body = body_reader<Queue>{ctx_, sd, detail::credit_return{runtime_, stream_id}},
         };
     }
 
-    friend auto operation_start(client& endpoint) -> task<void> {
-        return endpoint.operation_start();
-    }
-
-    friend auto operation_close(client& endpoint) -> task<void> {
-        return endpoint.runtime_.close();
-    }
-
-    template <body_stream Body>
-    friend auto operation_request(client& endpoint, http::request head, Body& body)
-        -> task<http::received<http::response, body_reader>> {
-        return endpoint.operation_request(std::move(head), body);
+    auto close() -> http::detail::operation<void> {
+        return runtime_.close();
     }
 
 public:
 
     // RFC 9113 §6.7 — see detail::endpoint_runtime::ping.
-    auto ping() -> task<void> {
-        co_await runtime_.ping();
+    auto ping() -> http::detail::operation<void> {
+        return runtime_.ping();
     }
 
     // RFC 9113 §9.1 / §6.8 — send a GOAWAY with the clamped
     // last-stream-id before the connection closes (see
     // detail::endpoint_runtime::shutdown).
-    auto shutdown() -> task<void> {
-        co_await runtime_.shutdown();
+    auto shutdown() -> http::detail::operation<void> {
+        return runtime_.shutdown();
     }
 
     auto update_settings(std::span<const setting> settings)
-        -> task<settings_ticket>
+        -> http::detail::operation<settings_ticket>
     {
-        co_return co_await runtime_.update_settings(settings);
+        return runtime_.update_settings(settings);
     }
 
     [[nodiscard]] auto acknowledged(settings_ticket ticket) const noexcept -> bool {
         return runtime_.acknowledged(ticket);
     }
 
-    auto expire_settings(settings_ticket ticket) -> task<void> {
-        co_await runtime_.expire_settings(ticket);
+    auto expire_settings(settings_ticket ticket) -> http::detail::operation<void> {
+        return runtime_.expire_settings(ticket);
     }
 
     [[nodiscard]] auto compression_state() const -> hpack_state {
@@ -210,9 +197,9 @@ public:
 private:
     S& transport_;
     detail::session_handle session_{};
-    detail::session_context ctx_{};
+    detail::session_context<Queue> ctx_{};
     configuration configuration_{};
-    detail::endpoint_runtime<S> runtime_;
+    detail::endpoint_runtime<S, Queue> runtime_;
 };
 
 } // namespace http::v2

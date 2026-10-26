@@ -101,11 +101,79 @@ static_assert(method{} == method::GET);
 
 // ─── Status codes (RFC 9110 §15) ─────────────────────────────
 
-using status = std::uint16_t;
+// RFC 9110 §15 — "status-code = 3DIGIT"; "All valid status codes are within the
+// range of 100 to 599, inclusive". A status outside that range cannot exist: a
+// literal is checked by the constructor while it is still a compile-time
+// constant, and a received token enters through parse(), the only runtime door.
+// Nothing downstream re-checks the range, because nothing downstream can be
+// handed an invalid value.
+class status {
+public:
+    // "No status yet" — what a response head holds before the protocol layer
+    // parsed one.
+    constexpr status() noexcept = default;
+
+    consteval status(int value) : value_(static_cast<std::uint16_t>(value)) {
+        if (value < 100 || value > 599)
+            throw "http::status: RFC 9110 §15 allows only 100-599";
+    }
+
+    // RFC 9110 §15 — "status-code = 3DIGIT". Non-throwing so it can run at a C
+    // callback boundary; each protocol wraps the failure in its own error
+    // channel.
+    [[nodiscard]] static constexpr auto parse(std::string_view token) noexcept
+        -> std::optional<status> {
+        std::uint16_t value = 0;
+        auto [end, error] = std::from_chars(
+            token.data(), token.data() + token.size(), value);
+        if (error != std::errc{} || end != token.data() + token.size())
+            return std::nullopt;
+        return from_number(value);
+    }
+
+    // The runtime door for a parser that hands over a number instead of a
+    // token (llhttp reports the status it framed as an integer).
+    [[nodiscard]] static constexpr auto from_number(std::uint16_t value) noexcept
+        -> std::optional<status> {
+        if (value < 100 || value > 599) return std::nullopt;
+        return status{value, checked{}};
+    }
+
+    [[nodiscard]] constexpr auto code() const noexcept -> std::uint16_t { return value_; }
+    [[nodiscard]] constexpr auto empty() const noexcept -> bool { return value_ == 0; }
+
+    friend constexpr auto operator==(status, status) noexcept -> bool = default;
+    friend constexpr auto operator<=>(status, status) noexcept = default;
+
+    template <std::integral Value>
+    friend constexpr auto operator==(status value, Value other) noexcept -> bool {
+        return value.value_ == other;
+    }
+    template <std::integral Value>
+    friend constexpr auto operator<=>(status value, Value other) noexcept {
+        return value.value_ <=> other;
+    }
+
+    // A status prints as the code a status line holds.
+    friend auto operator<<(std::ostream& out, status value) -> std::ostream& {
+        return out << value.code();
+    }
+
+private:
+    struct checked {};
+    constexpr status(std::uint16_t value, checked) noexcept : value_(value) {}
+    std::uint16_t value_{0};
+};
+
+static_assert(status::parse("200") == status{200});
+static_assert(!status::parse("700"));
+static_assert(!status::parse("20"));
+static_assert(status{} != status{200});
+static_assert(status{404}.code() == 404);
 
 // RFC 9110 §15.1 — "The status codes listed below are defined in this specification.  The reason phrases listed here are only recommendations -- they can be replaced by local equivalents or left out altogether without affecting the protocol."
 constexpr auto default_reason_phrase(status code) -> std::string_view {
-    switch (code) {
+    switch (code.code()) {
         case 100: return "Continue";
         case 101: return "Switching Protocols";
         case 103: return "Early Hints";
@@ -167,6 +235,8 @@ constexpr auto default_reason_phrase(status code) -> std::string_view {
 // RFC 9110 §15 — "5xx (Server Error): The server failed to fulfill an apparently valid request"
 constexpr auto is_informational(status s) -> bool { return s >= 100 && s < 200; }
 constexpr auto is_successful(status s)    -> bool { return s >= 200 && s < 300; }
+static_assert(is_informational(status{103}) && !is_informational(status{}));
+static_assert(is_successful(status{204}) && !is_successful(status{304}));
 
 // Whether a response with this status may carry a body: 1xx, 204, 205, and 304 all
 // terminate at the end of the header section.
@@ -178,26 +248,6 @@ constexpr auto status_allows_body(status s) -> bool {
     return !is_informational(s) && s != 204 && s != 205 && s != 304;
 }
 
-namespace detail {
-
-// RFC 9110 §15 — "status-code = 3DIGIT", i.e. 100-599. The range bound on an
-// already-parsed status value; parse_status wraps it for wire tokens.
-[[nodiscard]] constexpr auto is_valid_status(status s) -> bool {
-    return s >= 100 && s <= 599;
-}
-
-// RFC 9110 §15 — "status-code = 3DIGIT", i.e. 100-599. Non-throwing so it
-// can run at a C callback boundary; each protocol wraps the failure in its
-// own error channel.
-[[nodiscard]] inline auto parse_status(std::string_view token) -> std::optional<status> {
-    status code = 0;
-    auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), code);
-    if (ec != std::errc{} || ptr != token.data() + token.size()) return std::nullopt;
-    if (!is_valid_status(code)) return std::nullopt;
-    return code;
-}
-
-} // namespace detail
 
 // ─── Headers (RFC 9110 §5) ───────────────────────────────────
 
@@ -508,10 +558,24 @@ struct parsed_target {
             ? parsed_target{.form = target_form::asterisk}
             : parsed_target{};
 
+    if (m != method::CONNECT && target.starts_with('/')) {
+        auto query = target.find('?');
+        return {.form = target_form::origin,
+                .path = query == std::string_view::npos ? target : target.substr(0, query),
+                .path_and_query = target};
+    }
+
     // RFC 9112 §3.2.2 — "absolute-form = absolute-URI".
     if (auto sep = target.find("://"); sep != std::string_view::npos) {
+        auto alpha = [](char value) { return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z'); };
+        auto scheme = target.substr(0, sep);
+        if (scheme.empty() || !alpha(scheme.front()) ||
+            !std::ranges::all_of(scheme.substr(1), [&](char value) {
+                return alpha(value) || (value >= '0' && value <= '9') || value == '+' || value == '-' || value == '.';
+            }))
+            return {};
         auto authority_start = sep + 3;
-        auto path_start = target.find('/', authority_start);
+        auto path_start = target.find_first_of("/?", authority_start);
         parsed_target result{.form = target_form::absolute};
         result.scheme = target.substr(0, sep);
         result.authority = target.substr(authority_start,
@@ -526,6 +590,9 @@ struct parsed_target {
             // path of \"/\", so the normal form is to provide a path of \"/\" instead."
             result.path = "/";
             result.path_and_query = "/";
+        } else if (target[path_start] == '?') {
+            result.path = "/";
+            result.path_and_query = target.substr(path_start);
         } else {
             result.path_and_query = target.substr(path_start);
             auto query = result.path_and_query.find('?');
@@ -657,12 +724,19 @@ enum class request_field_error : std::uint8_t {
     malformed_connect_authority,
 };
 
-// HTTP/2 and HTTP/3 use the same HTTP field model. Produce one owned,
-// pseudo-first block here; each protocol adapter only maps these strings to
-// its backend descriptor type.
-[[nodiscard]] inline auto make_request_field_block(const request& req)
-    -> std::expected<std::vector<header>, request_field_error>
+// Validate and construct backend descriptors directly over the owned request.
+// The mapper is static; names and values remain alive through submission.
+template <typename MakeField>
+[[nodiscard]] inline auto make_request_field_block(request& req, MakeField make_field)
+    -> std::expected<std::vector<std::invoke_result_t<MakeField&, std::string_view, std::string_view>>, request_field_error>
 {
+    // Materialize an empty absolute path in the owned request, so descriptor
+    // views never refer to a temporary concatenation of "/" and the query.
+    if (!req.target.starts_with('/')) {
+        auto target = parse_target(req.target, req.method);
+        if (target.form == target_form::absolute && target.path_and_query.starts_with('?'))
+            req.target.insert(static_cast<std::size_t>(target.path_and_query.data() - req.target.data()), 1, '/');
+    }
     auto authority = request_authority(req);
     if (!authority)
         return std::unexpected{request_field_error::missing_authority};
@@ -681,7 +755,7 @@ enum class request_field_error : std::uint8_t {
             return std::unexpected{request_field_error::malformed_connect_authority};
     }
 
-    auto path = request_path(req);
+    auto path = request_path_and_query(req);
     auto scheme = request_scheme(req);
     if (req.method != method::CONNECT) {
         // RFC 9113 §8.3.1 — "A request in asterisk form (for OPTIONS) includes the
@@ -694,18 +768,18 @@ enum class request_field_error : std::uint8_t {
         if (!scheme) return std::unexpected{request_field_error::missing_scheme};
     }
 
-    std::vector<header> block;
+    std::vector<std::invoke_result_t<MakeField&, std::string_view, std::string_view>> block;
     block.reserve(req.fields.size() + (req.method == method::CONNECT ? 2 : 4));
-    block.push_back({":method", std::string(req.method.token())});
+    block.push_back(make_field(":method", req.method.token()));
     if (req.method != method::CONNECT) {
-        block.push_back({":scheme", std::string(*scheme)});
-        block.push_back({":authority", std::string(*authority)});
-        block.push_back({":path", path ? std::string(*path) : "*"});
+        block.push_back(make_field(":scheme", *scheme));
+        block.push_back(make_field(":authority", *authority));
+        block.push_back(make_field(":path", path.value_or("*")));
     } else {
-        block.push_back({":authority", std::string(*authority)});
+        block.push_back(make_field(":authority", *authority));
     }
     for (const auto& field : req.fields) {
-        if (!iequal(field.name, "host")) block.push_back(field);
+        if (!iequal(field.name, "host")) block.push_back(make_field(field.name, field.value));
     }
     return block;
 }
@@ -733,7 +807,16 @@ enum class field_disposition : std::uint8_t {
 
 struct decoded_fields {
     headers regular{};
-    std::string method_token{};
+    // RFC 9113 §8.3.1 / RFC 9114 §4.3 — ":method" is present on a request
+    // stream and never on a response stream, so the method doubles as the
+    // direction of the exchange. It is kept as the validated type: the parse
+    // layer decides once whether the token is a representable method, and the
+    // delivery path neither re-parses nor re-validates it.
+    std::optional<http::method> method{};
+    // A ":method" longer than http::method can hold. It cannot be stored, so
+    // the header-block check reads this flag instead and treats the message as
+    // malformed.
+    bool method_overflow{false};
     std::string path{};
     std::string scheme{};
     std::string authority{};
@@ -744,8 +827,12 @@ struct decoded_fields {
     // and legality.
     auto append(std::string name, std::string value) -> field_disposition {
         if (name == ":status") return field_disposition::deferred_status;
-        if (name == ":method") method_token = std::move(value);
-        else if (name == ":path") path = std::move(value);
+        if (name == ":method") {
+            if (auto parsed = http::method::parse(value))
+                method = std::move(*parsed);
+            else
+                method_overflow = true;
+        } else if (name == ":path") path = std::move(value);
         else if (name == ":scheme") scheme = std::move(value);
         else if (name == ":authority") authority = std::move(value);
         else if (!name.starts_with(':')) regular.push_back({std::move(name), std::move(value)});

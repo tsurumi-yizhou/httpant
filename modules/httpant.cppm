@@ -1,4 +1,8 @@
 export module httpant;
+export import httpant.queue;
+
+export import httpant.dependencies.stdexec;
+export import httpant.memory;
 
 export import :error;
 export import :trait;
@@ -25,5 +29,9 @@ export import :server.nghttp3;
 export import :coroutine;
 export import :execution;
 export import :fetch;
+export import :fetch.coroutine;
+export import :fetch.execution;
 export import :caching;
 export import :cookie;
+
+export import :websocket;

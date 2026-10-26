@@ -17,6 +17,10 @@ export namespace http::v1 {
 template <byte_stream S>
 class server {
 public:
+    // The prefix every local-misuse message of this engine starts with; the
+    // exchange token reads it from the server type that minted it.
+    static constexpr std::string_view message_prefix = error_prefix.view();
+
     explicit server(S& transport) : transport_(transport) {}
 
     using request_body = body_reader<HTTP_REQUEST, S>;
@@ -26,9 +30,11 @@ private:
     // shared per-exchange record the token and the server's active-exchange
     // latch both reference, so respond() can enforce single-response and
     // ordering invariants.
-    struct exchange_state {
+    using body_lifecycle = typename request_body::lifecycle;
+    struct exchange_state : body_lifecycle {
+        exchange_state(method request_method, bool consumed)
+            : body_lifecycle{consumed}, request_method(request_method) {}
         method request_method;
-        std::shared_ptr<typename request_body::lifecycle> body;
         bool responded{false};
     };
 
@@ -37,14 +43,14 @@ public:
         http::detail::exchange_token<server, std::shared_ptr<exchange_state>>;
     using incoming_request = http::detail::incoming_request<request_body, exchange_token>;
 
-private:
+public:
     // Read the request head and return it plus a lazy body reader.
-    auto operation_receive() -> task<incoming_request> {
+    auto receive() -> http::detail::operation<incoming_request> {
         // RFC 9112 §9.6 — no further requests once the connection closed.
         if (closed_ || close_requested_ || parser_.connection_closed())
             throw usage_error("http/1.1: connection closed after previous exchange");
         if (active_exchange_ &&
-            (!active_exchange_->body->consumed || !active_exchange_->responded))
+            (!active_exchange_->consumed || !active_exchange_->responded))
             throw usage_error("http/1.1: previous exchange not complete");
 
         parser_.begin_message();
@@ -79,11 +85,8 @@ private:
             // request head therefore produces a 400 response, which the server
             // writes itself; what is left for the application is closing the
             // connection, so the typed error has that action.
-            if (failure.info().version == protocol_version::http1 &&
-                failure.info().condition == error_condition::malformed_message) {
-                auto info = failure.info();
-                info.scope = error_scope::connection;
-                malformed.emplace(info, close_connection{std::nullopt}, failure.what());
+            if (failure.info().condition == error_condition::malformed_message) {
+                malformed.emplace(failure.info(), close_connection{std::nullopt}, failure.what());
             } else {
                 throw;
             }
@@ -127,13 +130,11 @@ private:
             .fields = std::move(st.fields),
         };
 
-        auto body_lifecycle = std::make_shared<typename request_body::lifecycle>();
-        body_lifecycle->consumed = parser_.complete();
-        auto exchange = std::make_shared<exchange_state>(st.req_method, body_lifecycle);
+        auto exchange = std::make_shared<exchange_state>(st.req_method, parser_.complete());
         active_exchange_ = exchange;
         co_return incoming_request{
             .head = std::move(head),
-            .body = request_body{transport_, parser_, std::move(body_lifecycle)},
+            .body = request_body{transport_, parser_, exchange},
             .token = exchange_token{*this, std::move(exchange)},
         };
     }
@@ -141,10 +142,10 @@ private:
     // Stream the response head and body. For HEAD or a successful CONNECT the
     // body is suppressed on the wire (no content is sent).
     template <body_stream Body>
-    auto operation_respond(
+    auto respond(
         exchange_token token,
         http::response head,
-        Body& body) -> task<void> {
+        Body& body) -> http::detail::operation<void> {
         // RFC 9112 §9.6 — no response once the connection is finished. The
         // parser's connection_closed_ latch is not consulted here: it is set
         // whenever a request completed with "Connection: close", which is
@@ -156,7 +157,7 @@ private:
         // A token minted by another server must not respond on this
         // connection; responding consumes the token (the exchange record moves
         // out), so a second respond with the same token fails the check above.
-        token.check_owner(*this, "http/1.1: ");
+        token.check_owner(*this);
         auto exchange = token.take_handle();
         if (active_exchange_ != exchange || exchange->responded)
             throw usage_error("http/1.1: exchange token does not belong to server");
@@ -174,7 +175,7 @@ private:
         // option on the wire (RFC 9112 §9.6 — "The server SHOULD send a
         // 'close' connection option in its final response on that connection"),
         // which also latches the connection closed below.
-        if (!exchange->body->consumed && !http::field_contains_token(head.fields, "connection", "close"))
+        if (!exchange->consumed && !http::field_contains_token(head.fields, "connection", "close"))
             head.fields.push_back({"connection", "close"});
 
         // RFC 9110 §9.3.2 — HEAD responses never carry content; RFC 9110 §9.3.6
@@ -214,20 +215,11 @@ private:
         exchange->responded = true;
     }
 
-    friend auto operation_start(server&) -> task<void> { co_return; }
-    friend auto operation_close(server&) -> task<void> { co_return; }
-
-    friend auto operation_receive(server& endpoint) -> task<incoming_request> {
-        return endpoint.operation_receive();
+    auto start() -> http::detail::operation<void> {
+        co_return;
     }
-
-    template <body_stream Body>
-    friend auto operation_respond(
-        server& endpoint,
-        exchange_token token,
-        http::response head,
-        Body& body) -> task<void> {
-        return endpoint.operation_respond(std::move(token), std::move(head), body);
+    auto close() -> http::detail::operation<void> {
+        co_return;
     }
 
 public:
