@@ -1,6 +1,7 @@
 export module httpant.examples.asio;
 
 import httpant.dependencies.asio;
+export import httpant.tls;
 import std;
 import httpant;
 
@@ -237,106 +238,11 @@ private:
     std::shared_ptr<tcp::socket> socket_;
 };
 
-class tls_socket_stream {
+class tls_socket_stream : public http::tls::stream<tcp_socket_stream> {
 public:
-    explicit tls_socket_stream(asio::ssl::stream<tcp::socket> socket)
-        : socket_(std::make_shared<asio::ssl::stream<tcp::socket>>(std::move(socket))) {}
-
-    // Copying a stream shares the underlying TLS connection (see
-    // tcp_socket_stream above).
-    tls_socket_stream(const tls_socket_stream&) = default;
-    auto operator=(const tls_socket_stream&) -> tls_socket_stream& = default;
-    tls_socket_stream(tls_socket_stream&&) = default;
-    auto operator=(tls_socket_stream&&) -> tls_socket_stream& = default;
-
-    auto async_read(std::span<std::byte> buffer, std::stop_token stop) {
-        auto socket = socket_;
-        auto state = std::make_shared<detail::socket_operation_state>(socket->get_executor(), [socket] {
-            std::error_code ignored;
-            socket->lowest_layer().cancel(ignored);
-        });
-        auto start = [socket, buffer](std::shared_ptr<detail::socket_operation_state> state) {
-            socket->async_read_some(
-                asio::buffer(buffer.data(), buffer.size()),
-                [state = std::move(state)](std::error_code ec, std::size_t bytes_read) {
-                    auto error = std::exception_ptr{};
-                    if (ec && ec != asio::error::eof)
-                        error = detail::failure(ec, "tls socket read failed");
-                    state->complete(std::move(error), ec == asio::error::eof ? 0 : bytes_read);
-                });
-        };
-        return detail::socket_operation{std::move(state), stop, std::move(start)};
-    }
-
-    auto async_read(std::span<std::byte> buffer) {
-        return async_read(buffer, std::stop_token{});
-    }
-
-    auto async_write(std::span<const std::byte> buffer, std::stop_token stop) {
-        auto socket = socket_;
-        auto state = std::make_shared<detail::socket_operation_state>(socket->get_executor(), [socket] {
-            std::error_code ignored;
-            socket->lowest_layer().cancel(ignored);
-        });
-        auto start = [socket, buffer](std::shared_ptr<detail::socket_operation_state> state) {
-            asio::async_write(
-                *socket,
-                asio::buffer(buffer.data(), buffer.size()),
-                [state = std::move(state)](std::error_code ec, std::size_t bytes_written) {
-                    auto error = std::exception_ptr{};
-                    if (ec)
-                        error = detail::failure(ec, "tls socket write failed");
-                    state->complete(std::move(error), bytes_written);
-                });
-        };
-        return detail::socket_operation{std::move(state), stop, std::move(start)};
-    }
-
-    auto async_write(std::span<const std::byte> buffer) {
-        return async_write(buffer, std::stop_token{});
-    }
-
-    auto socket() -> asio::ssl::stream<tcp::socket>& {
-        return *socket_;
-    }
-
-    auto lowest_layer() -> decltype(auto) {
-        return socket_->lowest_layer();
-    }
-
-private:
-    std::shared_ptr<asio::ssl::stream<tcp::socket>> socket_;
-};
-
-class tls_handshake_operation {
-public:
-    tls_handshake_operation(asio::ssl::stream<tcp::socket>& socket,
-                            asio::ssl::stream_base::handshake_type type,
-                            std::string what)
-        : socket_(socket), type_(type), what_(std::move(what)) {}
-
-    bool await_ready() const noexcept {
-        return false;
-    }
-
-    void await_suspend(std::coroutine_handle<> continuation) {
-        socket_.async_handshake(type_, [this, continuation](std::error_code ec) mutable {
-            if (ec)
-                error_ = detail::failure(ec, what_.c_str());
-            continuation.resume();
-        });
-    }
-
-    void await_resume() {
-        if (error_)
-            std::rethrow_exception(error_);
-    }
-
-private:
-    asio::ssl::stream<tcp::socket>& socket_;
-    asio::ssl::stream_base::handshake_type type_;
-    std::string what_;
-    std::exception_ptr error_{};
+    tls_socket_stream(tcp::socket socket, http::tls::context& context)
+        : http::tls::stream<tcp_socket_stream>(tcp_socket_stream{std::move(socket)}, context, "h2") {}
+    auto lowest_layer() -> tcp::socket& { return transport().socket(); }
 };
 
 class resolve_operation {
@@ -466,10 +372,8 @@ private:
     return accept_operation(acceptor, std::move(what));
 }
 
-[[nodiscard]] inline auto async_tls_handshake(asio::ssl::stream<tcp::socket>& socket,
-                                              asio::ssl::stream_base::handshake_type type,
-                                              std::string what = "tls handshake failed") -> tls_handshake_operation {
-    return tls_handshake_operation(socket, type, std::move(what));
+[[nodiscard]] inline auto async_tls_handshake(tls_socket_stream& socket, bool server) -> http::task<void> {
+    co_await socket.handshake(server, "h2");
 }
 
 } // namespace httpant::examples

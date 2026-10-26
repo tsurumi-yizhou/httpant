@@ -1,6 +1,6 @@
 import httpant.dependencies.asio;
 import httpant.dependencies.msquic;
-import httpant.dependencies.openssl;
+import httpant.dependencies.wolfssl;
 import std;
 import httpant;
 import httpant.examples.asio;
@@ -212,97 +212,18 @@ struct proxy_configuration {
     return config;
 }
 
-[[nodiscard]] auto make_alpn_wire(std::string_view protocol) -> std::vector<unsigned char> {
-    if (protocol.empty() || protocol.size() > 255)
-        throw std::runtime_error("ALPN identifier must contain between 1 and 255 bytes");
-
-    std::vector<unsigned char> wire;
-    wire.reserve(protocol.size() + 1);
-    wire.push_back(static_cast<unsigned char>(protocol.size()));
-    wire.insert(wire.end(), protocol.begin(), protocol.end());
-    return wire;
-}
-
-[[nodiscard]] auto make_openssl_error(std::string_view what) -> std::runtime_error {
-    auto code = ERR_get_error();
-    if (code == 0)
-        return std::runtime_error(std::string(what));
-
-    std::array<char, 256> buffer{};
-    ERR_error_string_n(code, buffer.data(), buffer.size());
-    return std::runtime_error(std::string(what) + ": " + buffer.data());
-}
-
-inline void check_openssl(int rc, std::string_view what) {
-    if (rc != 1)
-        throw make_openssl_error(what);
-}
-
-inline auto select_h2_alpn(SSL*,
-                           const unsigned char** out,
-                           unsigned char* outlen,
-                           const unsigned char* in,
-                           unsigned int inlen,
-                           void* arg) -> int {
-    auto* alpn_wire = static_cast<const std::vector<unsigned char>*>(arg);
-    if (SSL_select_next_proto(
-            const_cast<unsigned char**>(out),
-            outlen,
-            alpn_wire->data(),
-            static_cast<unsigned int>(alpn_wire->size()),
-            in,
-            inlen) != OPENSSL_NPN_NEGOTIATED)
-        return SSL_TLSEXT_ERR_ALERT_FATAL;
-    return SSL_TLSEXT_ERR_OK;
-}
-
-inline void configure_tls_common(SSL_CTX* context) {
-    check_openssl(httpant::dependencies::ssl_ctx_set_min_proto_version(context, TLS1_2_VERSION), "set minimum TLS version");
-    SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
-}
-
-inline void require_negotiated_alpn(SSL* ssl, std::string_view expected) {
-    const unsigned char* selected = nullptr;
-    unsigned int selected_size = 0;
-    SSL_get0_alpn_selected(ssl, &selected, &selected_size);
-    auto negotiated = std::string_view{reinterpret_cast<const char*>(selected), selected_size};
-    if (negotiated != expected)
-        throw std::runtime_error("TLS negotiated unexpected ALPN '" + std::string(negotiated) + "'");
-}
-
 struct h2_server_tls_context {
-    explicit h2_server_tls_context(const tls_certificate_files& files)
-        : context(asio::ssl::context::tls_server), alpn_wire(make_alpn_wire("h2")) {
-        configure_tls_common(context.native_handle());
-        context.use_certificate_chain_file(files.certificate_file);
-        context.use_private_key_file(files.private_key_file, asio::ssl::context::pem);
-        SSL_CTX_set_alpn_select_cb(context.native_handle(), &select_h2_alpn, &alpn_wire);
+    http::tls::context context{true};
+    explicit h2_server_tls_context(const tls_certificate_files& files) {
+        context.certificate(files.certificate_file, files.private_key_file);
     }
-
-    asio::ssl::context context;
-    std::vector<unsigned char> alpn_wire;
 };
 
 struct h2_client_tls_context {
-    explicit h2_client_tls_context(const upstream_security_options& options)
-        : context(asio::ssl::context::tls_client), alpn_wire(make_alpn_wire("h2")) {
-        configure_tls_common(context.native_handle());
-        if (options.insecure_no_verify) {
-            context.set_verify_mode(httpant::dependencies::asio_verify_none);
-        } else {
-            context.set_verify_mode(httpant::dependencies::asio_verify_peer);
-            context.load_verify_file(*options.ca_certificate_file);
-        }
-        auto rc = SSL_CTX_set_alpn_protos(
-            context.native_handle(),
-            alpn_wire.data(),
-            static_cast<unsigned int>(alpn_wire.size()));
-        if (rc != 0)
-            throw make_openssl_error("configure HTTP/2 ALPN");
+    http::tls::context context{false};
+    explicit h2_client_tls_context(const upstream_security_options& options) {
+        context.trust(options.ca_certificate_file.value_or(""), !options.insecure_no_verify);
     }
-
-    asio::ssl::context context;
-    std::vector<unsigned char> alpn_wire;
 };
 
 // A proxied response: the protocol head plus the fully buffered body. An
@@ -813,17 +734,9 @@ auto connect_upstream_h2_transport(const std::shared_ptr<proxy_state>& state) ->
     tcp::socket upstream_socket{state->executor};
     co_await async_connect(upstream_socket, *state->upstream_endpoint, "upstream TCP connect failed");
 
-    asio::ssl::stream<tcp::socket> tls_socket{std::move(upstream_socket), state->upstream_h2_tls->context};
-    check_openssl(
-        httpant::dependencies::ssl_set_tlsext_host_name(tls_socket.native_handle(), state->config.upstream_tls->server_name.c_str()),
-        "set TLS server name indication");
-    if (!state->config.upstream_tls->insecure_no_verify) {
-        tls_socket.set_verify_mode(httpant::dependencies::asio_verify_peer);
-        tls_socket.set_verify_callback(asio::ssl::host_name_verification(state->config.upstream_tls->server_name));
-    }
-
-    co_await async_tls_handshake(tls_socket, asio::ssl::stream_base::client, "upstream TLS handshake failed");
-    require_negotiated_alpn(tls_socket.native_handle(), "h2");
+    tls_socket_stream tls_socket{std::move(upstream_socket), state->upstream_h2_tls->context};
+    tls_socket.hostname(state->config.upstream_tls->server_name, !state->config.upstream_tls->insecure_no_verify);
+    co_await async_tls_handshake(tls_socket, false);
     co_return tls_socket_stream{std::move(tls_socket)};
 }
 
@@ -835,7 +748,7 @@ auto fetch_upstream_http2_response(const std::shared_ptr<proxy_state>& state,
     auto upstream_transport = co_await connect_upstream_h2_transport(state);
     using upstream_client = http::v2::client<tls_socket_stream>;
     upstream_client client{upstream_transport};
-    co_return co_await http::coroutine::scoped(
+    auto response = co_await http::coroutine::scoped(
         client, [&](upstream_client& endpoint) -> http::task<proxied_response> {
             auto body = http::buffer_body{std::move(content)};
             auto received = co_await http::coroutine::request(endpoint, std::move(request), body);
@@ -845,6 +758,8 @@ auto fetch_upstream_http2_response(const std::shared_ptr<proxy_state>& state,
                 .body = std::move(response_content),
             };
         });
+    co_await upstream_transport.close();
+    co_return response;
 }
 
 auto fetch_upstream_http3_response(const std::shared_ptr<proxy_state>& state,
@@ -1085,13 +1000,13 @@ auto serve_http2_connection(tls_socket_stream transport,
             co_await http::coroutine::respond(server, std::move(incoming->token), std::move(response), body);
         }
     });
+    co_await transport.close();
 }
 
 auto serve_http2_connection_from_socket(tcp::socket socket,
                                         std::shared_ptr<proxy_state> state) -> http::task<void> {
-    asio::ssl::stream<tcp::socket> tls_socket{std::move(socket), state->downstream_h2_tls->context};
-    co_await async_tls_handshake(tls_socket, asio::ssl::stream_base::server, "downstream TLS handshake failed");
-    require_negotiated_alpn(tls_socket.native_handle(), "h2");
+    tls_socket_stream tls_socket{std::move(socket), state->downstream_h2_tls->context};
+    co_await async_tls_handshake(tls_socket, true);
     co_await serve_http2_connection(tls_socket_stream{std::move(tls_socket)}, std::move(state));
 }
 

@@ -2,10 +2,11 @@ export module httpant.testing;
 
 import httpant.dependencies.boost.ut;
 import httpant.dependencies.asio;
-import httpant.dependencies.openssl;
+import httpant.examples.asio;
 import httpant.dependencies.msquic;
 import std;
 import httpant;
+import httpant.tls;
 
 export namespace httpant::testing {
 
@@ -685,10 +686,13 @@ struct recording_stream_factory {
         recording_stream_factory* transport{nullptr};
         std::int64_t stream_id{-1};
         http::stream_access access_{http::stream_access::bidirectional};
+        std::shared_ptr<int> lifetime{};
 
         stream() = default;
         stream(recording_stream_factory* value, std::int64_t id, http::stream_access access)
-            : transport(value), stream_id(id), access_(access) {}
+            : transport(value), stream_id(id), access_(access), lifetime(std::make_shared<int>()) {
+            transport->stream_lifetimes[id] = lifetime;
+        }
         stream(const stream&) = delete;
         auto operator=(const stream&) -> stream& = delete;
         stream(stream&&) noexcept = default;
@@ -786,6 +790,7 @@ struct recording_stream_factory {
     };
 
     std::deque<recorded_write> writes{};
+    std::unordered_map<std::int64_t, std::weak_ptr<int>> stream_lifetimes{};
     std::vector<recorded_shutdown> shutdowns{};
     std::vector<http::application_error> closes{};
     // Per-stream scripted partial-write acceptance: each
@@ -908,19 +913,12 @@ inline void route_writes_to(recording_stream_factory& from, recording_stream_fac
 // Synchronous test transports must settle before start returns. Own the root
 // even on an incomplete fixture: a detached launcher would leak the entire
 // suspended chain and leave references to this helper's stack behind.
-template <typename T>
-auto run_sync(http::task<T> work) -> T {
+template <typename T, typename Tag>
+auto run_sync(http::basic_task<T, Tag> work) -> T {
     work.start();
     if (!work.done())
-        throw std::runtime_error("test task did not complete synchronously");
+        throw std::runtime_error("test operation did not complete synchronously");
     return work.result();
-}
-
-inline auto run_sync(http::task<void> work) -> void {
-    work.start();
-    if (!work.done())
-        throw std::runtime_error("test task did not complete synchronously");
-    work.result();
 }
 
 struct tcp_stream {
@@ -1004,86 +1002,7 @@ struct tcp_stream {
     }
 };
 
-struct tls_stream {
-    asio::ssl::stream<asio::ip::tcp::socket>& socket;
-
-    struct read_awaiter {
-        asio::ssl::stream<asio::ip::tcp::socket>& sock;
-        std::span<std::byte> buf;
-        std::size_t result{0};
-        std::exception_ptr ex;
-
-        bool await_ready() noexcept {
-            return false;
-        }
-
-        void await_suspend(std::coroutine_handle<> h) {
-            sock.async_read_some(
-                asio::buffer(buf.data(), buf.size()),
-                [this, h](std::error_code ec, std::size_t n) mutable {
-                    if (ec && ec != asio::error::eof) {
-                        ex = std::make_exception_ptr(std::system_error(ec));
-                    }
-                    result = n;
-                    h.resume();
-                });
-        }
-
-        auto await_resume() -> std::size_t {
-            if (ex) {
-                std::rethrow_exception(ex);
-            }
-            return result;
-        }
-    };
-
-    struct write_awaiter {
-        asio::ssl::stream<asio::ip::tcp::socket>& sock;
-        std::span<const std::byte> data;
-        std::size_t result{0};
-        std::exception_ptr ex;
-
-        bool await_ready() noexcept {
-            return false;
-        }
-
-        void await_suspend(std::coroutine_handle<> h) {
-            asio::async_write(
-                sock,
-                asio::buffer(data.data(), data.size()),
-                [this, h](std::error_code ec, std::size_t n) mutable {
-                    if (ec) {
-                        ex = std::make_exception_ptr(std::system_error(ec));
-                    }
-                    result = n;
-                    h.resume();
-                });
-        }
-
-        auto await_resume() -> std::size_t {
-            if (ex) {
-                std::rethrow_exception(ex);
-            }
-            return result;
-        }
-    };
-
-    auto async_read(std::span<std::byte> buf) -> read_awaiter {
-        return {.sock = socket, .buf = buf, .result = 0, .ex = {}};
-    }
-
-    auto async_read(std::span<std::byte> buf, std::stop_token) -> read_awaiter {
-        return {.sock = socket, .buf = buf, .result = 0, .ex = {}};
-    }
-
-    auto async_write(std::span<const std::byte> data) -> write_awaiter {
-        return {.sock = socket, .data = data, .result = 0, .ex = {}};
-    }
-
-    auto async_write(std::span<const std::byte> data, std::stop_token) -> write_awaiter {
-        return {.sock = socket, .data = data, .result = 0, .ex = {}};
-    }
-};
+using tls_stream = http::tls::stream<httpant::examples::tcp_socket_stream>;
 
 struct quic_stream {
     HQUIC connection{nullptr};
