@@ -1,115 +1,22 @@
 @PACKAGE_INIT@
 
-# httpant is a C++23 module library. Module BMIs are not portable across
-# compilers or standard libraries, so a package cannot ship them: this config
-# hands the consumer the interface sources and lets its own build compile them,
-# with the same third-party targets and definitions the upstream build uses.
-#
-# That is why the targets below are real static libraries rather than interface
-# targets — CMake refuses a CXX_MODULES file set in INTERFACE scope — and why
-# they are created under a plain name and then aliased: a target whose name
-# contains "::" may only be an alias or an imported target. The aliases are the
-# public interface; the plain names are what appears in the consumer's build tree.
-#
-# This package publishes three targets:
-#   httpant::httpant        the protocol modules (module httpant)
-#   httpant::io             the native I/O engine (module httpant.io),
-#                           also aliased httpant::default-io
-#   httpant::imports        the module wrappers over llhttp/nghttp2/nghttp3/
-#                           stdexec, linked PUBLIC by httpant::httpant
+# httpant's modules as sources: this config registers the same targets the
+# repository builds (httpant::httpant, httpant::io, ...) and the consumer's
+# build compiles them, since module BMIs are not portable across compilers or
+# standard libraries. The optional parts are the ones this package was built
+# with, including the I/O mechanism.
 include(CMakeFindDependencyMacro)
-
-# httpant compiles with C++23 modules and the standard library as a module.
-# Without an xclang tree there is nothing to import, so fail here with a message
-# that says what to do rather than deep inside module scanning.
 find_dependency(xclang CONFIG)
 
-include("${CMAKE_CURRENT_LIST_DIR}/dependencies.cmake")
-
-set(_httpant_share "@PACKAGE_HTTPANT_INSTALL_SHARE@")
-
 if(NOT TARGET httpant::httpant)
-    file(GLOB_RECURSE _httpant_module_sources RELATIVE "${_httpant_share}"
-        "${_httpant_share}/modules/*.cppm")
-    # the engine's units belong to httpant::io, not to the protocol target
-    list(FILTER _httpant_module_sources EXCLUDE REGEX "^modules/io/")
-    list(TRANSFORM _httpant_module_sources PREPEND "${_httpant_share}/")
-
-    set(_httpant_definitions NGHTTP2_NO_SSIZE_T)
-    get_target_property(_HTTPANT_NGHTTP2_TYPE ${HTTPANT_NGHTTP2_TARGET} TYPE)
-    if(_HTTPANT_NGHTTP2_TYPE STREQUAL "STATIC_LIBRARY" OR _HTTPANT_NGHTTP2_TYPE STREQUAL "UNKNOWN_LIBRARY")
-        list(APPEND _httpant_definitions NGHTTP2_STATICLIB)
-    endif()
-    get_target_property(_HTTPANT_NGHTTP3_TYPE ${HTTPANT_NGHTTP3_TARGET} TYPE)
-    if(_HTTPANT_NGHTTP3_TYPE STREQUAL "STATIC_LIBRARY")
-        list(APPEND _httpant_definitions NGHTTP3_STATICLIB)
-    endif()
-
-    # The wrappers must be their own target: CMake rejects a public module
-    # source that imports a module provided by a private source of the same
-    # target, which is what folding them in would mean.
-    add_library(httpant-imports STATIC)
-    target_sources(httpant-imports PUBLIC FILE_SET CXX_MODULES
-        BASE_DIRS "${_httpant_share}" FILES
-        "${_httpant_share}/import/llhttp.ixx"
-        "${_httpant_share}/import/nghttp2.ixx"
-        "${_httpant_share}/import/nghttp3.ixx"
-        "${_httpant_share}/import/stdexec.ixx"
-    )
-    target_compile_definitions(httpant-imports PRIVATE ${_httpant_definitions})
-    target_link_libraries(httpant-imports PUBLIC
-        xclang::std
-        ${HTTPANT_LLHTTP_TARGET}
-        ${HTTPANT_NGHTTP2_TARGET}
-        ${HTTPANT_NGHTTP3_TARGET}
-        ${HTTPANT_STDEXEC_TARGET}
-    )
-    add_library(httpant::imports ALIAS httpant-imports)
-
-    add_library(httpant STATIC)
-    target_sources(httpant PUBLIC FILE_SET CXX_MODULES
-        BASE_DIRS "${_httpant_share}" FILES ${_httpant_module_sources})
-    target_link_libraries(httpant PUBLIC httpant::imports)
-    add_library(httpant::httpant ALIAS httpant)
-endif()
-
-# The native I/O engine is optional upstream, so it is optional here: its sources
-# are installed only when it was built.
-if(NOT TARGET httpant::io AND EXISTS "${_httpant_share}/modules/io/native.cppm")
-    file(GLOB _httpant_io_interface RELATIVE "${_httpant_share}"
-        "${_httpant_share}/modules/io/*.cppm")
-    list(TRANSFORM _httpant_io_interface PREPEND "${_httpant_share}/")
-
-    # Every mechanism's source ships; the platform picks which one compiles.
-    if(WIN32)
-        set(_HTTPANT_IO_MECHANISMs "${_httpant_share}/modules/io/native/ioring.cppm")
-    elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|OpenBSD|NetBSD|DragonFly)$")
-        set(_HTTPANT_IO_MECHANISMs
-            "${_httpant_share}/modules/io/native/kqueue.cppm"
-            "${_httpant_share}/modules/io/native/posix.cppm")
-    else()
-        set(_HTTPANT_IO_MECHANISMs
-            "${_httpant_share}/modules/io/native/uring.cppm"
-            "${_httpant_share}/modules/io/native/posix.cppm")
-    endif()
-
-    add_library(httpant-io STATIC)
-    target_sources(httpant-io PUBLIC FILE_SET CXX_MODULES
-        BASE_DIRS "${_httpant_share}" FILES ${_httpant_io_interface})
-    target_sources(httpant-io PRIVATE FILE_SET internal_modules TYPE CXX_MODULES
-        BASE_DIRS "${_httpant_share}" FILES
-        "${_httpant_share}/modules/io/native/queue.cppm")
-    target_sources(httpant-io PRIVATE ${_HTTPANT_IO_MECHANISMs})
-    set_source_files_properties(${_HTTPANT_IO_MECHANISMs} PROPERTIES LANGUAGE CXX)
-    target_link_libraries(httpant-io PUBLIC xclang::std)
-    if(WIN32)
-        target_link_libraries(httpant-io PRIVATE ws2_32 kernel32)
-    elseif(NOT APPLE AND NOT CMAKE_SYSTEM_NAME MATCHES "^(FreeBSD|OpenBSD|NetBSD|DragonFly)$")
-        httpant_find_liburing(_httpant_liburing liburing::liburing uring::uring)
-        target_link_libraries(httpant-io PRIVATE ${_httpant_liburing})
-    endif()
-    add_library(httpant::io ALIAS httpant-io)
-    add_library(httpant::default-io ALIAS httpant-io)
+  set(HTTPANT_BUILD_SUPPORT OFF)
+  set(HTTPANT_ENABLE_TLS @HTTPANT_ENABLE_TLS@)
+  set(HTTPANT_ENABLE_IO @HTTPANT_ENABLE_IO@)
+  set(HTTPANT_ENABLE_QUIC @HTTPANT_ENABLE_QUIC@)
+  set(HTTPANT_IO_BACKEND @HTTPANT_IO_BACKEND@)
+  set(HTTPANT_SOURCE "@PACKAGE_HTTPANT_INSTALL_SHARE@")
+  include("${CMAKE_CURRENT_LIST_DIR}/dependencies.cmake")
+  include("${CMAKE_CURRENT_LIST_DIR}/modules.cmake")
 endif()
 
 check_required_components(httpant)

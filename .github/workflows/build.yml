@@ -6,13 +6,10 @@ name: build
 #   io         the native engine (io_uring, kqueue, IORing)
 #
 # Both need an xclang tree (vars.XCLANG_URL) — C++23 modules are the whole point
-# of this library. The io job additionally needs the vcpkg triplets from
-# vcpkg-registry, because the dependencies have to be built by the same compiler
-# as the engine: liburing configured against a system compiler expects kernel
-# headers a sysrooted clang does not have.
+# of this library — and the vcpkg-registry checkout beside this one, whose
+# triplets build the dependencies with the same compiler.
 #
 #   vars.HTTPANT_TRIPLETS_URL    git URL of vcpkg-registry
-#   vars.HTTPANT_TRIPLETS_REF    optional: a commit of it
 on:
   push:
     branches: [main]
@@ -26,27 +23,31 @@ concurrency:
 jobs:
   protocol:
     name: protocol ${{ matrix.name }}
-    if: vars.XCLANG_URL != ''
+    if: vars.XCLANG_URL != '' && vars.HTTPANT_TRIPLETS_URL != ''
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: httpant
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux-x64
             os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
           - name: macos-arm64
             os: macos-15
-            target: aarch64-apple-darwin
           - name: windows-x64
             os: windows-2025
-            target: x86_64-pc-windows-msvc
     env:
-      XCLANG_TARGET: ${{ matrix.target }}
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: httpant
 
+      - name: Fetch current registry ports
+        shell: bash
+        run: git clone --depth 1 "${{ vars.HTTPANT_TRIPLETS_URL }}" ../vcpkg-registry
 
       - name: Fetch xclang
         shell: bash
@@ -74,7 +75,7 @@ jobs:
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.vcpkg/downloads
+          path: ${{ github.workspace }}/httpant/build/vcpkg-downloads
           key: vcpkg-protocol-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
           restore-keys: vcpkg-protocol-${{ runner.os }}-
 
@@ -96,14 +97,17 @@ jobs:
         with:
           name: protocol-logs-${{ matrix.name }}
           path: |
-            build/vcpkg-manifest-install.log
-            build/Testing/Temporary/LastTest.log
+            httpant/build/vcpkg-manifest-install.log
+            httpant/build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
 
   io:
     name: io ${{ matrix.name }}
     if: vars.XCLANG_URL != '' && vars.HTTPANT_TRIPLETS_URL != ''
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: httpant
     strategy:
       fail-fast: false
       matrix:
@@ -112,18 +116,18 @@ jobs:
           # have; the engine is compiled there and tested where the kernel allows.
           - name: linux-x64
             os: ubuntu-24.04
-            triplet: x64-linux-xclang
-            target: x86_64-unknown-linux-gnu
           - name: macos-arm64
             os: macos-15
-            triplet: arm64-osx-xclang
-            target: aarch64-apple-darwin
     env:
-      XCLANG_TARGET: ${{ matrix.target }}
-      VCPKG_TARGET_TRIPLET: ${{ matrix.triplet }}
       VCPKG_ROOT: ${{ github.workspace }}/.vcpkg
     steps:
       - uses: actions/checkout@v5
+        with:
+          path: httpant
+
+      - name: Fetch current registry ports
+        shell: bash
+        run: git clone --depth 1 "${{ vars.HTTPANT_TRIPLETS_URL }}" ../vcpkg-registry
 
       - name: Fetch xclang
         shell: bash
@@ -136,17 +140,6 @@ jobs:
             *)         curl -fsSL "$url" -o "$RUNNER_TEMP/xclang.tar"; tar -xzf "$RUNNER_TEMP/xclang.tar" -C "$RUNNER_TEMP" ;;
           esac
           echo "XCLANG_ROOT=$RUNNER_TEMP/xclang" >> "$GITHUB_ENV"
-
-      - name: Fetch the xclang triplets
-        shell: bash
-        run: |
-          set -euo pipefail
-          git clone --depth 1 "${{ vars.HTTPANT_TRIPLETS_URL }}" "$RUNNER_TEMP/vcpkg-registry"
-          if [ -n "${{ vars.HTTPANT_TRIPLETS_REF }}" ]; then
-            git -C "$RUNNER_TEMP/vcpkg-registry" fetch --depth 1 origin "${{ vars.HTTPANT_TRIPLETS_REF }}"
-            git -C "$RUNNER_TEMP/vcpkg-registry" checkout -q FETCH_HEAD
-          fi
-          echo "VCPKG_OVERLAY_TRIPLETS=$RUNNER_TEMP/vcpkg-registry/triplets" >> "$GITHUB_ENV"
 
       - name: Install vcpkg (latest)
         shell: bash
@@ -162,9 +155,9 @@ jobs:
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/.vcpkg/downloads
-          key: vcpkg-io-${{ runner.os }}-${{ matrix.triplet }}-${{ hashFiles('vcpkg.json') }}
-          restore-keys: vcpkg-io-${{ runner.os }}-${{ matrix.triplet }}-
+          path: ${{ github.workspace }}/httpant/build/vcpkg-downloads
+          key: vcpkg-io-${{ runner.os }}-${{ hashFiles('vcpkg.json') }}
+          restore-keys: vcpkg-io-${{ runner.os }}-
 
       - name: Configure
         shell: bash
@@ -184,6 +177,6 @@ jobs:
         with:
           name: io-logs-${{ matrix.name }}
           path: |
-            build/vcpkg-manifest-install.log
-            build/Testing/Temporary/LastTest.log
+            httpant/build/vcpkg-manifest-install.log
+            httpant/build/Testing/Temporary/LastTest.log
           if-no-files-found: ignore

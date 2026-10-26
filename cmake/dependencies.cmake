@@ -1,131 +1,47 @@
-# The dependencies every consumer needs. Development-only ones (asio, OpenSSL,
-# msquic, Boost.UT) live in Dependencies-development.cmake and are never reached
-# from the installed package: an installed config must not re-run them, and a
-# consumer that happens to set BUILD_TESTING must not make them appear.
+# The packages httpant's modules build against. The repository's build and the
+# installed package (httpant-config.cmake) both include this file, after
+# HTTPANT_ENABLE_IO and HTTPANT_ENABLE_QUIC are known.
 #
-# Reuse targets supplied by the parent project (including FetchContent),
-# and only search for installed packages when none of their targets exist.
-function(httpant_find_dependency output package)
-    foreach(candidate IN LISTS ARGN)
-        if(TARGET "${candidate}")
-            set(${output} "${candidate}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
-    find_package(${package} CONFIG REQUIRED)
-    foreach(candidate IN LISTS ARGN)
-        if(TARGET "${candidate}")
-            set(${output} "${candidate}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
-    message(FATAL_ERROR "${package} did not provide a supported target: ${ARGN}")
+# Everything comes from vcpkg: the manifest is vcpkg.json, and
+# vcpkg-configuration.json adds the registry's reviewed overlay ports.
+
+find_package(xclang CONFIG REQUIRED)
+find_package(stdexec CONFIG REQUIRED)
+find_package(asio CONFIG REQUIRED)
+find_package(llhttp CONFIG REQUIRED)
+find_package(nghttp3 CONFIG REQUIRED)
+
+# nghttp2's and liburing's vcpkg ports ship headers and archives without a CMake
+# package, so their targets are built by hand. IMPORTED_LOCATION is the
+# single-config default and the per-config entries are what multi-config
+# generators read; setting only one of them breaks a configure that has no
+# CMAKE_BUILD_TYPE.
+function(httpant_import_library TARGET LIBRARY)
+  set(PREFIX "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  find_library(RELEASE_LIBRARY NAMES "${LIBRARY}" PATHS "${PREFIX}/lib"
+    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  find_library(DEBUG_LIBRARY NAMES "${LIBRARY}" PATHS "${PREFIX}/debug/lib"
+    NO_DEFAULT_PATH NO_CACHE REQUIRED)
+  add_library(${TARGET} STATIC IMPORTED GLOBAL)
+  set_target_properties(${TARGET} PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${PREFIX}/include"
+    IMPORTED_LOCATION "${RELEASE_LIBRARY}"
+    IMPORTED_LOCATION_DEBUG "${DEBUG_LIBRARY}"
+    IMPORTED_LOCATION_RELEASE "${RELEASE_LIBRARY}"
+    IMPORTED_LOCATION_RELWITHDEBINFO "${RELEASE_LIBRARY}"
+    IMPORTED_LOCATION_MINSIZEREL "${RELEASE_LIBRARY}")
 endfunction()
 
-httpant_find_dependency(HTTPANT_LLHTTP_TARGET llhttp
-    llhttp::llhttp llhttp::llhttp_static llhttp_static llhttp_shared)
-httpant_find_dependency(HTTPANT_NGHTTP3_TARGET nghttp3
-    nghttp3::nghttp3 nghttp3::nghttp3_static nghttp3 nghttp3_static)
-httpant_find_dependency(HTTPANT_STDEXEC_TARGET stdexec STDEXEC::stdexec stdexec)
+httpant_import_library(nghttp2::nghttp2 nghttp2)
 
-# nghttp2's vcpkg port may only provide headers and libraries, while its
-# source build and other packages provide a CMake target.
-foreach(candidate IN ITEMS nghttp2::nghttp2 nghttp2::nghttp2_static nghttp2 nghttp2_static)
-    if(TARGET "${candidate}")
-        set(HTTPANT_NGHTTP2_TARGET "${candidate}")
-        break()
-    endif()
-endforeach()
-if(NOT HTTPANT_NGHTTP2_TARGET)
-    find_package(nghttp2 CONFIG QUIET)
-    foreach(candidate IN ITEMS nghttp2::nghttp2 nghttp2::nghttp2_static nghttp2 nghttp2_static)
-        if(TARGET "${candidate}")
-            set(HTTPANT_NGHTTP2_TARGET "${candidate}")
-            break()
-        endif()
-    endforeach()
-endif()
-if(NOT HTTPANT_NGHTTP2_TARGET)
-    find_path(NGHTTP2_INCLUDE_DIR
-        NAMES nghttp2/nghttp2.h
-        REQUIRED
-    )
-    find_library(NGHTTP2_LIBRARY_RELEASE
-        NAMES nghttp2
-        PATH_SUFFIXES lib
-    )
-    find_library(NGHTTP2_LIBRARY_DEBUG
-        NAMES nghttp2
-        PATH_SUFFIXES debug/lib
-    )
-    if(NOT NGHTTP2_LIBRARY_RELEASE AND NOT NGHTTP2_LIBRARY_DEBUG)
-        message(FATAL_ERROR "Failed to locate nghttp2 library.")
-    endif()
-
-    set(NGHTTP2_LIBRARY "${NGHTTP2_LIBRARY_RELEASE}")
-    if(NOT NGHTTP2_LIBRARY)
-        set(NGHTTP2_LIBRARY "${NGHTTP2_LIBRARY_DEBUG}")
-    endif()
-
-    add_library(nghttp2::nghttp2 UNKNOWN IMPORTED)
-    set_target_properties(
-        nghttp2::nghttp2 PROPERTIES
-        IMPORTED_LOCATION "${NGHTTP2_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${NGHTTP2_INCLUDE_DIR}"
-    )
-    if(NGHTTP2_LIBRARY_RELEASE)
-        set_property(TARGET nghttp2::nghttp2 APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
-        set_target_properties(
-            nghttp2::nghttp2 PROPERTIES
-            IMPORTED_LOCATION_RELEASE "${NGHTTP2_LIBRARY_RELEASE}"
-        )
-    endif()
-    if(NGHTTP2_LIBRARY_DEBUG)
-        set_property(TARGET nghttp2::nghttp2 APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
-        set_target_properties(
-            nghttp2::nghttp2 PROPERTIES
-            IMPORTED_LOCATION_DEBUG "${NGHTTP2_LIBRARY_DEBUG}"
-        )
-    endif()
-    set(HTTPANT_NGHTTP2_TARGET nghttp2::nghttp2)
+if(HTTPANT_ENABLE_IO AND HTTPANT_IO_BACKEND STREQUAL "uring")
+  httpant_import_library(liburing::liburing uring)
 endif()
 
-# liburing's vcpkg port ships headers and archives without a CMake package, so
-# accept a target from the parent project first, then a package, then the
-# archive itself.
-function(httpant_find_liburing output)
-    foreach(candidate IN LISTS ARGN)
-        if(TARGET "${candidate}")
-            set(${output} "${candidate}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
-    find_package(unofficial-liburing CONFIG QUIET)
-    foreach(candidate IN ITEMS unofficial-liburing::uring liburing::liburing)
-        if(TARGET "${candidate}")
-            set(${output} "${candidate}" PARENT_SCOPE)
-            return()
-        endif()
-    endforeach()
-    if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
-        set(prefix "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
-        find_library(uring_release NAMES uring PATHS "${prefix}/lib" NO_DEFAULT_PATH)
-        find_library(uring_debug NAMES uring PATHS "${prefix}/debug/lib" NO_DEFAULT_PATH)
-        if(uring_release AND uring_debug)
-            add_library(httpant-uring STATIC IMPORTED GLOBAL)
-            set_target_properties(httpant-uring PROPERTIES
-                INTERFACE_INCLUDE_DIRECTORIES "${prefix}/include"
-                IMPORTED_LOCATION "${uring_release}"
-                IMPORTED_LOCATION_DEBUG "${uring_debug}"
-                IMPORTED_LOCATION_RELEASE "${uring_release}"
-                IMPORTED_LOCATION_RELWITHDEBINFO "${uring_release}"
-                IMPORTED_LOCATION_MINSIZEREL "${uring_release}")
-            set(${output} httpant-uring PARENT_SCOPE)
-            return()
-        endif()
-    endif()
-    find_library(uring_system NAMES uring REQUIRED)
-    add_library(httpant-uring STATIC IMPORTED GLOBAL)
-    set_target_properties(httpant-uring PROPERTIES IMPORTED_LOCATION "${uring_system}")
-    set(${output} httpant-uring PARENT_SCOPE)
-endfunction()
+if(HTTPANT_ENABLE_QUIC OR HTTPANT_BUILD_SUPPORT)
+  find_package(msquic CONFIG REQUIRED)
+endif()
+
+if(HTTPANT_ENABLE_TLS)
+  find_package(wolfssl CONFIG REQUIRED)
+endif()
