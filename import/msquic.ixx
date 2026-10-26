@@ -9,6 +9,8 @@ inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET = QUIC_ADDRESS_FAMILY_INET
 inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET6 = QUIC_ADDRESS_FAMILY_INET6;
 inline constexpr auto module_QUIC_STATUS_INTERNAL_ERROR = QUIC_STATUS_INTERNAL_ERROR;
 inline constexpr auto module_QUIC_STATUS_OUT_OF_MEMORY = QUIC_STATUS_OUT_OF_MEMORY;
+inline constexpr auto module_QUIC_STATUS_PENDING = QUIC_STATUS_PENDING;
+inline constexpr auto module_QUIC_STATUS_CONNECTION_REFUSED = QUIC_STATUS_CONNECTION_REFUSED;
 inline constexpr auto module_QUIC_STATUS_SUCCESS = QUIC_STATUS_SUCCESS;
 using module_QUIC_STATUS = QUIC_STATUS;
 }
@@ -21,6 +23,10 @@ export inline constexpr auto QUIC_ADDRESS_FAMILY_INET6 = httpant::dependencies::
 export inline constexpr auto QUIC_STATUS_INTERNAL_ERROR = httpant::dependencies::detail::module_QUIC_STATUS_INTERNAL_ERROR;
 #undef QUIC_STATUS_OUT_OF_MEMORY
 export inline constexpr auto QUIC_STATUS_OUT_OF_MEMORY = httpant::dependencies::detail::module_QUIC_STATUS_OUT_OF_MEMORY;
+#undef QUIC_STATUS_PENDING
+export inline constexpr auto QUIC_STATUS_PENDING = httpant::dependencies::detail::module_QUIC_STATUS_PENDING;
+#undef QUIC_STATUS_CONNECTION_REFUSED
+export inline constexpr auto QUIC_STATUS_CONNECTION_REFUSED = httpant::dependencies::detail::module_QUIC_STATUS_CONNECTION_REFUSED;
 #undef QUIC_STATUS_SUCCESS
 export inline constexpr auto QUIC_STATUS_SUCCESS = httpant::dependencies::detail::module_QUIC_STATUS_SUCCESS;
 #undef QUIC_STATUS
@@ -72,6 +78,7 @@ export using ::QUIC_STREAM_EVENT_START_COMPLETE;
 export using ::QUIC_STREAM_OPEN_FLAG_NONE;
 export using ::QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
 export using ::QUIC_STREAM_SHUTDOWN_FLAGS;
+export using ::QUIC_STREAM_SHUTDOWN_FLAG_ABORT;
 export using ::QUIC_STREAM_SHUTDOWN_FLAG_ABORT_RECEIVE;
 export using ::QUIC_STREAM_SHUTDOWN_FLAG_ABORT_SEND;
 export using ::QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL;
@@ -94,4 +101,14 @@ export namespace httpant::dependencies {
 void set_quic_address_port(QuicAddr& address, uint16_t port) {
     address.SetPort(port);
 }
+}
+
+export using ::QUIC_CREDENTIAL_CONFIG;
+export using ::QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE;
+export namespace httpant::dependencies {
+inline constexpr auto listener_address = QUIC_PARAM_LISTENER_LOCAL_ADDRESS;
+inline constexpr auto connection_local_address = QUIC_PARAM_CONN_LOCAL_ADDRESS;
+inline constexpr auto connection_remote_address = QUIC_PARAM_CONN_REMOTE_ADDRESS;
+inline constexpr auto stream_id = QUIC_PARAM_STREAM_ID;
+inline auto quic_port(const QUIC_ADDR& address) -> uint16_t { return QuicAddrGetPort(&address); }
 }

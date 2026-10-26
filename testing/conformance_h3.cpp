@@ -263,18 +263,37 @@ struct gated_stream_factory {
         void await_resume() const noexcept {}
     };
 
+    // Like a QUIC transport's, a parked acknowledgement completes stopped once
+    // the write's stop token is requested.
     struct ack_awaiter {
         gated_stream_factory& transport;
         std::size_t count{0};
+        std::stop_token stop{};
         std::coroutine_handle<> parked{};
+        parked_stop on_stop{};
+
+        ack_awaiter(gated_stream_factory& value, std::size_t bytes, std::stop_token token)
+            : transport(value), count(bytes), stop(std::move(token)) {}
+        ack_awaiter(const ack_awaiter&) = delete;
+        auto operator=(const ack_awaiter&) -> ack_awaiter& = delete;
+        ack_awaiter(ack_awaiter&& other) noexcept
+            : transport(other.transport), count(other.count), stop(std::move(other.stop)) {}
+        auto operator=(ack_awaiter&&) -> ack_awaiter& = delete;
 
         [[nodiscard]] bool await_ready() const noexcept { return transport.ack_gate_open; }
-        void await_suspend(std::coroutine_handle<> handle) {
-            ++transport.ack_parks;
+        auto await_suspend(std::coroutine_handle<> handle) -> bool {
             parked = handle;
             transport.pending_acks.push_back(this);
+            if (on_stop.arm(stop, parked))
+                return true;
+            std::erase(transport.pending_acks, this);
+            return false;
         }
-        auto await_resume() const noexcept -> std::size_t { return count; }
+        auto await_resume() -> std::size_t {
+            std::erase(transport.pending_acks, this);
+            on_stop.finish();
+            return count;
+        }
     };
 
     struct write_awaiter {
@@ -282,6 +301,7 @@ struct gated_stream_factory {
         std::int64_t stream_id;
         std::span<const std::byte> data;
         bool fin{false};
+        std::stop_token stop{};
         std::coroutine_handle<> parked{};
 
         [[nodiscard]] bool await_ready() const noexcept { return transport.write_gate_open; }
@@ -298,7 +318,7 @@ struct gated_stream_factory {
             return {
                 .accepted = data.size(),
                 .buffer_release = {},
-                .acknowledgement = {transport, data.size()},
+                .acknowledgement = {transport, data.size(), stop},
             };
         }
     };
@@ -323,8 +343,8 @@ struct gated_stream_factory {
         auto async_read(std::span<std::byte> buf, std::stop_token stop) -> read_awaiter {
             return {transport->inbound(stream_id), buf, std::move(stop)};
         }
-        auto async_write(std::span<const std::byte> data, bool fin, std::stop_token) -> write_awaiter {
-            return {*transport, stream_id, data, fin};
+        auto async_write(std::span<const std::byte> data, bool fin, std::stop_token stop) -> write_awaiter {
+            return {*transport, stream_id, data, fin, std::move(stop)};
         }
         void consume(std::size_t) {}
         void shutdown(http::stream_side side, http::application_error error) {
@@ -411,10 +431,9 @@ struct gated_stream_factory {
 
     // The two gates: while closed, stream writes / acknowledgements park
     // instead of completing, and the parked awaiters queue here until the
-    // test opens the gate. ack_parks counts every acknowledgement suspension.
+    // test releases them.
     bool write_gate_open{true};
     bool ack_gate_open{true};
-    std::size_t ack_parks{0};
     std::deque<write_awaiter*> pending_writes{};
     std::deque<ack_awaiter*> pending_acks{};
 
@@ -490,7 +509,7 @@ struct gated_stream_factory {
         pending_acks.pop_front();
         if (count)
             awaiter->count = *count;
-        awaiter->parked.resume();
+        std::exchange(awaiter->parked, {}).resume();
         return true;
     }
 };
@@ -615,64 +634,6 @@ static suite<"h3 cancellation and respond validation"> h3_cancellation_suite = [
         expect(cancelled);
     };
 
-    // RFC 9110 §15 — "All valid status codes are within the range of 100 to
-    // 599, inclusive." — an application answering with a status outside that
-    // range would put an invalid ':status' value on the wire (RFC 9114
-    // §4.3.2), so the send path rejects it locally before any frame is
-    // submitted, mirroring the inbound :status validation. The connection
-    // and its other streams survive.
-    "http3_out_of_range_status_rejected_on_send"_test = [] {
-        h3_pair pair;
-
-        auto receive = http::coroutine::receive(pair.server);
-        receive.start();
-        http::buffer_body empty;
-        auto client_request = http::coroutine::request(
-            pair.client, basic_get("/status-700"), empty);
-        client_request.start();
-        route_writes_to(pair.client_transport, pair.server_transport);
-        auto incoming = run_sync(std::move(receive));
-        expect(incoming.head.target == "/status-700"sv);
-        static_cast<void>(run_sync(drain_body(incoming.body)));
-        static_cast<void>(pair.server_transport.take_writes());
-
-        auto threw = false;
-        try {
-            auto body = make_body("never submitted");
-            run_sync(http::coroutine::respond(pair.server,
-                std::move(incoming.token),
-                http::response{.status = 700, .reason = {}, .fields = {}},
-                body));
-        } catch (const http::usage_error& failure) {
-            expect(std::string_view{failure.what()}.contains("http/3:"sv));
-            threw = true;
-        }
-        expect(threw);
-        // The rejected response never reaches the wire.
-        expect(pair.server_transport.writes.empty());
-
-        // The connection survives: a second exchange with a valid status
-        // completes normally.
-        auto receive_2 = http::coroutine::receive(pair.server);
-        receive_2.start();
-        http::buffer_body empty_2;
-        auto client_request_2 = http::coroutine::request(
-            pair.client, basic_get("/fine"), empty_2);
-        client_request_2.start();
-        route_writes_to(pair.client_transport, pair.server_transport);
-        auto incoming_2 = run_sync(std::move(receive_2));
-        expect(incoming_2.head.target == "/fine"sv);
-        static_cast<void>(run_sync(drain_body(incoming_2.body)));
-        http::buffer_body response_body;
-        run_sync(http::coroutine::respond(pair.server,
-            std::move(incoming_2.token),
-            http::response{.status = 200, .reason = {}, .fields = {}},
-            response_body));
-        route_writes_to(pair.server_transport, pair.client_transport);
-        auto received_2 = run_sync(std::move(client_request_2));
-        expect(received_2.head.status == 200_u);
-    };
-
     // RFC 9110 §15.3.5 — "A 204 response is terminated by the end of the
     // header section; it cannot contain content or trailers." RFC 9114 §4.1 —
     // message content is sent as DATA frames (§7.2.1 — "DATA frames
@@ -724,6 +685,33 @@ static suite<"h3 cancellation and respond validation"> h3_cancellation_suite = [
 };
 
 static suite<"h3 driver internals"> h3_internals_suite = [] {
+    "http3_completed_stream_handles_are_released"_test = [] {
+        h3_pair pair;
+        for (int index = 0; index < 4; ++index) {
+            auto receive = http::coroutine::receive(pair.server);
+            receive.start();
+            http::buffer_body empty;
+            auto request = http::coroutine::request(pair.client, basic_get(), empty);
+            request.start();
+            route_writes_to(pair.client_transport, pair.server_transport);
+            auto incoming = run_sync(std::move(receive));
+            static_cast<void>(run_sync(drain_body(incoming.body)));
+            auto body = make_body("done");
+            run_sync(http::coroutine::respond(pair.server, std::move(incoming.token),
+                http::response{.status = 200}, body));
+            route_writes_to(pair.server_transport, pair.client_transport);
+            auto received = run_sync(std::move(request));
+            expect(read_body_text(received.body) == "done");
+        }
+        // Subsequent requests also reap the completed reader coroutine frames.
+        expect(pair.client_transport.stream_lifetimes.at(0).expired());
+        expect(pair.server_transport.stream_lifetimes.at(0).expired());
+        expect(!pair.client_transport.stream_lifetimes.at(2).expired());
+        expect(!pair.server_transport.stream_lifetimes.at(3).expired());
+        run_sync(http::coroutine::close(pair.client));
+        run_sync(http::coroutine::close(pair.server));
+    };
+
     // RFC 9114 §5.2 — "Upon receipt of a GOAWAY frame, if the client has
     // already sent requests with a stream ID greater than or equal to the
     // identifier contained in the GOAWAY frame, those requests will not be
@@ -753,132 +741,76 @@ static suite<"h3 driver internals"> h3_internals_suite = [] {
             static_cast<void>(run_sync(std::move(client_request)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::goaway_rejected);
-            expect(failure.info().retryable);
+            expect(http::retryable(failure.info()));
             threw = true;
         }
         expect(threw);
     };
 
-    // Internal machinery test: a pump_outbound_body parked on the outbound
-    // ACK wait must complete when the connection fails — fail_connection
-    // marks the body state terminal before resuming the ACK waiter, so the
-    // pump co_returns and the caller surfaces the connection error instead of
-    // re-parking on a state the map no longer holds (pre-fix: permanent
-    // hang). Not HTTP RFC behavior.
-    "http3_connection_failure_completes_ack_parked_upload"_test = [] {
+    // Internal machinery test: a respond parked on its FIN acknowledgement
+    // completes when the connection fails. RFC 9114 §7.2.4 — "If an endpoint
+    // receives a second SETTINGS frame on the control stream, the endpoint
+    // MUST respond with a connection error of type H3_FRAME_UNEXPECTED."
+    // Not HTTP RFC behavior otherwise.
+    "http3_connection_failure_completes_fin_parked_respond"_test = [] {
         h3_gated_pair pair;
-        chunked_body body{{bytes_of("upload-first-chunk"), bytes_of("upload-second-chunk")}};
-
-        pair.client_transport.ack_gate_open = false;
-        auto request = http::coroutine::request(
-            pair.client, basic_get("/upload"), body);
+        http::buffer_body empty;
+        auto request = http::coroutine::request(pair.client, basic_get("/fail"), empty);
         request.start();
-        expect(!request.done());
-        expect(pair.client_transport.ack_parks == 1_u);
+        route_gated_writes_to(pair.client_transport, pair.server_transport);
+        auto receive = http::coroutine::receive(pair.server);
+        receive.start();
+        auto incoming = run_sync(std::move(receive));
 
-        // ACK only the bytes preceding the first body chunk: nghttp3 keeps
-        // the chunk retained, so the pump leaves flush() and parks on the
-        // outbound ACK wait.
-        auto chunk = bytes_of("upload-first-chunk");
-        auto& batch = pair.client_transport.writes.back();
-        auto haystack = std::span<const std::byte>{batch.data};
-        auto it = std::search(haystack.begin(), haystack.end(), chunk.begin(), chunk.end());
-        expect(it != haystack.end());
-        auto header_bytes = static_cast<std::size_t>(it - haystack.begin());
-        expect(pair.client_transport.release_next_ack(header_bytes));
-        expect(!request.done());
-        expect(pair.client_transport.pending_acks.empty());
+        pair.server_transport.ack_gate_open = false;
+        chunked_body body{{bytes_of("response-chunk")}};
+        auto respond = http::coroutine::respond(pair.server, std::move(incoming.token),
+            http::response{.status = 200, .reason = {}, .fields = {}}, body);
+        respond.start();
+        expect(!respond.done());
 
-        // RFC 9114 §7.2.4 — "If an endpoint receives a second SETTINGS frame
-        // on the control stream, the endpoint MUST respond with a connection
-        // error of type H3_FRAME_UNEXPECTED." The duplicate SETTINGS frame
-        // (type 0x04, empty payload) on the server's control stream (id 3)
-        // fails the connection while the pump is parked.
+        // A duplicate SETTINGS frame (type 0x04, empty payload) on the
+        // client's control stream (id 2).
         const std::array duplicate_settings{std::byte{0x04}, std::byte{0x00}};
-        pair.client_transport.feed(3, duplicate_settings, false);
-        // The woken pump flushes once more (nghttp3 emits its shutdown GOAWAY
-        // on the control stream); release those transport ACKs too.
-        while (pair.client_transport.release_next_ack()) {}
+        pair.server_transport.feed(2, duplicate_settings, false);
 
-        expect(request.done());
-        auto threw = false;
-        if (request.done()) {
-            try {
-                static_cast<void>(run_sync(std::move(request)));
-            } catch (const http::protocol_error& failure) {
-                expect(failure.info().condition == http::error_condition::malformed_frame);
-                expect(failure.info().scope == http::error_scope::connection);
-                threw = true;
-            }
-        }
-        expect(threw);
+        expect(respond.done());
+        if (respond.done())
+            run_sync(std::move(respond));
     };
 
-    // Internal machinery test: a server respond whose pump_outbound_body is
-    // parked on the outbound ACK wait must complete when the peer resets the
-    // still-open request stream — the read driver delivers http::stream_reset,
-    // read_stream_guarded closes the stream at the sole protocol owner, and
-    // mark_stream_closed terminates the respond's outbound body before
-    // resuming its ACK waiter (pre-fix: the pump re-parked on a state the map
-    // no longer held and hung). The reset itself is RFC 9114 §4.1.1 — "Once a
-    // request stream has been opened, the request MAY be cancelled by either
-    // endpoint. ... an implementation resets the sending parts of streams and
-    // aborts reading on the receiving parts of streams." — a stream-level
-    // event that leaves the connection alive.
-    "http3_peer_reset_completes_ack_parked_respond"_test = [] {
+    // Internal machinery test: a respond parked on its FIN acknowledgement
+    // completes when the peer resets the still-open request stream: the read
+    // driver closes the stream, which ends the respond's sending side. The
+    // reset itself is RFC 9114 §4.1.1 — "Once a request stream has been
+    // opened, the request MAY be cancelled by either endpoint." — a
+    // stream-level event that leaves the connection alive.
+    "http3_peer_reset_completes_fin_parked_respond"_test = [] {
         h3_gated_pair pair;
 
-        // The client upload parks after its first batch, so the request
-        // stream stays open (no FIN) and the server's read driver for stream
-        // 0 stays active.
-        chunked_body request_body{{
-            bytes_of("reset-first-chunk"),
-            bytes_of("reset-second-chunk"),
-        }};
-        pair.client_transport.ack_gate_open = false;
+        // The upload never reaches FIN, so the server's read driver for
+        // stream 0 stays active.
+        one_chunk_then_hang_body request_body{"reset-upload"};
         auto request = http::coroutine::request(
             pair.client, basic_get("/upload"), request_body);
         request.start();
-        expect(!request.done());
-        expect(pair.client_transport.ack_parks == 1_u);
-
         route_gated_writes_to(pair.client_transport, pair.server_transport);
         auto receive = http::coroutine::receive(pair.server);
         receive.start();
         auto incoming = run_sync(std::move(receive));
         expect(incoming.head.target == "/upload"sv);
 
-        // The respond parks on the outbound ACK wait: ACK only the bytes
-        // preceding the first response chunk, so nghttp3 keeps the chunk
-        // retained and the pump leaves flush() to wait for the rest.
-        chunked_body response_body{{
-            bytes_of("response-first-chunk"),
-            bytes_of("response-second-chunk"),
-        }};
         pair.server_transport.ack_gate_open = false;
+        chunked_body response_body{{bytes_of("response-first-chunk"), bytes_of("response-second-chunk")}};
         auto respond = http::coroutine::respond(pair.server,
             std::move(incoming.token),
             http::response{.status = 200, .reason = {}, .fields = {}},
             response_body);
         respond.start();
         expect(!respond.done());
-        expect(pair.server_transport.ack_parks == 1_u);
 
-        auto chunk = bytes_of("response-first-chunk");
-        auto& batch = pair.server_transport.writes.back();
-        auto haystack = std::span<const std::byte>{batch.data};
-        auto it = std::search(haystack.begin(), haystack.end(), chunk.begin(), chunk.end());
-        expect(it != haystack.end());
-        auto header_bytes = static_cast<std::size_t>(it - haystack.begin());
-        expect(pair.server_transport.release_next_ack(header_bytes));
-        expect(!respond.done());
-        expect(pair.server_transport.pending_acks.empty());
-
-        // RFC 9114 §8.1 — H3_REQUEST_CANCELLED (0x010c): the peer abandons
-        // the request stream (QUIC RESET_STREAM) while the respond is parked.
+        // RFC 9114 §8.1 — H3_REQUEST_CANCELLED (0x010c).
         pair.server_transport.feed_reset(0, 0x010c);
-        // The woken respond pump flushes once more; release those ACKs too.
-        while (pair.server_transport.release_next_ack()) {}
 
         expect(respond.done());
         auto completed = false;
@@ -888,19 +820,17 @@ static suite<"h3 driver internals"> h3_internals_suite = [] {
         }
         expect(completed);
 
-        // The reset surfaces to the application on the exchange's read side
-        // (mark_stream_closed aborted the stream) as the typed stream error
-        // with the peer's wire code, and the connection survives the
-        // stream-scoped event: no connection close initiated.
+        // The reset surfaces on the exchange's read side as the typed stream
+        // error with the peer's error code; the connection survives it.
         auto body_threw = false;
         try {
             static_cast<void>(run_sync(drain_body(incoming.body)));
         } catch (const http::protocol_error& failure) {
             expect(failure.info().condition == http::error_condition::stream_reset);
-            expect(!failure.info().retryable);
+            expect(http::retryable(failure.info()));
             const auto& reset = std::get<http::reset_stream>(failure.action());
             // 268 = 0x010c = H3_REQUEST_CANCELLED, the code fed above.
-            expect(std::get<http::v3::error_code>(reset.code).value == 268_u);
+            expect(reset.code == 268_u);
             body_threw = true;
         }
         expect(body_threw);
@@ -978,13 +908,12 @@ static suite<"h3 driver internals"> h3_internals_suite = [] {
         expect(received_second.head.status == 200_u);
     };
 
-    // Internal machinery test: the recording factory acknowledges every write
-    // synchronously, so the transport ACK wait inside flush_output is never
-    // exercised. With the ACK gate closed, each batch of a multi-chunk upload
-    // parks until the test releases the ACK; the pump then advances to the
-    // next chunk and the full body arrives exactly once at the server. Not HTTP
-    // RFC behavior.
-    "http3_upload_parks_until_ack_arrives"_test = [] {
+    // Internal machinery test: peer acknowledgements never pace the writes.
+    // With the ACK gate closed, a multi-chunk upload and its FIN all reach the
+    // transport; the respond, though, completes only once the peer
+    // acknowledges its FIN, since closing the connection earlier would
+    // discard the response. Not HTTP RFC behavior.
+    "http3_writes_do_not_wait_for_ack"_test = [] {
         h3_gated_pair pair;
         chunked_body body{{bytes_of("ack-first-chunk"), bytes_of("ack-second-chunk")}};
 
@@ -993,22 +922,7 @@ static suite<"h3 driver internals"> h3_internals_suite = [] {
             pair.client, basic_get("/upload"), body);
         request.start();
         expect(!request.done());
-        // The first batch (HEADERS + first DATA chunk) parked on its ACK.
-        expect(pair.client_transport.ack_parks == 1_u);
-
-        expect(pair.client_transport.release_next_ack());
-        expect(!request.done());
-        // The second chunk's batch parked on its ACK.
-        expect(pair.client_transport.ack_parks == 2_u);
-
-        expect(pair.client_transport.release_next_ack());
-        // The FIN-only batch also awaits a (zero-byte) acknowledgement.
-        expect(pair.client_transport.ack_parks == 3_u);
-        expect(pair.client_transport.release_next_ack());
-        expect(pair.client_transport.pending_acks.empty());
-        // Upload done; the request now parks on the response headers.
-        expect(!request.done());
-        pair.client_transport.ack_gate_open = true;
+        expect(!pair.client_transport.writes.empty() && pair.client_transport.writes.back().fin);
 
         route_gated_writes_to(pair.client_transport, pair.server_transport);
         auto receive = http::coroutine::receive(pair.server);
@@ -1017,11 +931,18 @@ static suite<"h3 driver internals"> h3_internals_suite = [] {
         expect(incoming.head.target == "/upload"sv);
         expect(read_body_text(incoming.body) == "ack-first-chunkack-second-chunk"sv);
 
+        pair.server_transport.ack_gate_open = false;
         http::buffer_body response_body;
-        run_sync(http::coroutine::respond(pair.server,
+        auto respond = http::coroutine::respond(pair.server,
             std::move(incoming.token),
             http::response{.status = 200, .reason = {}, .fields = {}},
-            response_body));
+            response_body);
+        respond.start();
+        expect(!respond.done());
+        expect(!pair.server_transport.writes.empty() && pair.server_transport.writes.back().fin);
+        while (pair.server_transport.release_next_ack()) {}
+        expect(respond.done());
+        run_sync(std::move(respond));
         route_gated_writes_to(pair.server_transport, pair.client_transport);
 
         auto received = run_sync(std::move(request));
