@@ -85,7 +85,6 @@ export using ::QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL;
 export using ::QUIC_STREAM_SHUTDOWN_FLAG_NONE;
 export using ::QUIC_STREAM_START_FLAG_IMMEDIATE;
 export using ::QuicAddr;
-export using ::QuicAddrGetFamily;
 
 export namespace httpant::dependencies {
 inline bool quic_failed(QUIC_STATUS status) noexcept { return QUIC_FAILED(status); }
@@ -111,4 +110,7 @@ inline constexpr auto connection_local_address = QUIC_PARAM_CONN_LOCAL_ADDRESS;
 inline constexpr auto connection_remote_address = QUIC_PARAM_CONN_REMOTE_ADDRESS;
 inline constexpr auto stream_id = QUIC_PARAM_STREAM_ID;
 inline auto quic_port(const QUIC_ADDR& address) -> uint16_t { return QuicAddrGetPort(&address); }
+// QuicAddrGetFamily has internal linkage in the msquic headers, so it cannot be
+// re-exported; this wrapper keeps the helper reachable for module consumers.
+inline auto quic_family(const QUIC_ADDR& address) -> QUIC_ADDRESS_FAMILY { return QuicAddrGetFamily(&address); }
 }

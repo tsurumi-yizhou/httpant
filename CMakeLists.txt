@@ -54,6 +54,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Warnings stay on for the first-party tree but never fail the build.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  add_compile_options(-Wall -Wextra)
+endif()
+
 include(CTest)
 
 ## Dependencies and modules

@@ -179,6 +179,9 @@ struct state : std::enable_shared_from_this<state<Queue, Local>> {
     http::queues::buffer<std::shared_ptr<stream_type>, Local> accepted;
     std::exception_ptr failure;
     std::atomic<bool> admitted{false};
+    // Set from any thread when an event could not be queued for the engine; consumed
+    // on the engine thread by drain(), which surfaces it as a typed connection error.
+    std::atomic<bool> delivery_failed{false};
     bool handshake = false, running = false, closed = false, peer_closed = false, closing = false;
     struct delivery : native_io::request {
         std::shared_ptr<state> owner;
@@ -206,13 +209,18 @@ struct state : std::enable_shared_from_this<state<Queue, Local>> {
     void publish(record item) noexcept {
         auto owner = this->weak_from_this().lock();
         if (!owner) return;
-        bool result = false;
-        try { result = records.push(std::move(item)); }
+        bool queued = false;
+        try { queued = records.push(std::move(item)); }
         catch (...) {}
-        if (!result) std::terminate();
+        if (!queued) delivery_failed.store(true, std::memory_order_release);
         // The post owns the callback context until the engine has consumed its records.
+        // A failed post must not take the process down: drain() turns delivery_failed
+        // into a typed connection error, closing at most this connection.
         auto* next = new (std::nothrow) delivery{std::move(owner)};
-        if (!next) std::terminate();
+        if (!next) {
+            delivery_failed.store(true, std::memory_order_release);
+            return;
+        }
         scheduler.engine()->start(*next);
     }
     static auto listener_event(HQUIC, void* context, QUIC_LISTENER_EVENT* event) noexcept -> QUIC_STATUS {
@@ -323,6 +331,8 @@ struct state : std::enable_shared_from_this<state<Queue, Local>> {
     }
     void drain() {
         record item;
+        if (delivery_failed.exchange(false, std::memory_order_acq_rel) && !failure)
+            failure = std::make_exception_ptr(std::system_error(std::make_error_code(std::errc::not_enough_memory)));
         while (records.try_pop(item)) {
             auto* stream = item.stream.get();
             try {

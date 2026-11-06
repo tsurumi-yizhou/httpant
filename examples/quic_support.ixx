@@ -1249,7 +1249,7 @@ inline auto quic_connection_transport::remote_address() const -> std::string {
 }
 
 [[nodiscard]] inline auto quic_address_to_string(const QUIC_ADDR& address) -> std::string {
-    if (QuicAddrGetFamily(&address) == QUIC_ADDRESS_FAMILY_INET) {
+    if (httpant::dependencies::quic_family(address) == QUIC_ADDRESS_FAMILY_INET) {
         const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&address);
         std::array<unsigned char, 4> bytes{};
         std::memcpy(bytes.data(), &ipv4->sin_addr, bytes.size());
