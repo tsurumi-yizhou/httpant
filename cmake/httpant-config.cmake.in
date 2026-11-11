@@ -1,0 +1,18 @@
+@PACKAGE_INIT@
+
+# httpant's libraries with their module interface units. The consumer's build
+# compiles the interfaces again for its importers, since module BMIs are not
+# portable. The optional parts are the ones this package was built with.
+set(HTTPANT_ENABLE_TLS @HTTPANT_ENABLE_TLS@)
+set(HTTPANT_ENABLE_IO @HTTPANT_ENABLE_IO@)
+set(HTTPANT_IO_BACKEND "@HTTPANT_IO_BACKEND@")
+
+include(CMakeFindDependencyMacro)
+set(_httpant_module_path "${CMAKE_MODULE_PATH}")
+list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+include("${CMAKE_CURRENT_LIST_DIR}/dependencies.cmake")
+set(CMAKE_MODULE_PATH "${_httpant_module_path}")
+
+include("${CMAKE_CURRENT_LIST_DIR}/httpant-targets.cmake")
+set_property(TARGET httpant::std APPEND PROPERTY INTERFACE_LINK_LIBRARIES xclang::std)
+check_required_components(httpant)

@@ -1,0 +1,17 @@
+{
+    "name": "httpant",
+    "version": "0.2.0",
+    "dependencies": [
+        "llhttp",
+        "nghttp2",
+        "nghttp3",
+        "stdexec",
+        "asio",
+        "bext-ut",
+        "wolfssl",
+        {
+            "name": "liburing",
+            "platform": "linux"
+        }
+    ]
+}
