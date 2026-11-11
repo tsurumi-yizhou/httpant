@@ -1,0 +1,16 @@
+{
+  "name": "httpant-msquic",
+  "version": "0.1.0",
+  "description": "MsQuic stream_factory adapter for httpant",
+  "dependencies": [
+    "asio",
+    "llhttp",
+    "nghttp2",
+    "nghttp3",
+    {
+      "name": "openssl",
+      "platform": "!windows"
+    },
+    "stdexec"
+  ]
+}
