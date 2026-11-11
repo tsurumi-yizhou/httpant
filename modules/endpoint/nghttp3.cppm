@@ -1,0 +1,584 @@
+export module httpant:endpoint.nghttp3;
+import httpant.exception;
+
+import httpant.dependencies.nghttp3;
+import std;
+import :trait;
+import :error;
+import :session.nghttp3;
+import :parse.nghttp3;
+
+export namespace http::v3 {
+
+namespace detail {
+
+enum class endpoint_role {
+    client,
+    server,
+};
+
+inline auto make_settings(const configuration& config) -> nghttp3_settings {
+    nghttp3_settings settings;
+    nghttp3_settings_default(&settings);
+    settings.max_field_section_size = config.maximum_field_section_size;
+    settings.qpack_max_dtable_capacity = config.compression.decoder_capacity;
+    settings.qpack_encoder_max_dtable_capacity = config.compression.encoder_capacity;
+    settings.qpack_blocked_streams = config.compression.blocked_streams;
+    settings.qpack_indexing_strat = NGHTTP3_QPACK_INDEXING_STRAT_EAGER;
+    return settings;
+}
+
+template <template <class> class Queue>
+inline auto create_connection(
+    endpoint_role role,
+    conn_context<Queue>& context,
+    const configuration& config) -> connection_handle
+{
+    auto callbacks = make_callbacks<Queue>();
+    auto settings = make_settings(config);
+    nghttp3_conn* raw_connection = nullptr;
+    auto result = role == endpoint_role::client
+        ? nghttp3_conn_client_new(
+              &raw_connection,
+              &callbacks,
+              &settings,
+              nghttp3_mem_default(),
+              &context)
+        : nghttp3_conn_server_new(
+              &raw_connection,
+              &callbacks,
+              &settings,
+              nghttp3_mem_default(),
+              &context);
+    if (result != 0) {
+        connection_handle cleanup{raw_connection};
+        throw make_error(
+            role == endpoint_role::client ? "conn_client_new" : "conn_server_new",
+            result);
+    }
+    context.is_client = role == endpoint_role::client;
+    context.local_configuration = config;
+    return connection_handle{raw_connection};
+}
+
+template <template <class> class Queue>
+[[nodiscard]] inline auto compression_state(const conn_context<Queue>& context)
+    -> qpack_state
+{
+    return qpack_state{
+        .decoder_capacity = context.local_configuration.compression.decoder_capacity,
+        .blocked_streams = context.local_configuration.compression.blocked_streams,
+        .encoder_capacity = context.local_configuration.compression.encoder_capacity,
+        .peer_decoder_capacity = context.peer_decoder_capacity,
+        .peer_blocked_streams = context.peer_blocked_streams,
+    };
+}
+
+template <template <class> class Queue>
+inline void close_finished_stream(conn_context<Queue>& ctx, nghttp3_conn* conn, std::int64_t id) {
+    auto input = ctx.inputs.find(id);
+    if ((id & 2) || input == ctx.inputs.end() || !input->second.closed ||
+        !input->second.fin_acknowledged || input->second.finished)
+        return;
+    if (auto exchange = ctx.core.streams.find(id);
+        exchange != ctx.core.streams.end() && !exchange->second->core.complete)
+        return; // QPACK can still be decoding a field section received at FIN.
+    // Both QUIC directions have completed: the peer's FIN was read and our
+    // FIN was acknowledged. nghttp3 retains its stream until told it closed.
+    input->second.finished = true;
+    check(nghttp3_conn_close_stream(conn, id, NGHTTP3_H3_NO_ERROR), "close_stream");
+}
+
+// Serializes flush_output so only one coroutine may be inside
+// nghttp3_conn_writev_stream / async_write / add_write_offset at a time.
+// nghttp3 does not advance its write offset until add_write_offset, so a
+// second flush entering while the first is suspended in async_write would
+// receive the same unsent batch and duplicate bytes on the wire.
+// Waiters are released only by the holder's unlock(), so a holder stuck
+// forever inside a transport write would strand the queue. The transport
+// contract covers this: every stream_factory operation takes a stop token and
+// must complete — with an error once the connection has failed — so the
+// holder always reaches unlock() and the queue drains. This gate relies on
+// that contract.
+template <template <class> class Queue = http::queues::local>
+struct flush_gate {
+    bool locked{false};
+    http::queues::buffer<std::coroutine_handle<>, Queue> waiters{};
+
+    struct lock_awaiter {
+        flush_gate& gate;
+
+        [[nodiscard]] bool await_ready() const noexcept { return false; }
+        auto await_suspend(std::coroutine_handle<> handle) noexcept -> bool {
+            if (!gate.locked) {
+                gate.locked = true;
+                return false;
+            }
+            gate.waiters.push_back(handle);
+            return true;
+        }
+        void await_resume() const noexcept {}
+    };
+
+    [[nodiscard]] auto lock() noexcept -> lock_awaiter { return {*this}; }
+
+    void unlock() noexcept {
+        if (waiters.empty()) {
+            locked = false;
+            return;
+        }
+        auto handle = waiters.front();
+        waiters.pop_front();
+        handle.resume();
+    }
+};
+
+template <stream_factory S, template <class> class Queue>
+class endpoint_runtime {
+public:
+    using stream_pointer = std::shared_ptr<typename S::stream_type>;
+    using stream_map = std::unordered_map<std::int64_t, stream_pointer>;
+
+    endpoint_runtime(
+        S& transport,
+        nghttp3_conn* connection,
+        conn_context<Queue>& context,
+        stream_map& streams)
+        : transport_(transport), connection_(connection), context_(context), streams_(streams) {}
+
+    endpoint_runtime(const endpoint_runtime&) = delete;
+    auto operator=(const endpoint_runtime&) -> endpoint_runtime& = delete;
+
+    auto start() -> http::detail::operation<void> {
+        if (context_.core.connection_error)
+            std::rethrow_exception(context_.core.connection_error);
+        if (started_)
+            co_return;
+        started_ = true;
+
+        try {
+            auto& stop = co_await current_stop_token();
+            auto control = co_await transport_.async_open_unidirectional(stop);
+            auto encoder = co_await transport_.async_open_unidirectional(stop);
+            auto decoder = co_await transport_.async_open_unidirectional(stop);
+            auto control_id = to_stream_id(control.identifier());
+            auto encoder_id = to_stream_id(encoder.identifier());
+            auto decoder_id = to_stream_id(decoder.identifier());
+            streams_[control_id] = std::make_shared<typename S::stream_type>(std::move(control));
+            streams_[encoder_id] = std::make_shared<typename S::stream_type>(std::move(encoder));
+            streams_[decoder_id] = std::make_shared<typename S::stream_type>(std::move(decoder));
+            bound_streams_ = {control_id, encoder_id, decoder_id};
+
+            check(nghttp3_conn_bind_control_stream(connection_, control_id), "bind_control");
+            check(
+                nghttp3_conn_bind_qpack_streams(connection_, encoder_id, decoder_id),
+                "bind_qpack");
+            context_.local_control_stream_id = control_id;
+            co_await flush();
+            scope_.spawn(accept_loop());
+        } catch (...) {
+            // No driver can repair a failed initialization. Keep this endpoint
+            // terminal and wake existing waiters; a new connection needs a
+            // new endpoint and transport, instead of rebinding partial state.
+            fail_connection(context_, http::exceptions::current_exception());
+            throw;
+        }
+    }
+
+    // Stops the accept loop and every stream reader and waits for them to
+    // finish. Exchanges still parked on this connection are woken with
+    // http::stopped.
+    auto close() -> http::detail::operation<void> {
+        scope_.request_stop();
+        co_await scope_.join();
+        fail_connection(context_, http::exceptions::make_exception_ptr(http::stopped{}));
+    }
+
+    auto flush() -> http::detail::operation<void> {
+        co_await flush_gate_.lock();
+        try {
+            co_await flush_output(scope_.stop_token());
+            reap_closed_streams();
+        } catch (...) {
+            flush_gate_.unlock();
+            throw;
+        }
+        flush_gate_.unlock();
+    }
+
+    auto shutdown() -> http::detail::operation<void> {
+        check(nghttp3_conn_submit_shutdown_notice(connection_), "submit_shutdown_notice");
+        check(nghttp3_conn_shutdown(connection_), "shutdown");
+        co_await flush();
+        // Closing the connection abandons unacknowledged stream data.
+        co_await http::detail::park_until{acknowledged_, [this] { return unacknowledged_ == 0; }};
+        if (!context_.connection_close_started) {
+            context_.connection_close_started = true;
+            // RFC 9114 §8.1 — H3_NO_ERROR indicates a graceful connection
+            // close after the GOAWAY bytes have been accepted by the transport.
+            co_await transport_.async_close(
+                application_error{NGHTTP3_H3_NO_ERROR});
+        }
+        co_await close();
+    }
+
+    void read(stream_pointer stream, bool peer_initiated = true) {
+        auto stream_id = to_stream_id(stream->identifier());
+        streams_[stream_id] = stream;
+        scope_.spawn(read_stream_guarded(std::move(stream), peer_initiated));
+    }
+
+private:
+    // Flushes each nghttp3_conn_writev_stream batch. Only bytes the transport
+    // accepted advance the nghttp3 write offset, and buffer release is awaited
+    // before spans can change. Each batch is copied, so nghttp3's retained
+    // chunks are released as soon as the transport accepts the copy; peer
+    // acknowledgements are awaited by children and never pace the writes.
+    auto flush_output(std::stop_token stop) -> http::detail::operation<void> {
+        std::int64_t sid = -1;
+        int fin = 0;
+        nghttp3_vec vec[8];
+        for (;;) {
+            auto n = nghttp3_conn_writev_stream(connection_, &sid, &fin, vec, 8);
+            if (n < 0) {
+                rethrow_callback_failure(context_);
+                // RFC 9114 §8 — the negative code means the connection must be
+                // closed; infer the H3 application error code (Section 8.1) and
+                // record it for the upper layer to carry on CONNECTION_CLOSE.
+                auto code = nghttp3_err_infer_quic_app_error_code(static_cast<int>(n));
+                record_connection_error(context_, connection_, code);
+                throw protocol_error{
+                    error_info{
+                        .condition = error_condition::malformed_frame,
+                        .exchange_identity = std::nullopt,
+                        .library_code = static_cast<int>(n),
+                    },
+                    close_connection{code},
+                    std::format("http/3: writev_stream failed ({})", n)};
+            }
+            rethrow_callback_failure(context_);
+            if (n == 0 && fin == 0) break;
+
+            auto it = streams_.find(sid);
+            if (it == streams_.end())
+                throw std::logic_error("http/3: write on an unknown stream");
+            // Held by value: an acknowledgement child can abandon the stream
+            // while this flush is suspended in a write.
+            auto stream = it->second;
+
+            // The read_data interface keeps each vec's bytes owned by the caller
+            // until acked; they are copied into one stable buffer per batch.
+            std::vector<std::byte> data;
+            auto count = static_cast<std::size_t>(n);
+            for (std::size_t i = 0; i < count; ++i) {
+                auto bytes = std::as_bytes(std::span{
+                    reinterpret_cast<const char*>(vec[i].base), vec[i].len});
+                data.insert(data.end(), bytes.begin(), bytes.end());
+            }
+
+            try {
+                auto remaining = std::span<const std::byte>{data};
+                // FIN is kept off the data-bearing writes. If a transport
+                // accepts a partial write, the FIN would otherwise be delivered
+                // before the final byte, closing the send side early. Data is
+                // drained first, then a zero-length FIN-only write is emitted
+                // exactly once when nghttp3 requested stream finalization.
+                while (!remaining.empty()) {
+                    auto result = co_await stream->async_write(remaining, false, stop);
+                    co_await std::move(result.buffer_release);
+                    if (result.accepted == 0)
+                        throw usage_error("transport: stream write made no progress");
+                    if (result.accepted > remaining.size())
+                        throw usage_error("transport: stream write accepted too many bytes");
+                    check(
+                        nghttp3_conn_add_write_offset(connection_, sid, static_cast<nghttp3_ssize>(result.accepted)),
+                        "add_write_offset");
+                    check(nghttp3_conn_add_ack_offset(connection_, sid, result.accepted), "add_ack_offset");
+                    await_acknowledgement(sid, std::move(result.acknowledgement), result.accepted, false);
+                    remaining = remaining.subspan(result.accepted);
+                }
+                if (fin != 0) {
+                    // nghttp3 reports a zero-byte write offset once
+                    // the FIN has been handed to the transport.
+                    auto result = co_await stream->async_write(std::span<const std::byte>{}, true, stop);
+                    co_await std::move(result.buffer_release);
+                    if (result.accepted != 0)
+                        throw usage_error("transport: FIN-only write accepted bytes");
+                    check(nghttp3_conn_add_write_offset(connection_, sid, 0), "add_write_offset");
+                    await_acknowledgement(sid, std::move(result.acknowledgement), 0, true);
+                }
+            } catch (const http::stream_reset& reset) {
+                abandon(sid, reset);
+            }
+        }
+    }
+
+    template <typename Acknowledgement>
+    void await_acknowledgement(std::int64_t sid, Acknowledgement acknowledgement, std::size_t accepted, bool fin) {
+        ++unacknowledged_;
+        scope_.spawn(acknowledge(sid, std::move(acknowledgement), accepted, fin));
+    }
+
+    // A FIN acknowledgement completes the stream's sending side; shutdown
+    // waits for every acknowledgement before closing the connection.
+    template <typename Acknowledgement>
+    auto acknowledge(std::int64_t sid, Acknowledgement acknowledgement, std::size_t accepted, bool fin)
+        -> http::detail::operation<void>
+    {
+        try {
+            auto acknowledged = co_await std::move(acknowledgement);
+            if (acknowledged > accepted)
+                throw usage_error("transport: stream write acknowledged too many bytes");
+            if (fin && streams_.contains(sid)) {
+                {
+                    http::detail::wake_scope scope{wakeups_};
+                    context_.inputs[sid].fin_acknowledged = true;
+                    if (auto it = context_.core.outbound_bodies.find(sid); it != context_.core.outbound_bodies.end()) {
+                        it->second->finished = true;
+                        it->second->resume_ack_waiter();
+                    }
+                    close_finished_stream(context_, connection_, sid);
+                }
+                co_await http::detail::dispatch_wakeups{wakeups_};
+                reap_closed_streams();
+            }
+        } catch (const http::stream_reset& reset) {
+            abandon(sid, reset);
+        } catch (...) {
+            if (!scope_.stop_requested())
+                fail_connection(context_, http::exceptions::current_exception());
+        }
+        if (--unacknowledged_ == 0)
+            acknowledged_.resume();
+    }
+
+    // RFC 9114 §4.1.1 — the peer abandoned this one stream (STOP_SENDING);
+    // close it at the sole protocol owner and keep the other streams running.
+    // Abandon the retained body chunk so a pump_outbound_body parked on ACK
+    // wakes and exits instead of waiting for an ACK that can no longer arrive.
+    void abandon(std::int64_t sid, const http::stream_reset& reset) {
+        if (streams_.erase(sid) == 0)
+            return;
+        if (auto it = context_.core.outbound_bodies.find(sid); it != context_.core.outbound_bodies.end())
+            terminate_outbound_body(*it->second);
+        if (nghttp3_conn_close_stream(connection_, sid, reset.error_code.value) != 0)
+            mark_stream_closed(context_, sid, reset.error_code.value);
+    }
+
+    auto accept_loop() -> http::detail::operation<void> {
+        try {
+            auto& stop = scope_.stop_token();
+            while (!stop.stop_requested()) {
+                auto stream = co_await transport_.async_accept(stop);
+                read(std::make_shared<typename S::stream_type>(std::move(stream)));
+            }
+        } catch (...) {
+            if (!scope_.stop_requested())
+                fail_connection(context_, http::exceptions::current_exception());
+        }
+    }
+
+    auto read_stream_guarded(stream_pointer stream, bool peer_initiated) -> http::detail::operation<void> {
+        auto stream_id = to_stream_id(stream->identifier());
+        std::exception_ptr failure;
+        try {
+            co_await read_stream(stream, peer_initiated);
+            co_return;
+        } catch (const http::stream_reset& reset) {
+            // RFC 9114 §4.1.1 — "Stream errors are expressed as ... resets;
+            // they do not affect other streams or the connection." Inform the
+            // sole protocol owner so the stream reaches its terminal state
+            // (nghttp3 delivers stream_close, which wakes the stream's
+            // waiters); when nghttp3 never saw the stream, mark it directly.
+            // The connection and its other in-flight streams keep running.
+            if (nghttp3_conn_close_stream(connection_, stream_id, reset.error_code.value) != 0)
+                mark_stream_closed(context_, stream_id, reset.error_code.value);
+            streams_.erase(stream_id);
+            context_.inputs.erase(stream_id);
+            co_return;
+        } catch (...) {
+            failure = http::exceptions::current_exception();
+        }
+
+        if (scope_.stop_requested())
+            co_return;
+
+        if (auto code = reset_code(failure)) {
+            // RFC 9204 §2.2.2.2 — "When a stream is reset or reading is
+            // abandoned, the decoder emits a Stream Cancellation instruction."
+            // nghttp3_conn_close_stream has already updated the sole QPACK
+            // owner; execute the typed QUIC stream action and flush any
+            // resulting decoder-stream instruction.
+            try {
+                stream->shutdown(
+                    stream_side::both,
+                    application_error{*code});
+                co_await flush();
+            } catch (...) {
+                failure = http::exceptions::current_exception();
+                record_connection_error(
+                    context_, connection_, NGHTTP3_H3_INTERNAL_ERROR);
+            }
+            if (context_.connection_error_code == 0) {
+                // RFC 9114 §8 — "Stream errors are expressed as ... resets;
+                // they do not affect other streams or the connection." The
+                // typed stream action was executed; the connection and its
+                // other exchanges keep running. A server-side request-stream
+                // failure is delivered to receive() so the application sees
+                // the typed error; a client-side failure wakes its own
+                // request through mark_stream_closed (delivered by
+                // nghttp3_conn_close_stream in record_stream_error).
+                if (!context_.is_client) {
+                    // The failed request stream is never delivered to
+                    // receive() (it rethrows the queued failure), so no
+                    // body_reader will ever release its stream_data: drop the
+                    // ctx.streams entry (and its buffered body / decoded
+                    // fields) here. The transport handle stays in streams_
+                    // and is reaped by reap_closed_streams once the stream
+                    // closes, preserving that function's early-release
+                    // behavior for the handle.
+                    context_.core.streams.erase(stream_id);
+                    context_.server_stream_failures.push_back(failure);
+                    context_.core.receive_waiter.resume();
+                }
+                co_return;
+            }
+        }
+
+        if (context_.connection_error_code != 0 &&
+            !context_.connection_close_started) {
+            context_.connection_close_started = true;
+            try {
+                // RFC 9114 §8 — the protocol layer selects the typed H3/QPACK
+                // application error; the factory only performs QUIC close.
+                co_await transport_.async_close(
+                    application_error{context_.connection_error_code});
+            } catch (...) {
+                // The protocol action was selected and attempted; failure of
+                // the transport action is now the terminal error and must not
+                // be swallowed behind the original protocol violation.
+                failure = http::exceptions::current_exception();
+            }
+        }
+        fail_connection(context_, std::move(failure));
+    }
+
+    auto read_stream(stream_pointer stream, bool peer_initiated) -> http::detail::operation<void> {
+        auto stream_id = to_stream_id(stream->identifier());
+        auto unidirectional = peer_initiated
+            ? accepted_stream_is_unidirectional(
+                  context_, connection_, stream->access())
+            : false;
+        std::array<std::byte, io_buffer_size> buffer;
+        for (;;) {
+            if (auto it = context_.core.streams.find(stream_id);
+                it != context_.core.streams.end() &&
+                it->second->buffered_body_size >= body_buffer_limit) {
+                co_await body_capacity(it->second);
+                continue;
+            }
+            auto capacity = body_buffer_limit;
+            if (auto it = context_.core.streams.find(stream_id); it != context_.core.streams.end())
+                capacity -= it->second->buffered_body_size;
+            auto size = co_await stream->async_read(
+                std::span{buffer}.first(capacity), scope_.stop_token());
+            // The transport signals fin by returning zero bytes, so the fin
+            // flag passed to process_input is exactly "no bytes this read"; a
+            // partial frame left at fin therefore accumulated from earlier
+            // reads and is the stream's truncated last frame (RFC 9114 §7.1).
+            // nghttp3's callbacks wake parked coroutines; they are queued and
+            // resumed below, once this reader has suspended (see wake_scope).
+            // A failure is rethrown only after the wake-ups queued before it
+            // have been dispatched.
+            std::exception_ptr input_failure;
+            try {
+                http::detail::wake_scope scope{wakeups_};
+                auto consumed = process_input(
+                    context_, connection_, stream_id, unidirectional,
+                    std::span<const std::byte>{buffer.data(), static_cast<std::size_t>(size)},
+                    size == 0);
+                stream->consume(static_cast<std::size_t>(consumed));
+                for (auto it = context_.deferred_consumption.begin();
+                     it != context_.deferred_consumption.end();) {
+                    if (auto handle = streams_.find(it->first); handle != streams_.end())
+                        handle->second->consume(it->second);
+                    it = context_.deferred_consumption.erase(it);
+                }
+                if (size == 0) {
+                    close_finished_stream(context_, connection_, stream_id);
+                    if (auto it = context_.core.streams.find(stream_id);
+                        it != context_.core.streams.end())
+                        it->second->core.resume_waiter();
+                }
+            } catch (...) {
+                input_failure = http::exceptions::current_exception();
+            }
+            co_await http::detail::dispatch_wakeups{wakeups_};
+            if (input_failure)
+                std::rethrow_exception(input_failure);
+            if (size == 0) {
+                reap_closed_streams();
+                // RFC 9114 §4.1 — "If a client-initiated stream terminates
+                // without enough of the HTTP message to provide a complete
+                // response, the server SHOULD abort its response stream with
+                // the error code H3_REQUEST_INCOMPLETE." The frame-level
+                // truncations nghttp3 reports are handled as stream errors in
+                // process_request_stream / forward_stream_input; a request
+                // stream that reaches FIN while its QPACK field section is
+                // still blocked is consumed silently by nghttp3 (the FIN is
+                // buffered until unblocking), so httpant cannot distinguish it
+                // from a still-decoding stream and delivers EOF without a
+                // reset.
+                co_return;
+            }
+            co_await flush();
+        }
+    }
+
+    // Reaps transport handles and input parsers whose exchange has fully
+    // ended: the stream closed at the protocol layer, or (client side) the
+    // completed exchange was released by the body_reader. The bound control /
+    // QPACK streams and the peer's control / QPACK streams live until
+    // connection teardown, so they are never reaped here.
+    void reap_closed_streams() {
+        auto connection_lifetime = [this](std::int64_t id) {
+            return bound_streams_.contains(id) ||
+                   context_.remote_control_stream_id == id ||
+                   context_.remote_qpack_encoder_stream_id == id ||
+                   context_.remote_qpack_decoder_stream_id == id;
+        };
+        std::erase_if(streams_, [&](const auto& entry) {
+            if (connection_lifetime(entry.first))
+                return false;
+            close_finished_stream(context_, connection_, entry.first);
+            auto it = context_.core.streams.find(entry.first);
+            auto input = context_.inputs.find(entry.first);
+            auto finished = input != context_.inputs.end() && input->second.finished;
+            if (!finished && it != context_.core.streams.end() && !it->second->core.closed)
+                return false;
+            // A server request stream whose state was released early keeps its
+            // handle: the response may still be written through it.
+            if (!finished && it == context_.core.streams.end() && !context_.is_client)
+                return false;
+            context_.inputs.erase(entry.first);
+            return true;
+        });
+    }
+
+    S& transport_;
+    nghttp3_conn* connection_;
+    conn_context<Queue>& context_;
+    stream_map& streams_;
+    std::unordered_set<std::int64_t> bound_streams_{};
+    flush_gate<Queue> flush_gate_{};
+    http::detail::wake_queue<Queue> wakeups_{};
+    std::size_t unacknowledged_{0};
+    http::detail::waiter_slot<Queue> acknowledged_{};
+    bool started_{false};
+    // Declared last: destroyed first, while the state its children use lives.
+    http::detail::operation_scope scope_{};
+};
+
+} // namespace detail
+
+} // namespace http::v3
