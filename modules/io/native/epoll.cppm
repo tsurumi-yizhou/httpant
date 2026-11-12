@@ -26,11 +26,10 @@ namespace native_io {
         };
         static_assert(sizeof(request_state) <= sizeof(request::native));
         auto state(request& r) noexcept -> request_state& { return *std::launder(reinterpret_cast<request_state*>(r.native.data())); }
-    } // namespace
+    } // namespace detail
     using namespace detail;
 
-    template <template <class> class Queue>
-    struct engine<Queue>::impl : detail::queue<Queue> {
+    template <template <class> class Queue> struct engine<Queue>::impl : detail::queue<Queue> {
         using detail::queue<Queue>::active;
         using detail::queue<Queue>::take;
         using detail::queue<Queue>::track;
@@ -74,7 +73,8 @@ namespace native_io {
                 }
                 work_ready.release(static_cast<std::ptrdiff_t>(workers.size()));
                 workers.clear();
-                if (timer >= 0) ::close(timer);
+                if (timer >= 0)
+                    ::close(timer);
                 if (wake >= 0)
                     ::close(wake);
                 ::close(descriptor);
@@ -93,11 +93,11 @@ namespace native_io {
         }
         void arm_timer() {
             auto next = deadline();
-            if (next == armed) return;
+            if (next == armed)
+                return;
             itimerspec value{};
             if (next != std::chrono::steady_clock::time_point::max()) {
-                auto ns = std::max<long long>(1,
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(next - std::chrono::steady_clock::now()).count());
+                auto ns = std::max<long long>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(next - std::chrono::steady_clock::now()).count());
                 value.it_value = {ns / 1000000000, ns % 1000000000};
             }
             if (::timerfd_settime(timer, 0, &value, nullptr) < 0)
@@ -112,7 +112,8 @@ namespace native_io {
             if (wake_pending.exchange(true, std::memory_order_acq_rel))
                 return;
             std::uint64_t one = 1;
-            while (::write(wake, &one, sizeof one) < 0 && errno == EINTR) {}
+            while (::write(wake, &one, sizeof one) < 0 && errno == EINTR) {
+            }
         }
 
         void run_worker() {
@@ -120,7 +121,8 @@ namespace native_io {
                 work_ready.acquire();
                 request* r;
                 while (!work.try_pop(r)) {
-                    if (closing.load(std::memory_order_acquire)) return;
+                    if (closing.load(std::memory_order_acquire))
+                        return;
                     std::this_thread::yield();
                 }
                 if (!r->cancelled.load(std::memory_order_acquire) && !r->is_closed()) {
@@ -215,8 +217,12 @@ namespace native_io {
             auto fd = static_cast<int>(r.file);
             std::array<iovec, max_buffers> buffers{};
             auto count = r.buffer_count;
-            for (unsigned i = 0; i < count; ++i) buffers[i] = {r.buffers[i].data, r.buffers[i].size};
-            if (!count) { buffers[0] = {r.buffer, r.size}; count = 1; }
+            for (unsigned i = 0; i < count; ++i)
+                buffers[i] = {r.buffers[i].data, r.buffers[i].size};
+            if (!count) {
+                buffers[0] = {r.buffer, r.size};
+                count = 1;
+            }
             ssize_t result = 0;
             std::uint32_t filter = EPOLLIN;
             switch (r.kind) {
@@ -382,14 +388,10 @@ namespace native_io {
             }
         }
     };
-    template <template <class> class Queue>
-    engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
-    template <template <class> class Queue>
-    engine<Queue>::~engine() = default;
-    template <template <class> class Queue>
-    auto engine<Queue>::name() noexcept -> const char* { return "epoll"; }
-    template <template <class> class Queue>
-    void engine<Queue>::start(request& r) noexcept {
+    template <template <class> class Queue> engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
+    template <template <class> class Queue> engine<Queue>::~engine() = default;
+    template <template <class> class Queue> auto engine<Queue>::name() noexcept -> const char* { return "epoll"; }
+    template <template <class> class Queue> void engine<Queue>::start(request& r) noexcept {
         r.rejected = false;
         if (auto error = impl_->push(r)) {
             r.rejected = true;
@@ -398,23 +400,19 @@ namespace native_io {
         }
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel(request& r) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel(request& r) noexcept {
         r.cancelled.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel_file(handle file) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel_file(handle file) noexcept {
         impl_->mark_closed(file);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::stop() noexcept {
+    template <template <class> class Queue> void engine<Queue>::stop() noexcept {
         impl_->stopped.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::run() {
+    template <template <class> class Queue> void engine<Queue>::run() {
         if (impl_->stopped.exchange(false, std::memory_order_acquire))
             return;
         struct guard {
@@ -441,25 +439,25 @@ namespace native_io {
                 auto fd = events[i].data.fd;
                 if (fd == impl_->timer) {
                     std::uint64_t expirations;
-                    while (::read(fd, &expirations, sizeof expirations) < 0 && errno == EINTR) {}
+                    while (::read(fd, &expirations, sizeof expirations) < 0 && errno == EINTR) {
+                    }
                     impl_->armed = std::chrono::steady_clock::time_point::max();
                     continue;
                 }
                 if (fd == impl_->wake) {
                     std::uint64_t value;
-                    while (::read(fd, &value, sizeof value) < 0 && errno == EINTR) {}
+                    while (::read(fd, &value, sizeof value) < 0 && errno == EINTR) {
+                    }
                     impl_->wake_pending.store(false, std::memory_order_release);
                     continue;
                 }
                 for (auto* r = impl_->active; r; r = r->active_next)
-                    if (r->file == fd && state(*r).armed &&
-                        (events[i].events & (state(*r).filter | EPOLLERR | EPOLLHUP)))
-                    {
+                    if (r->file == fd && state(*r).armed && (events[i].events & (state(*r).filter | EPOLLERR | EPOLLHUP))) {
                         state(*r).ready = true;
-                        r->offset = (events[i].events & EPOLLIN && r->events & 1 ? 1 : 0) | (events[i].events & EPOLLOUT && r->events & 2 ? 2 : 0) | (events[i].events & EPOLLERR ? 4 : 0);
+                        r->offset = (events[i].events & EPOLLIN && r->events & 1 ? 1 : 0) | (events[i].events & EPOLLOUT && r->events & 2 ? 2 : 0) |
+                                    (events[i].events & EPOLLERR ? 4 : 0);
                     }
             }
-
         }
     }
 } // namespace native_io

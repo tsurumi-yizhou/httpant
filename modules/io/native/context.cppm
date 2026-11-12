@@ -51,8 +51,8 @@ namespace native_io {
                     if (::GetFileType(reinterpret_cast<HANDLE>(r.file)) != FILE_TYPE_PIPE)
                         throw std::system_error(error, std::system_category());
                     HANDLE pipe = nullptr;
-                    if (!::DuplicateHandle(::GetCurrentProcess(), reinterpret_cast<HANDLE>(r.file),
-                                           ::GetCurrentProcess(), &pipe, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    if (!::DuplicateHandle(::GetCurrentProcess(), reinterpret_cast<HANDLE>(r.file), ::GetCurrentProcess(), &pipe, 0, FALSE,
+                                           DUPLICATE_SAME_ACCESS))
                         throw std::system_error(::GetLastError(), std::system_category());
                     try {
                         value.emplace<descriptor>(context, pipe);
@@ -69,7 +69,8 @@ namespace native_io {
                 };
 #else
                 struct stat info;
-                if (::fstat(r.file, &info) < 0) throw std::system_error(errno, std::generic_category());
+                if (::fstat(r.file, &info) < 0)
+                    throw std::system_error(errno, std::generic_category());
                 if (!S_ISSOCK(info.st_mode)) {
                     value.emplace<descriptor>(context, r.file);
                     return;
@@ -108,19 +109,23 @@ namespace native_io {
             }
             ~asio_resource() { release(); }
             void release() noexcept {
-                std::visit([](auto& socket) {
-                    std::error_code ignored;
-                    if (socket.is_open()) {
+                std::visit(
+                    [](auto& socket) {
+                        std::error_code ignored;
+                        if (socket.is_open()) {
 #ifndef _WIN32
-                        if constexpr (std::same_as<std::decay_t<decltype(socket)>, descriptor>) socket.release();
-                        else
+                            if constexpr (std::same_as<std::decay_t<decltype(socket)>, descriptor>)
+                                socket.release();
+                            else
 #else
-                        if constexpr (std::same_as<std::decay_t<decltype(socket)>, descriptor>) socket.close(ignored);
-                        else
+                            if constexpr (std::same_as<std::decay_t<decltype(socket)>, descriptor>)
+                                socket.close(ignored);
+                            else
 #endif
-                        socket.release(ignored);
-                    }
-                }, value);
+                                socket.release(ignored);
+                        }
+                    },
+                    value);
             }
         };
 #ifdef ASIO_HAS_FILE
@@ -137,7 +142,8 @@ namespace native_io {
             ~asio_file() { release(); }
             void release() noexcept {
                 std::error_code ignored;
-                if (value.is_open()) value.release(ignored);
+                if (value.is_open())
+                    value.release(ignored);
             }
         };
 #endif
@@ -157,31 +163,48 @@ namespace native_io {
             if (::poll(&descriptor, 1, 0) < 0)
                 throw std::system_error(errno, std::generic_category());
 #endif
-            return (descriptor.revents & (POLLIN | POLLHUP) && r.events & 1 ? 1 : 0)
-                 | (descriptor.revents & POLLOUT && r.events & 2 ? 2 : 0)
-                 | (descriptor.revents & (POLLERR | POLLNVAL) ? 4 : 0);
+            return (descriptor.revents & (POLLIN | POLLHUP) && r.events & 1 ? 1 : 0) | (descriptor.revents & POLLOUT && r.events & 2 ? 2 : 0) |
+                   (descriptor.revents & (POLLERR | POLLNVAL) ? 4 : 0);
         }
         template <class Socket> auto asio_wait(Socket& socket, int events, std::error_code& error) -> asio::awaitable<void> {
             using namespace asio::experimental::awaitable_operators;
             auto wait = [&](int event) -> asio::awaitable<std::error_code> {
                 std::error_code error;
-                co_await socket.async_wait(event == 1 ? Socket::wait_read : event == 2 ? Socket::wait_write : Socket::wait_error,
+                co_await socket.async_wait(event == 1   ? Socket::wait_read
+                                           : event == 2 ? Socket::wait_write
+                                                        : Socket::wait_error,
                                            asio::redirect_error(asio::use_awaitable, error));
                 co_return error;
             };
             auto selected = [](auto error) { return error; };
             switch (events & 7) {
-            case 0: error = co_await wait(4); break;
-            case 1: error = co_await wait(1); break;
-            case 2: error = co_await wait(2); break;
-            case 3: error = std::visit(selected, co_await (wait(1) || wait(2))); break;
-            case 4: error = co_await wait(4); break;
-            case 5: error = std::visit(selected, co_await (wait(1) || wait(4))); break;
-            case 6: error = std::visit(selected, co_await (wait(2) || wait(4))); break;
-            case 7: error = std::visit(selected, co_await (wait(1) || wait(2) || wait(4))); break;
+            case 0:
+                error = co_await wait(4);
+                break;
+            case 1:
+                error = co_await wait(1);
+                break;
+            case 2:
+                error = co_await wait(2);
+                break;
+            case 3:
+                error = std::visit(selected, co_await (wait(1) || wait(2)));
+                break;
+            case 4:
+                error = co_await wait(4);
+                break;
+            case 5:
+                error = std::visit(selected, co_await (wait(1) || wait(4)));
+                break;
+            case 6:
+                error = std::visit(selected, co_await (wait(2) || wait(4)));
+                break;
+            case 7:
+                error = std::visit(selected, co_await (wait(1) || wait(2) || wait(4)));
+                break;
             }
         }
-    }
+    } // namespace detail
 
     struct detail::asio_loop::impl {
         asio::io_context context{1};
@@ -192,7 +215,8 @@ namespace native_io {
 #endif
         auto socket(request& r) -> std::shared_ptr<detail::asio_resource> {
             auto entry = sockets.find(r.file);
-            if (entry != sockets.end()) return entry->second;
+            if (entry != sockets.end())
+                return entry->second;
             auto current = std::make_shared<detail::asio_resource>(context, r);
             sockets.emplace(r.file, current);
             return current;
@@ -210,18 +234,25 @@ namespace native_io {
 #ifdef ASIO_HAS_FILE
                     auto entry = files.find(r.file);
                     auto resource = entry != files.end() ? entry->second : std::make_shared<detail::asio_file>(context, r);
-                    if (entry == files.end()) files.emplace(r.file, resource);
+                    if (entry == files.end())
+                        files.emplace(r.file, resource);
                     if (r.kind == operation::read_at)
-                        result = co_await resource->value.async_read_some_at(r.offset, asio::buffer(r.buffer, r.size), asio::redirect_error(asio::use_awaitable, error));
+                        result = co_await resource->value.async_read_some_at(r.offset, asio::buffer(r.buffer, r.size),
+                                                                             asio::redirect_error(asio::use_awaitable, error));
                     else
-                        result = co_await resource->value.async_write_some_at(r.offset, asio::buffer(r.buffer, r.size), asio::redirect_error(asio::use_awaitable, error));
+                        result = co_await resource->value.async_write_some_at(r.offset, asio::buffer(r.buffer, r.size),
+                                                                              asio::redirect_error(asio::use_awaitable, error));
 #endif
                 } else {
                     auto resource = socket(r);
                     std::array<asio::mutable_buffer, max_buffers> buffers;
                     auto count = r.buffer_count;
-                    for (unsigned i = 0; i < count; ++i) buffers[i] = asio::buffer(r.buffers[i].data, r.buffers[i].size);
-                    if (!count) { buffers[0] = asio::buffer(r.buffer, r.size); count = 1; }
+                    for (unsigned i = 0; i < count; ++i)
+                        buffers[i] = asio::buffer(r.buffers[i].data, r.buffers[i].size);
+                    if (!count) {
+                        buffers[0] = asio::buffer(r.buffer, r.size);
+                        count = 1;
+                    }
                     auto sequence = std::span{buffers.data(), count};
                     if (auto* descriptor = std::get_if<detail::asio_resource::descriptor>(&resource->value)) {
                         if (r.kind == operation::read)
@@ -231,12 +262,15 @@ namespace native_io {
 #ifndef _WIN32
                         else if (r.kind == operation::readable) {
                             co_await detail::asio_wait(*descriptor, r.events, error);
-                            if (!error) result = detail::poll_events(r);
+                            if (!error)
+                                result = detail::poll_events(r);
                         }
 #endif
-                        else throw std::system_error(std::make_error_code(std::errc::invalid_argument));
+                        else
+                            throw std::system_error(std::make_error_code(std::errc::invalid_argument));
                     } else if (r.kind == operation::accept) {
-                        auto peer = co_await std::get<detail::asio_resource::acceptor>(resource->value).async_accept(asio::redirect_error(asio::use_awaitable, error));
+                        auto peer =
+                            co_await std::get<detail::asio_resource::acceptor>(resource->value).async_accept(asio::redirect_error(asio::use_awaitable, error));
                         if (!error) {
                             result = peer.release();
                             configure_stream(result);
@@ -246,17 +280,30 @@ namespace native_io {
                             co_await detail::asio_wait(*stream, r.events, error);
                         else if (auto* datagram = std::get_if<asio::ip::udp::socket>(&resource->value))
                             co_await detail::asio_wait(*datagram, r.events, error);
-                        else co_await detail::asio_wait(std::get<detail::asio_resource::acceptor>(resource->value), r.events, error);
-                        if (!error) result = detail::poll_events(r);
+                        else
+                            co_await detail::asio_wait(std::get<detail::asio_resource::acceptor>(resource->value), r.events, error);
+                        if (!error)
+                            result = detail::poll_events(r);
                     } else if (auto* stream = std::get_if<detail::asio_resource::stream::socket>(&resource->value)) {
                         switch (r.kind) {
                         case operation::connect:
-                            co_await stream->async_connect(detail::asio_endpoint<detail::asio_resource::stream::endpoint>(r.address), asio::redirect_error(asio::use_awaitable, error)); break;
-                        case operation::read: result = co_await stream->async_read_some(sequence, asio::redirect_error(asio::use_awaitable, error)); break;
-                        case operation::write: result = co_await stream->async_write_some(sequence, asio::redirect_error(asio::use_awaitable, error)); break;
-                        case operation::receive: result = co_await stream->async_receive(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error)); break;
-                        case operation::send: result = co_await stream->async_send(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error)); break;
-                        default: throw std::system_error(std::make_error_code(std::errc::invalid_argument));
+                            co_await stream->async_connect(detail::asio_endpoint<detail::asio_resource::stream::endpoint>(r.address),
+                                                           asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        case operation::read:
+                            result = co_await stream->async_read_some(sequence, asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        case operation::write:
+                            result = co_await stream->async_write_some(sequence, asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        case operation::receive:
+                            result = co_await stream->async_receive(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        case operation::send:
+                            result = co_await stream->async_send(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        default:
+                            throw std::system_error(std::make_error_code(std::errc::invalid_argument));
                         }
                     } else {
                         auto& datagram = std::get<asio::ip::udp::socket>(resource->value);
@@ -264,18 +311,27 @@ namespace native_io {
                         auto receive = asio::redirect_error(asio::use_awaitable, error);
                         switch (r.kind) {
                         case operation::read:
-                        case operation::receive: result = co_await datagram.async_receive(sequence, r.flags, receive); break;
+                        case operation::receive:
+                            result = co_await datagram.async_receive(sequence, r.flags, receive);
+                            break;
                         case operation::write:
-                        case operation::send: result = co_await datagram.async_send(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error)); break;
+                        case operation::send:
+                            result = co_await datagram.async_send(sequence, r.flags, asio::redirect_error(asio::use_awaitable, error));
+                            break;
                         case operation::receive_from:
                             result = co_await datagram.async_receive_from(sequence, endpoint, r.flags, receive);
                             std::memcpy(r.address.data(), endpoint.data(), endpoint.size());
-                            r.address.length = endpoint.size(); break;
+                            r.address.length = endpoint.size();
+                            break;
                         case operation::send_to:
-                            result = co_await datagram.async_send_to(sequence, detail::asio_endpoint<asio::ip::udp::endpoint>(r.address), r.flags, asio::redirect_error(asio::use_awaitable, error)); break;
-                        default: throw std::system_error(std::make_error_code(std::errc::invalid_argument));
+                            result = co_await datagram.async_send_to(sequence, detail::asio_endpoint<asio::ip::udp::endpoint>(r.address), r.flags,
+                                                                     asio::redirect_error(asio::use_awaitable, error));
+                            break;
+                        default:
+                            throw std::system_error(std::make_error_code(std::errc::invalid_argument));
                         }
-                        if (error == asio::error::message_size) error.clear();
+                        if (error == asio::error::message_size)
+                            error.clear();
                     }
                 }
             } catch (const std::system_error& failure) {
@@ -286,13 +342,15 @@ namespace native_io {
             if (error == asio::error::eof
 #ifdef _WIN32
                 || (r.kind == operation::read &&
-                    (error == asio::error::broken_pipe ||
-                     error == std::error_code{ERROR_NO_DATA, asio::error::get_system_category()}))
+                    (error == asio::error::broken_pipe || error == std::error_code{ERROR_NO_DATA, asio::error::get_system_category()}))
 #endif
-            ) { error.clear(); result = 0; }
-            else if (error) {
+            ) {
+                error.clear();
+                result = 0;
+            } else if (error) {
                 result = -1;
-                if (error == asio::error::operation_aborted) error = std::make_error_code(std::errc::operation_canceled);
+                if (error == asio::error::operation_aborted)
+                    error = std::make_error_code(std::errc::operation_canceled);
             }
             r.result = result;
             r.error = error;
@@ -300,12 +358,16 @@ namespace native_io {
         auto execute(request& r) -> asio::awaitable<void> {
             detail::asio_data(r).pending->started = true;
             try {
-                if (r.cancelled.load(std::memory_order_acquire) || r.is_closed()) r.result = -1;
-                else co_await perform(r);
+                if (r.cancelled.load(std::memory_order_acquire) || r.is_closed())
+                    r.result = -1;
+                else
+                    co_await perform(r);
             } catch (const std::system_error& error) {
-                r.result = -1; r.error = error.code();
+                r.result = -1;
+                r.error = error.code();
             } catch (...) {
-                r.result = -1; r.error = std::make_error_code(std::errc::not_enough_memory);
+                r.result = -1;
+                r.error = std::make_error_code(std::errc::not_enough_memory);
             }
             // Complete after the operation and its cancellation slot are gone.
             r.result_ready = true;
@@ -316,7 +378,8 @@ namespace native_io {
     void detail::asio_loop::signal() noexcept { impl_->context.stop(); }
     void detail::asio_loop::restart() { impl_->context.restart(); }
     void detail::asio_loop::run_one(bool pending) {
-        if (!pending) impl_->context.run_one();
+        if (!pending)
+            impl_->context.run_one();
         impl_->context.poll();
     }
     void detail::asio_loop::close(handle file) noexcept {
@@ -335,8 +398,7 @@ namespace native_io {
         auto pending = std::make_shared<asio_operation>();
         asio_data(r).pending = pending.get();
         r.result_ready = false;
-        asio::co_spawn(impl_->context, impl_->execute(r),
-            asio::bind_cancellation_slot(pending->signal.slot(), asio::consign(asio::detached, pending)));
+        asio::co_spawn(impl_->context, impl_->execute(r), asio::bind_cancellation_slot(pending->signal.slot(), asio::consign(asio::detached, pending)));
     }
     void detail::asio_loop::cancel(request& r) noexcept {
         auto& pending = *asio_data(r).pending;
@@ -345,4 +407,4 @@ namespace native_io {
             pending.signal.emit(asio::cancellation_type::all);
         }
     }
-}
+} // namespace native_io

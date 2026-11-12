@@ -24,11 +24,10 @@ namespace native_io {
         };
         static_assert(sizeof(request_state) <= sizeof(request::native));
         auto state(request& r) noexcept -> request_state& { return *std::launder(reinterpret_cast<request_state*>(r.native.data())); }
-    } // namespace
+    } // namespace detail
     using namespace detail;
 
-    template <template <class> class Queue>
-    struct engine<Queue>::impl : detail::queue<Queue> {
+    template <template <class> class Queue> struct engine<Queue>::impl : detail::queue<Queue> {
         using detail::queue<Queue>::active;
         using detail::queue<Queue>::take;
         using detail::queue<Queue>::track;
@@ -81,7 +80,8 @@ namespace native_io {
                 work_ready.acquire();
                 request* r;
                 while (!work.try_pop(r)) {
-                    if (closing.load(std::memory_order_acquire)) return;
+                    if (closing.load(std::memory_order_acquire))
+                        return;
                     std::this_thread::yield();
                 }
                 if (!r->cancelled.load(std::memory_order_acquire) && !r->is_closed()) {
@@ -106,7 +106,8 @@ namespace native_io {
             if (s.secondary) {
                 struct kevent extra;
                 EV_SET(&extra, static_cast<uintptr_t>(r.file), EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-                while (::kevent(descriptor, &extra, 1, nullptr, 0, nullptr) < 0 && errno == EINTR) {}
+                while (::kevent(descriptor, &extra, 1, nullptr, 0, nullptr) < 0 && errno == EINTR) {
+                }
                 s.secondary = false;
             }
             if (!s.filter)
@@ -122,7 +123,8 @@ namespace native_io {
                 if (other != &r && other->file == r.file && (state(*other).filter == filter || (filter == EVFILT_READ && state(*other).secondary)))
                     throw std::system_error(std::make_error_code(std::errc::operation_in_progress));
             struct kevent event;
-            EV_SET(&event, static_cast<uintptr_t>(r.file), filter, EV_ADD | (r.kind == operation::readable && !(r.events & 3) ? EV_CLEAR : EV_ONESHOT), 0, 0, &r);
+            EV_SET(&event, static_cast<uintptr_t>(r.file), filter, EV_ADD | (r.kind == operation::readable && !(r.events & 3) ? EV_CLEAR : EV_ONESHOT), 0, 0,
+                   &r);
             if (::kevent(descriptor, &event, 1, nullptr, 0, nullptr) < 0)
                 throw std::system_error(errno, std::generic_category(), "kevent register");
             state(r).filter = filter;
@@ -148,13 +150,18 @@ namespace native_io {
             }
             if (!s.ready)
                 return;
-            if (r.kind != operation::readable) disarm(r);
+            if (r.kind != operation::readable)
+                disarm(r);
             s.ready = false;
             auto fd = static_cast<int>(r.file);
             std::array<iovec, max_buffers> buffers{};
             auto count = r.buffer_count;
-            for (unsigned i = 0; i < count; ++i) buffers[i] = {r.buffers[i].data, r.buffers[i].size};
-            if (!count) { buffers[0] = {r.buffer, r.size}; count = 1; }
+            for (unsigned i = 0; i < count; ++i)
+                buffers[i] = {r.buffers[i].data, r.buffers[i].size};
+            if (!count) {
+                buffers[0] = {r.buffer, r.size};
+                count = 1;
+            }
             ssize_t result = 0;
             short filter = EVFILT_READ;
             switch (r.kind) {
@@ -244,13 +251,20 @@ namespace native_io {
             case operation::readable: {
                 pollfd fd{static_cast<int>(r.file), static_cast<short>((r.events & 1 ? POLLIN : 0) | (r.events & 2 ? POLLOUT : 0)), 0};
                 auto ready = ::poll(&fd, 1, 0);
-                if (ready < 0) { auto error = errno; disarm(r); errno = error; result = -1; break; }
+                if (ready < 0) {
+                    auto error = errno;
+                    disarm(r);
+                    errno = error;
+                    result = -1;
+                    break;
+                }
                 if (ready) {
                     disarm(r);
                     result = (fd.revents & POLLIN && r.events & 1 ? 1 : 0) | (fd.revents & POLLOUT && r.events & 2 ? 2 : 0) | (fd.revents & POLLERR ? 4 : 0);
                     break;
                 }
-                if (!(r.events & 3) && s.filter) return;
+                if (!(r.events & 3) && s.filter)
+                    return;
                 disarm(r);
                 arm(r, r.events & 2 ? EVFILT_WRITE : EVFILT_READ);
                 if ((r.events & 3) == 3) {
@@ -259,7 +273,8 @@ namespace native_io {
                             throw std::system_error(std::make_error_code(std::errc::operation_in_progress));
                     struct kevent extra;
                     EV_SET(&extra, static_cast<uintptr_t>(r.file), EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, &r);
-                    if (::kevent(descriptor, &extra, 1, nullptr, 0, nullptr) < 0) throw std::system_error(errno, std::generic_category(), "kevent read wait");
+                    if (::kevent(descriptor, &extra, 1, nullptr, 0, nullptr) < 0)
+                        throw std::system_error(errno, std::generic_category(), "kevent read wait");
                     s.secondary = true;
                 }
                 return;
@@ -335,14 +350,10 @@ namespace native_io {
             }
         }
     };
-    template <template <class> class Queue>
-    engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
-    template <template <class> class Queue>
-    engine<Queue>::~engine() = default;
-    template <template <class> class Queue>
-    auto engine<Queue>::name() noexcept -> const char* { return "kqueue-readv-writev"; }
-    template <template <class> class Queue>
-    void engine<Queue>::start(request& r) noexcept {
+    template <template <class> class Queue> engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
+    template <template <class> class Queue> engine<Queue>::~engine() = default;
+    template <template <class> class Queue> auto engine<Queue>::name() noexcept -> const char* { return "kqueue-readv-writev"; }
+    template <template <class> class Queue> void engine<Queue>::start(request& r) noexcept {
         r.rejected = false;
         if (auto error = impl_->push(r)) {
             r.rejected = true;
@@ -351,23 +362,19 @@ namespace native_io {
         }
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel(request& r) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel(request& r) noexcept {
         r.cancelled.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel_file(handle file) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel_file(handle file) noexcept {
         impl_->mark_closed(file);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::stop() noexcept {
+    template <template <class> class Queue> void engine<Queue>::stop() noexcept {
         impl_->stopped.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::run() {
+    template <template <class> class Queue> void engine<Queue>::run() {
         if (impl_->stopped.exchange(false, std::memory_order_acquire))
             return;
         for (;;) {

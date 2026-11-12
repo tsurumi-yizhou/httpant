@@ -18,16 +18,19 @@ namespace {
     template <class T> class single {
         std::mutex mutex_;
         std::optional<T> item_;
+
     public:
         auto push(T value) -> bool {
             std::lock_guard lock{mutex_};
-            if (item_) return false;
+            if (item_)
+                return false;
             item_.emplace(std::move(value));
             return true;
         }
         auto try_pop(T& value) -> bool {
             std::lock_guard lock{mutex_};
-            if (!item_) return false;
+            if (!item_)
+                return false;
             value = std::move(*item_);
             item_.reset();
             return true;
@@ -44,7 +47,8 @@ namespace {
                     auto& self = static_cast<post&>(r);
                     self.failure = error;
                     self.done = true;
-                    if (self.file == 123456) self.owner->stop();
+                    if (self.file == 123456)
+                        self.owner->stop();
                 };
             }
         } first{engine}, second{engine};
@@ -57,17 +61,21 @@ namespace {
         require(first.done && first.failure == std::errc::operation_canceled, "close sweep before submission");
     }
     auto address(std::uint16_t port = 0) -> native_io::socket_address {
-        const unsigned char bytes[]{127, 0, 0, 1}; return native_io::make_address(false, bytes, port);
+        const unsigned char bytes[]{127, 0, 0, 1};
+        return native_io::make_address(false, bytes, port);
     }
     auto listener() -> native_io::handle {
         auto h = native_io::open_socket(false, false);
-        native_io::bind(h, address()); native_io::listen(h, 1024); return h;
+        native_io::bind(h, address());
+        native_io::listen(h, 1024);
+        return h;
     }
     struct socket_owner {
         native_io::handle value = native_io::invalid_handle;
         native_io::engine<>* engine;
         void close() noexcept {
-            if (value == native_io::invalid_handle) return;
+            if (value == native_io::invalid_handle)
+                return;
             engine->cancel_file(value);
             native_io::close_socket(std::exchange(value, native_io::invalid_handle));
         }
@@ -319,7 +327,8 @@ namespace {
         address.length = size;
         auto open = [&] {
             auto socket = ::socket(AF_UNIX, SOCK_STREAM, 0);
-            if (socket < 0) throw std::system_error(errno, std::generic_category());
+            if (socket < 0)
+                throw std::system_error(errno, std::generic_category());
             if (::fcntl(socket, F_SETFL, O_NONBLOCK) < 0) {
                 auto error = errno;
                 ::close(socket);

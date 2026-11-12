@@ -8,7 +8,7 @@ module;
 #include <cstdlib>
 
 #if __has_include(<dispatch/dispatch.h>)
-#  include <dispatch/dispatch.h>
+#include <dispatch/dispatch.h>
 #endif
 
 #define STDEXEC_IN_MODULE_PURVIEW
@@ -16,7 +16,7 @@ module;
 #include <stdexec/__detail/__config.hpp>
 
 #if STDEXEC_ENABLE_NUMA
-#  include <numa.h>
+#include <numa.h>
 #endif
 
 // The standard execution core and its extensions have one module owner.
@@ -51,4 +51,4 @@ export namespace httpant::stdexec_ext {
 
     template <class Scheduler>
     concept timed_scheduler = experimental::execution::timed_scheduler<Scheduler>;
-}
+} // namespace httpant::stdexec_ext

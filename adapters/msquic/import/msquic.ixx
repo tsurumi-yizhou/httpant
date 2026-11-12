@@ -5,15 +5,15 @@ module;
 export module httpant.dependencies.msquic;
 
 namespace httpant::dependencies::detail {
-inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET = QUIC_ADDRESS_FAMILY_INET;
-inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET6 = QUIC_ADDRESS_FAMILY_INET6;
-inline constexpr auto module_QUIC_STATUS_INTERNAL_ERROR = QUIC_STATUS_INTERNAL_ERROR;
-inline constexpr auto module_QUIC_STATUS_OUT_OF_MEMORY = QUIC_STATUS_OUT_OF_MEMORY;
-inline constexpr auto module_QUIC_STATUS_PENDING = QUIC_STATUS_PENDING;
-inline constexpr auto module_QUIC_STATUS_CONNECTION_REFUSED = QUIC_STATUS_CONNECTION_REFUSED;
-inline constexpr auto module_QUIC_STATUS_SUCCESS = QUIC_STATUS_SUCCESS;
-using module_QUIC_STATUS = QUIC_STATUS;
-}
+    inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET = QUIC_ADDRESS_FAMILY_INET;
+    inline constexpr auto module_QUIC_ADDRESS_FAMILY_INET6 = QUIC_ADDRESS_FAMILY_INET6;
+    inline constexpr auto module_QUIC_STATUS_INTERNAL_ERROR = QUIC_STATUS_INTERNAL_ERROR;
+    inline constexpr auto module_QUIC_STATUS_OUT_OF_MEMORY = QUIC_STATUS_OUT_OF_MEMORY;
+    inline constexpr auto module_QUIC_STATUS_PENDING = QUIC_STATUS_PENDING;
+    inline constexpr auto module_QUIC_STATUS_CONNECTION_REFUSED = QUIC_STATUS_CONNECTION_REFUSED;
+    inline constexpr auto module_QUIC_STATUS_SUCCESS = QUIC_STATUS_SUCCESS;
+    using module_QUIC_STATUS = QUIC_STATUS;
+} // namespace httpant::dependencies::detail
 
 #undef QUIC_ADDRESS_FAMILY_INET
 export inline constexpr auto QUIC_ADDRESS_FAMILY_INET = httpant::dependencies::detail::module_QUIC_ADDRESS_FAMILY_INET;
@@ -87,9 +87,9 @@ export using ::QUIC_STREAM_START_FLAG_IMMEDIATE;
 export using ::QuicAddr;
 
 export namespace httpant::dependencies {
-inline bool quic_failed(QUIC_STATUS status) noexcept { return QUIC_FAILED(status); }
-inline bool quic_succeeded(QUIC_STATUS status) noexcept { return QUIC_SUCCEEDED(status); }
-}
+    inline bool quic_failed(QUIC_STATUS status) noexcept { return QUIC_FAILED(status); }
+    inline bool quic_succeeded(QUIC_STATUS status) noexcept { return QUIC_SUCCEEDED(status); }
+} // namespace httpant::dependencies
 
 export using ::CleanUpManual;
 export using ::sockaddr_in;
@@ -97,20 +97,18 @@ export using ::sockaddr_in6;
 
 // Keep the platform byte-order helper inside this module's object file.
 export namespace httpant::dependencies {
-void set_quic_address_port(QuicAddr& address, uint16_t port) {
-    address.SetPort(port);
-}
-}
+    void set_quic_address_port(QuicAddr& address, uint16_t port) { address.SetPort(port); }
+} // namespace httpant::dependencies
 
 export using ::QUIC_CREDENTIAL_CONFIG;
 export using ::QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE;
 export namespace httpant::dependencies {
-inline constexpr auto listener_address = QUIC_PARAM_LISTENER_LOCAL_ADDRESS;
-inline constexpr auto connection_local_address = QUIC_PARAM_CONN_LOCAL_ADDRESS;
-inline constexpr auto connection_remote_address = QUIC_PARAM_CONN_REMOTE_ADDRESS;
-inline constexpr auto stream_id = QUIC_PARAM_STREAM_ID;
-inline auto quic_port(const QUIC_ADDR& address) -> uint16_t { return QuicAddrGetPort(&address); }
-// QuicAddrGetFamily has internal linkage in the msquic headers, so it cannot be
-// re-exported; this wrapper keeps the helper reachable for module consumers.
-inline auto quic_family(const QUIC_ADDR& address) -> QUIC_ADDRESS_FAMILY { return QuicAddrGetFamily(&address); }
-}
+    inline constexpr auto listener_address = QUIC_PARAM_LISTENER_LOCAL_ADDRESS;
+    inline constexpr auto connection_local_address = QUIC_PARAM_CONN_LOCAL_ADDRESS;
+    inline constexpr auto connection_remote_address = QUIC_PARAM_CONN_REMOTE_ADDRESS;
+    inline constexpr auto stream_id = QUIC_PARAM_STREAM_ID;
+    inline auto quic_port(const QUIC_ADDR& address) -> uint16_t { return QuicAddrGetPort(&address); }
+    // QuicAddrGetFamily has internal linkage in the msquic headers, so it cannot be
+    // re-exported; this wrapper keeps the helper reachable for module consumers.
+    inline auto quic_family(const QUIC_ADDR& address) -> QUIC_ADDRESS_FAMILY { return QuicAddrGetFamily(&address); }
+} // namespace httpant::dependencies
