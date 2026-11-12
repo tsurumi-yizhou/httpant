@@ -20,15 +20,12 @@ namespace native_io {
             std::array<iovec, max_buffers> buffers{};
         };
         static_assert(sizeof(datagram_state) <= sizeof(request::native));
-        auto datagram(request& r) noexcept -> datagram_state& {
-            return *std::launder(reinterpret_cast<datagram_state*>(r.native.data()));
-        }
+        auto datagram(request& r) noexcept -> datagram_state& { return *std::launder(reinterpret_cast<datagram_state*>(r.native.data())); }
 
-    }
+    } // namespace detail
     using namespace detail;
 
-    template <template <class> class Queue>
-    struct engine<Queue>::impl : detail::queue<Queue> {
+    template <template <class> class Queue> struct engine<Queue>::impl : detail::queue<Queue> {
         using detail::queue<Queue>::active;
         using detail::queue<Queue>::take;
         using detail::queue<Queue>::track;
@@ -123,8 +120,12 @@ namespace native_io {
             case operation::send_to: {
                 auto* state = ::new (r.native.data()) datagram_state{};
                 auto count = r.buffer_count;
-                for (unsigned i = 0; i < count; ++i) state->buffers[i] = {r.buffers[i].data, r.buffers[i].size};
-                if (!count) { state->buffers[0] = {r.buffer, size}; count = 1; }
+                for (unsigned i = 0; i < count; ++i)
+                    state->buffers[i] = {r.buffers[i].data, r.buffers[i].size};
+                if (!count) {
+                    state->buffers[0] = {r.buffer, size};
+                    count = 1;
+                }
                 if (r.kind == operation::receive_from || r.kind == operation::send_to) {
                     state->message.msg_name = r.address.data();
                     state->message.msg_namelen = r.kind == operation::send_to ? r.address.size() : r.address.bytes.size();
@@ -231,14 +232,10 @@ namespace native_io {
                 finish(*r, r->result, r->error);
         }
     };
-    template <template <class> class Queue>
-    engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
-    template <template <class> class Queue>
-    engine<Queue>::~engine() = default;
-    template <template <class> class Queue>
-    auto engine<Queue>::name() noexcept -> const char* { return "liburing"; }
-    template <template <class> class Queue>
-    void engine<Queue>::start(request& r) noexcept {
+    template <template <class> class Queue> engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
+    template <template <class> class Queue> engine<Queue>::~engine() = default;
+    template <template <class> class Queue> auto engine<Queue>::name() noexcept -> const char* { return "liburing"; }
+    template <template <class> class Queue> void engine<Queue>::start(request& r) noexcept {
         r.rejected = false;
         if (auto error = impl_->push(r)) {
             r.rejected = true;
@@ -247,25 +244,21 @@ namespace native_io {
         }
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel(request& r) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel(request& r) noexcept {
         r.cancelled.store(true, std::memory_order_release);
         impl_->cancellation_pending.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel_file(handle file) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel_file(handle file) noexcept {
         impl_->mark_closed(file);
         impl_->cancellation_pending.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::stop() noexcept {
+    template <template <class> class Queue> void engine<Queue>::stop() noexcept {
         impl_->stopped.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::run() {
+    template <template <class> class Queue> void engine<Queue>::run() {
         if (impl_->stopped.exchange(false, std::memory_order_acquire))
             return;
         struct running_guard {

@@ -18,13 +18,15 @@ export namespace native_io::detail {
                 std::lock_guard lock{mutex};
                 r.registered_next = registered;
                 r.registered_previous = &registered;
-                if (registered) registered->registered_previous = &r.registered_next;
+                if (registered)
+                    registered->registered_previous = &r.registered_next;
                 registered = &r;
             }
             pending_count.fetch_add(1, std::memory_order_release);
             std::error_code error;
             try {
-                if (pending.push(&r)) return {};
+                if (pending.push(&r))
+                    return {};
                 error = std::make_error_code(std::errc::no_buffer_space);
             } catch (const std::bad_alloc&) {
                 error = std::make_error_code(std::errc::not_enough_memory);
@@ -37,7 +39,8 @@ export namespace native_io::detail {
             std::lock_guard lock{mutex};
             if (auto** previous = std::exchange(r.registered_previous, nullptr)) {
                 *previous = r.registered_next;
-                if (r.registered_next) r.registered_next->registered_previous = previous;
+                if (r.registered_next)
+                    r.registered_next->registered_previous = previous;
             }
         }
         auto take(std::size_t limit = 64) noexcept -> request* {

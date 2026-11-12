@@ -17,11 +17,11 @@ namespace native_io {
             return {code, std::system_category()};
         }
         void check(HRESULT result, const char* what) {
-            if (FAILED(result)) throw std::system_error(ring_error(result), what);
+            if (FAILED(result))
+                throw std::system_error(ring_error(result), what);
         }
-    }
-    template <template <class> class Queue>
-    struct engine<Queue>::impl : detail::windows<Queue> {
+    } // namespace detail
+    template <template <class> class Queue> struct engine<Queue>::impl : detail::windows<Queue> {
         using detail::windows<Queue>::port;
         using detail::windows<Queue>::complete;
         HIORING ring = nullptr;
@@ -32,12 +32,14 @@ namespace native_io {
             check(::CreateIoRing(IORING_VERSION_3, IORING_CREATE_FLAGS{}, 256, 512, &ring), "CreateIoRing");
             try {
                 event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                if (!event) fail_win("CreateEvent ring");
+                if (!event)
+                    fail_win("CreateEvent ring");
                 check(::SetIoRingCompletionEvent(ring, event), "SetIoRingCompletionEvent");
                 wait.emplace(event, 2);
                 wait->watch(port);
             } catch (...) {
-                if (event) ::CloseHandle(event);
+                if (event)
+                    ::CloseHandle(event);
                 ::CloseIoRing(ring);
                 throw;
             }
@@ -52,11 +54,12 @@ namespace native_io {
             wait->watch(port);
         }
         void flush() override {
-            if (!std::exchange(dirty, false)) return;
+            if (!std::exchange(dirty, false))
+                return;
             UINT32 submitted = 0;
             check(::SubmitIoRing(ring, 0, 0, &submitted), "SubmitIoRing");
         }
-        template<class Build> void build(Build fn) {
+        template <class Build> void build(Build fn) {
             auto result = fn();
             if (result == IORING_E_SUBMISSION_QUEUE_FULL) {
                 flush();
@@ -87,14 +90,14 @@ namespace native_io {
                 return;
             }
             auto id = reinterpret_cast<UINT_PTR>(&r);
-            build([&] { return ::BuildIoRingCancelRequest(ring,
-                IoRingHandleRefFromHandle(reinterpret_cast<HANDLE>(r.file)), id, id | 1); });
+            build([&] { return ::BuildIoRingCancelRequest(ring, IoRingHandleRefFromHandle(reinterpret_cast<HANDLE>(r.file)), id, id | 1); });
         }
         void drain() override {
             IORING_CQE entry{};
             for (;;) {
                 auto result = ::PopIoRingCompletion(ring, &entry);
-                if (result == S_FALSE) break;
+                if (result == S_FALSE)
+                    break;
                 check(result, "PopIoRingCompletion");
                 auto id = entry.UserData;
                 auto& r = *reinterpret_cast<request*>(id & ~UINT_PTR{1});
@@ -115,14 +118,10 @@ namespace native_io {
             }
         }
     };
-    template <template <class> class Queue>
-    engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
-    template <template <class> class Queue>
-    engine<Queue>::~engine() = default;
-    template <template <class> class Queue>
-    auto engine<Queue>::name() noexcept -> const char* { return "windows-io-ring"; }
-    template <template <class> class Queue>
-    void engine<Queue>::start(request& r) noexcept {
+    template <template <class> class Queue> engine<Queue>::engine() : impl_(std::make_unique<impl>()) {}
+    template <template <class> class Queue> engine<Queue>::~engine() = default;
+    template <template <class> class Queue> auto engine<Queue>::name() noexcept -> const char* { return "windows-io-ring"; }
+    template <template <class> class Queue> void engine<Queue>::start(request& r) noexcept {
         r.rejected = false;
         if (auto error = impl_->push(r)) {
             r.rejected = true;
@@ -131,18 +130,17 @@ namespace native_io {
         }
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel(request& r) noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel(request& r) noexcept {
         r.cancelled.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::cancel_file(handle file) noexcept { impl_->mark_closed(file); impl_->signal(); }
-    template <template <class> class Queue>
-    void engine<Queue>::stop() noexcept {
+    template <template <class> class Queue> void engine<Queue>::cancel_file(handle file) noexcept {
+        impl_->mark_closed(file);
+        impl_->signal();
+    }
+    template <template <class> class Queue> void engine<Queue>::stop() noexcept {
         impl_->stopped.store(true, std::memory_order_release);
         impl_->signal();
     }
-    template <template <class> class Queue>
-    void engine<Queue>::run() { impl_->run(); }
+    template <template <class> class Queue> void engine<Queue>::run() { impl_->run(); }
 } // namespace native_io

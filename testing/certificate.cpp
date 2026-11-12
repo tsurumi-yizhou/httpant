@@ -2,62 +2,70 @@ import std;
 import httpant.dependencies.wolfssl;
 
 namespace {
-int check(int result, std::string_view action) {
-    if (result < 0) throw std::runtime_error(std::format("{}: wolfSSL error {}", action, result));
-    return result;
-}
-struct random_source {
-    WC_RNG value{};
-    random_source() { check(wc_InitRng(&value), "initialize random source"); }
-    ~random_source() { wc_FreeRng(&value); }
-};
-struct private_key {
-    ecc_key value{};
-    private_key() { check(wc_ecc_init(&value), "initialize EC key"); }
-    ~private_key() { wc_ecc_free(&value); }
-};
-bool current(const std::filesystem::path& cert, const std::filesystem::path& key) {
-    if (!std::filesystem::exists(key)) return false;
-    auto* parsed = wolfSSL_X509_load_certificate_file(cert.string().c_str(), WOLFSSL_FILETYPE_PEM);
-    if (!parsed) return false;
-    const unsigned char* date = nullptr;
-    unsigned char format = 0;
-    int length = 0;
-    std::tm calendar{};
-    auto info = wc_GetDateInfo(wolfSSL_X509_notAfter(parsed), 32, &date, &format, &length);
-    auto result = info == 0 ? wc_GetDateAsCalendarTime(date, length, format, &calendar) : info;
-    wolfSSL_X509_free(parsed);
-    if (result != 0) return false;
-    using namespace std::chrono;
-    auto expires = sys_days{year{calendar.tm_year + 1900}/month{unsigned(calendar.tm_mon + 1)}/day{unsigned(calendar.tm_mday)}} +
-        hours{calendar.tm_hour} + minutes{calendar.tm_min} + seconds{calendar.tm_sec};
-    return expires > system_clock::now() + days{1};
-}
-void date(unsigned char* output, int& size, std::chrono::sys_seconds time) {
-    auto text = std::format("{:%Y%m%d%H%M%S}Z", time);
-    output[0] = 0x18;
-    output[1] = static_cast<unsigned char>(text.size());
-    std::memcpy(output + 2, text.data(), text.size());
-    size = static_cast<int>(text.size() + 2);
-}
-void pem(const std::filesystem::path& path, std::span<const unsigned char> der, int type) {
-    std::array<unsigned char, 8192> output;
-    auto size = check(wc_DerToPem(der.data(), der.size(), output.data(), output.size(), type), "encode PEM");
-    std::ofstream file{path, std::ios::binary | std::ios::trunc};
-    file.exceptions(std::ios::badbit | std::ios::failbit);
-    file.write(reinterpret_cast<const char*>(output.data()), size);
-    file.close();
-}
-}
+    int check(int result, std::string_view action) {
+        if (result < 0)
+            throw std::runtime_error(std::format("{}: wolfSSL error {}", action, result));
+        return result;
+    }
+    struct random_source {
+        WC_RNG value{};
+        random_source() { check(wc_InitRng(&value), "initialize random source"); }
+        ~random_source() { wc_FreeRng(&value); }
+    };
+    struct private_key {
+        ecc_key value{};
+        private_key() { check(wc_ecc_init(&value), "initialize EC key"); }
+        ~private_key() { wc_ecc_free(&value); }
+    };
+    bool current(const std::filesystem::path& cert, const std::filesystem::path& key) {
+        if (!std::filesystem::exists(key))
+            return false;
+        auto* parsed = wolfSSL_X509_load_certificate_file(cert.string().c_str(), WOLFSSL_FILETYPE_PEM);
+        if (!parsed)
+            return false;
+        const unsigned char* date = nullptr;
+        unsigned char format = 0;
+        int length = 0;
+        std::tm calendar{};
+        auto info = wc_GetDateInfo(wolfSSL_X509_notAfter(parsed), 32, &date, &format, &length);
+        auto result = info == 0 ? wc_GetDateAsCalendarTime(date, length, format, &calendar) : info;
+        wolfSSL_X509_free(parsed);
+        if (result != 0)
+            return false;
+        using namespace std::chrono;
+        auto expires = sys_days{year{calendar.tm_year + 1900} / month{unsigned(calendar.tm_mon + 1)} / day{unsigned(calendar.tm_mday)}} +
+                       hours{calendar.tm_hour} + minutes{calendar.tm_min} + seconds{calendar.tm_sec};
+        return expires > system_clock::now() + days{1};
+    }
+    void date(unsigned char* output, int& size, std::chrono::sys_seconds time) {
+        auto text = std::format("{:%Y%m%d%H%M%S}Z", time);
+        output[0] = 0x18;
+        output[1] = static_cast<unsigned char>(text.size());
+        std::memcpy(output + 2, text.data(), text.size());
+        size = static_cast<int>(text.size() + 2);
+    }
+    void pem(const std::filesystem::path& path, std::span<const unsigned char> der, int type) {
+        std::array<unsigned char, 8192> output;
+        auto size = check(wc_DerToPem(der.data(), der.size(), output.data(), output.size(), type), "encode PEM");
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        file.exceptions(std::ios::badbit | std::ios::failbit);
+        file.write(reinterpret_cast<const char*>(output.data()), size);
+        file.close();
+    }
+} // namespace
 
 int main(int argc, char** argv) {
     try {
-        if (argc != 2) throw std::invalid_argument("expected an existing build directory");
+        if (argc != 2)
+            throw std::invalid_argument("expected an existing build directory");
         std::filesystem::path directory{argv[1]};
-        if (!std::filesystem::is_directory(directory)) throw std::invalid_argument("build directory does not exist");
-        if (wolfSSL_Init() != WOLFSSL_SUCCESS) throw std::runtime_error("TLS initialization failed");
+        if (!std::filesystem::is_directory(directory))
+            throw std::invalid_argument("build directory does not exist");
+        if (wolfSSL_Init() != WOLFSSL_SUCCESS)
+            throw std::runtime_error("TLS initialization failed");
         auto cert_path = directory / "quic-cert.pem", key_path = directory / "quic-key.pem";
-        if (current(cert_path, key_path)) return 0;
+        if (current(cert_path, key_path))
+            return 0;
         random_source random;
         private_key key;
         check(wc_ecc_make_key_ex(&random.value, 32, &key.value, ECC_SECP256R1), "generate P-256 key");

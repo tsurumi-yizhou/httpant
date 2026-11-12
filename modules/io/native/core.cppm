@@ -24,7 +24,10 @@ export namespace native_io {
     enum class operation { post, read, write, read_at, write_at, connect, accept, readable, timer, receive, receive_from, send, send_to };
 
     inline constexpr std::size_t max_buffers = 16;
-    struct buffer { void* data = nullptr; std::size_t size = 0; };
+    struct buffer {
+        void* data = nullptr;
+        std::size_t size = 0;
+    };
 
     struct alignas(std::max_align_t) request {
         operation kind = operation::post;
@@ -62,8 +65,7 @@ export namespace native_io {
         alignas(std::max_align_t) std::array<std::byte, 512> native;
     };
 
-    template <template <class> class Queue = http::queues::locked>
-    class engine {
+    template <template <class> class Queue = http::queues::locked> class engine {
     public:
         engine();
         ~engine();
@@ -109,8 +111,8 @@ export namespace http::io::net {
             constexpr address_v4() noexcept = default;
             constexpr explicit address_v4(bytes_type bytes) noexcept : bytes_(bytes) {}
             constexpr explicit address_v4(uint_type value) noexcept
-                : bytes_{static_cast<unsigned char>(value >> 24), static_cast<unsigned char>(value >> 16),
-                         static_cast<unsigned char>(value >> 8), static_cast<unsigned char>(value)} {}
+                : bytes_{static_cast<unsigned char>(value >> 24), static_cast<unsigned char>(value >> 16), static_cast<unsigned char>(value >> 8),
+                         static_cast<unsigned char>(value)} {}
             constexpr auto to_bytes() const noexcept -> bytes_type { return bytes_; }
             constexpr auto to_uint() const noexcept -> uint_type {
                 return (uint_type{bytes_[0]} << 24) | (uint_type{bytes_[1]} << 16) | (uint_type{bytes_[2]} << 8) | bytes_[3];
@@ -124,6 +126,7 @@ export namespace http::io::net {
             static constexpr auto broadcast() noexcept -> address_v4 { return address_v4{0xffffffff}; }
             auto operator==(const address_v4&) const -> bool = default;
             auto operator<=>(const address_v4&) const = default;
+
         private:
             bytes_type bytes_{};
         };
@@ -140,9 +143,14 @@ export namespace http::io::net {
             constexpr auto is_loopback() const noexcept -> bool { return *this == loopback(); }
             constexpr auto is_multicast() const noexcept -> bool { return bytes_[0] == 255; }
             static constexpr auto any() noexcept -> address_v6 { return {}; }
-            static constexpr auto loopback() noexcept -> address_v6 { bytes_type bytes{}; bytes[15] = 1; return address_v6{bytes}; }
+            static constexpr auto loopback() noexcept -> address_v6 {
+                bytes_type bytes{};
+                bytes[15] = 1;
+                return address_v6{bytes};
+            }
             auto operator==(const address_v6&) const -> bool = default;
             auto operator<=>(const address_v6&) const = default;
+
         private:
             bytes_type bytes_{};
             unsigned long scope_ = 0;
@@ -156,42 +164,64 @@ export namespace http::io::net {
             constexpr auto is_v6() const noexcept -> bool { return value_.index() == 1; }
             auto to_v4() const -> address_v4 { return std::get<address_v4>(value_); }
             auto to_v6() const -> address_v6 { return std::get<address_v6>(value_); }
-            auto to_string() const -> std::string { return std::visit([](auto a) { return a.to_string(); }, value_); }
-            auto is_loopback() const noexcept -> bool { return std::visit([](auto a) { return a.is_loopback(); }, value_); }
-            auto is_unspecified() const noexcept -> bool { return std::visit([](auto a) { return a.is_unspecified(); }, value_); }
-            auto is_multicast() const noexcept -> bool { return std::visit([](auto a) { return a.is_multicast(); }, value_); }
+            auto to_string() const -> std::string {
+                return std::visit([](auto a) { return a.to_string(); }, value_);
+            }
+            auto is_loopback() const noexcept -> bool {
+                return std::visit([](auto a) { return a.is_loopback(); }, value_);
+            }
+            auto is_unspecified() const noexcept -> bool {
+                return std::visit([](auto a) { return a.is_unspecified(); }, value_);
+            }
+            auto is_multicast() const noexcept -> bool {
+                return std::visit([](auto a) { return a.is_multicast(); }, value_);
+            }
             auto operator==(const address&) const -> bool = default;
             auto operator<=>(const address&) const = default;
+
         private:
             std::variant<address_v4, address_v6> value_;
         };
         inline auto make_address_v4(std::string_view text, std::error_code& error) noexcept -> address_v4 {
-            auto a = native_io::parse_address(text, false, error); address_v4::bytes_type bytes{};
-            if (error) return {};
-            native_io::address_bytes(a, bytes.data()); return address_v4{bytes};
+            auto a = native_io::parse_address(text, false, error);
+            address_v4::bytes_type bytes{};
+            if (error)
+                return {};
+            native_io::address_bytes(a, bytes.data());
+            return address_v4{bytes};
         }
         inline auto make_address_v6(std::string_view text, std::error_code& error) noexcept -> address_v6 {
-            auto a = native_io::parse_address(text, true, error); address_v6::bytes_type bytes{};
-            if (error) return {};
-            native_io::address_bytes(a, bytes.data()); return address_v6{bytes, native_io::address_scope(a)};
+            auto a = native_io::parse_address(text, true, error);
+            address_v6::bytes_type bytes{};
+            if (error)
+                return {};
+            native_io::address_bytes(a, bytes.data());
+            return address_v6{bytes, native_io::address_scope(a)};
         }
         inline auto make_address(std::string_view text, std::error_code& error) noexcept -> address {
-            if (text.find(':') != text.npos) return make_address_v6(text, error);
+            if (text.find(':') != text.npos)
+                return make_address_v6(text, error);
             return make_address_v4(text, error);
         }
         inline auto make_address_v4(std::string_view text) -> address_v4 {
-            std::error_code error; auto a = make_address_v4(text, error);
-            if (error) throw std::system_error(error);
+            std::error_code error;
+            auto a = make_address_v4(text, error);
+            if (error)
+                throw std::system_error(error);
             return a;
         }
         inline auto make_address_v6(std::string_view text) -> address_v6 {
-            std::error_code error; auto a = make_address_v6(text, error);
-            if (error) throw std::system_error(error);
+            std::error_code error;
+            auto a = make_address_v6(text, error);
+            if (error)
+                throw std::system_error(error);
             return a;
         }
         inline auto make_address(std::string_view text) -> address {
-            std::error_code error; auto a = make_address(text, error);
-            if (error) throw std::system_error(error);
+            std::error_code error;
+            auto a = make_address(text, error);
+            if (error)
+                throw std::system_error(error);
             return a;
         }
         template <class Protocol, template <class> class Queue = http::queues::locked> class basic_endpoint {
@@ -202,13 +232,25 @@ export namespace http::io::net {
             basic_endpoint(Protocol protocol, std::uint16_t port)
                 : basic_endpoint(protocol.family() == native_io::family(true) ? ip::address{address_v6{}} : ip::address{address_v4{}}, port) {}
             basic_endpoint(const ip::address& a, std::uint16_t port) {
-                if (a.is_v6()) { auto v = a.to_v6(); auto bytes = v.to_bytes(); value_ = native_io::make_address(true, bytes.data(), port, v.scope_id()); }
-                else { auto bytes = a.to_v4().to_bytes(); value_ = native_io::make_address(false, bytes.data(), port); }
+                if (a.is_v6()) {
+                    auto v = a.to_v6();
+                    auto bytes = v.to_bytes();
+                    value_ = native_io::make_address(true, bytes.data(), port, v.scope_id());
+                } else {
+                    auto bytes = a.to_v4().to_bytes();
+                    value_ = native_io::make_address(false, bytes.data(), port);
+                }
             }
             auto protocol() const noexcept -> Protocol { return native_io::is_v6(value_) ? Protocol::v6() : Protocol::v4(); }
             auto address() const -> ip::address {
-                if (native_io::is_v6(value_)) { address_v6::bytes_type bytes{}; native_io::address_bytes(value_, bytes.data()); return address_v6{bytes, native_io::address_scope(value_)}; }
-                address_v4::bytes_type bytes{}; native_io::address_bytes(value_, bytes.data()); return address_v4{bytes};
+                if (native_io::is_v6(value_)) {
+                    address_v6::bytes_type bytes{};
+                    native_io::address_bytes(value_, bytes.data());
+                    return address_v6{bytes, native_io::address_scope(value_)};
+                }
+                address_v4::bytes_type bytes{};
+                native_io::address_bytes(value_, bytes.data());
+                return address_v4{bytes};
             }
             void address(const ip::address& a) { *this = basic_endpoint{a, port()}; }
             auto port() const noexcept -> std::uint16_t { return native_io::address_port(value_); }
@@ -217,8 +259,13 @@ export namespace http::io::net {
             auto data() const noexcept -> const data_type* { return value_.data(); }
             auto size() const noexcept -> std::size_t { return value_.size(); }
             auto capacity() const noexcept -> std::size_t { return value_.bytes.size(); }
-            void resize(std::size_t n) { if (n > capacity()) throw std::length_error("endpoint size"); value_.length = static_cast<unsigned>(n); }
+            void resize(std::size_t n) {
+                if (n > capacity())
+                    throw std::length_error("endpoint size");
+                value_.length = static_cast<unsigned>(n);
+            }
             auto operator==(const basic_endpoint& other) const -> bool { return address() == other.address() && port() == other.port(); }
+
         private:
             native_io::socket_address value_;
         };
@@ -232,7 +279,9 @@ export namespace http::io::net {
                 explicit no_delay(bool value = false) : value_(value) {}
                 auto value() const noexcept -> bool { return value_; }
                 static constexpr int key = 2;
-            private: bool value_;
+
+            private:
+                bool value_;
             };
             static auto v4() noexcept -> tcp { return tcp{false}; }
             static auto v6() noexcept -> tcp { return tcp{true}; }
@@ -240,6 +289,7 @@ export namespace http::io::net {
             auto type() const noexcept -> int { return 1; }
             auto protocol() const noexcept -> int { return 6; }
             auto operator==(const tcp&) const -> bool = default;
+
         private:
             explicit tcp(bool value) : v6_(value) {}
             bool v6_;
@@ -254,19 +304,28 @@ export namespace http::io::net {
             auto type() const noexcept -> int { return 2; }
             auto protocol() const noexcept -> int { return 17; }
             auto operator==(const udp&) const -> bool = default;
+
         private:
             explicit udp(bool value) : v6_(value) {}
             bool v6_;
         };
-    }
+    } // namespace ip
     class mutable_buffer {
     public:
         constexpr mutable_buffer() noexcept = default;
         constexpr mutable_buffer(void* p, std::size_t n) noexcept : data_(p), size_(n) {}
         constexpr auto data() const noexcept -> void* { return data_; }
         constexpr auto size() const noexcept -> std::size_t { return size_; }
-        auto operator+=(std::size_t n) noexcept -> mutable_buffer& { n = std::min(n, size_); data_ = static_cast<std::byte*>(data_) + n; size_ -= n; return *this; }
-    private: void* data_ = nullptr; std::size_t size_ = 0;
+        auto operator+=(std::size_t n) noexcept -> mutable_buffer& {
+            n = std::min(n, size_);
+            data_ = static_cast<std::byte*>(data_) + n;
+            size_ -= n;
+            return *this;
+        }
+
+    private:
+        void* data_ = nullptr;
+        std::size_t size_ = 0;
     };
     class const_buffer {
     public:
@@ -275,8 +334,16 @@ export namespace http::io::net {
         constexpr const_buffer(mutable_buffer b) noexcept : data_(b.data()), size_(b.size()) {}
         constexpr auto data() const noexcept -> const void* { return data_; }
         constexpr auto size() const noexcept -> std::size_t { return size_; }
-        auto operator+=(std::size_t n) noexcept -> const_buffer& { n = std::min(n, size_); data_ = static_cast<const std::byte*>(data_) + n; size_ -= n; return *this; }
-    private: const void* data_ = nullptr; std::size_t size_ = 0;
+        auto operator+=(std::size_t n) noexcept -> const_buffer& {
+            n = std::min(n, size_);
+            data_ = static_cast<const std::byte*>(data_) + n;
+            size_ -= n;
+            return *this;
+        }
+
+    private:
+        const void* data_ = nullptr;
+        std::size_t size_ = 0;
     };
     inline auto buffer(void* p, std::size_t n) noexcept -> mutable_buffer { return {p, n}; }
     inline auto buffer(const void* p, std::size_t n) noexcept -> const_buffer { return {p, n}; }
@@ -284,9 +351,7 @@ export namespace http::io::net {
     inline auto buffer(const_buffer b) noexcept -> const_buffer { return b; }
     template <class T, std::size_t N> auto buffer(std::span<T, N> bytes) noexcept { return buffer(bytes.data(), bytes.size_bytes()); }
     template <class T, std::size_t N> auto buffer(T (&a)[N]) noexcept { return buffer(a, N * sizeof(T)); }
-    template <class T> auto buffer(T& value) noexcept {
-        return buffer(std::data(value), std::size(value) * sizeof(*std::data(value)));
-    }
+    template <class T> auto buffer(T& value) noexcept { return buffer(std::data(value), std::size(value) * sizeof(*std::data(value))); }
     inline auto operator+(mutable_buffer b, std::size_t n) noexcept -> mutable_buffer { return b += n; }
     inline auto operator+(const_buffer b, std::size_t n) noexcept -> const_buffer { return b += n; }
     inline auto buffer_sequence_begin(const mutable_buffer& b) noexcept { return &b; }
@@ -311,7 +376,9 @@ export namespace http::io::net {
             explicit boolean_option(bool value = false) noexcept : value_(value) {}
             auto value() const noexcept -> bool { return value_; }
             static constexpr int key = Key;
-        private: bool value_;
+
+        private:
+            bool value_;
         };
         using reuse_address = boolean_option<0>;
         using keep_alive = boolean_option<1>;
@@ -323,4 +390,4 @@ export namespace http::io::net {
         return static_cast<socket_base::wait_type>(static_cast<int>(a) & static_cast<int>(b));
     }
 
-}
+} // namespace http::io::net
