@@ -400,8 +400,9 @@ dependencies with the same toolchain as Httpant.
 Options: `HTTPANT_BUILD_TESTS` and `HTTPANT_ENABLE_TLS` (default `ON` at top
 level), `HTTPANT_BUILD_EXAMPLES`, `HTTPANT_BUILD_BENCHMARKS` and
 `HTTPANT_ENABLE_IO` (default `OFF`). Every dependency
-comes from vcpkg through `cmake/toolchain.cmake`, built by the `*-xclang`
-triplets in `cmake/triplets`. The protocol needs llhttp, nghttp2, nghttp3 and
+comes from vcpkg at the microsoft/vcpkg baseline in `vcpkg-configuration.json`
+through `cmake/toolchain.cmake`, which writes the `*-xclang` triplet for the
+target into the build directory. The protocol needs llhttp, nghttp2, nghttp3 and
 stdexec; the engine adds liburing on Linux, and TLS, tests and examples add
 Asio, wolfSSL and Boost.UT. `cmake/dependencies.cmake` finds them for this build
 and for the installed package alike; nghttp2 and liburing install no CMake

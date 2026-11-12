@@ -21,7 +21,6 @@
             "inherits": "base",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_CXX_FLAGS_DEBUG": "-g0",
                 "HTTPANT_BUILD_EXAMPLES": "ON"
             }
         },
