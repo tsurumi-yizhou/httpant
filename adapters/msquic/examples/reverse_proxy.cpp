@@ -748,16 +748,16 @@ auto fetch_upstream_http2_response(const std::shared_ptr<proxy_state>& state,
     auto upstream_transport = co_await connect_upstream_h2_transport(state);
     using upstream_client = http::v2::client<tls_socket_stream>;
     upstream_client client{upstream_transport};
-    auto response = co_await http::coroutine::scoped(
-        client, [&](upstream_client& endpoint) -> http::task<proxied_response> {
-            auto body = http::buffer_body{std::move(content)};
-            auto received = co_await http::coroutine::request(endpoint, std::move(request), body);
-            auto response_content = co_await drain_body_to_vector(received.body);
-            co_return proxied_response{
-                .head = std::move(received.head),
-                .body = std::move(response_content),
-            };
-        });
+    auto run_session = [&](upstream_client& endpoint) -> http::task<proxied_response> {
+        auto body = http::buffer_body{std::move(content)};
+        auto received = co_await http::coroutine::request(endpoint, std::move(request), body);
+        auto response_content = co_await drain_body_to_vector(received.body);
+        co_return proxied_response{
+            .head = std::move(received.head),
+            .body = std::move(response_content),
+        };
+    };
+    auto response = co_await http::coroutine::scoped(client, std::move(run_session));
     co_await upstream_transport.close();
     co_return response;
 }
@@ -971,7 +971,7 @@ auto serve_http2_connection(tls_socket_stream transport,
 
     using downstream_server = http::v2::server<tls_socket_stream>;
     downstream_server server{transport};
-    co_await http::coroutine::scoped(server, [&](downstream_server& server) -> http::task<void> {
+    auto run_session = [&](downstream_server& server) -> http::task<void> {
         for (;;) {
             std::optional<downstream_server::incoming_request> incoming;
             try {
@@ -999,7 +999,8 @@ auto serve_http2_connection(tls_socket_stream transport,
             auto body = http::buffer_body{std::move(response_body)};
             co_await http::coroutine::respond(server, std::move(incoming->token), std::move(response), body);
         }
-    });
+    };
+    co_await http::coroutine::scoped(server, std::move(run_session));
     co_await transport.close();
 }
 

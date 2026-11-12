@@ -168,7 +168,7 @@ public:
     // RFC 9112 §9.6 — whether the connection is finished after the current
     // exchange (the peer sent "close", or the response body was close-delimited).
     [[nodiscard]] auto should_close() const noexcept -> bool {
-        return parser_.connection_closed();
+        return closed_ || parser_.connection_closed();
     }
 
     // RFC 9110 §15.2.2 / §9.3.6 — whether the last response switched the

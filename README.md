@@ -517,10 +517,11 @@ you:
 
 ```cpp
 http::v2::client<TlsStream> client{tls};
-auto response = co_await http::coroutine::scoped(client, [&](auto& c) -> http::task<std::string> {
+auto run_session = [&](auto& c) -> http::task<std::string> {
     auto received = co_await http::coroutine::request(c, request);
     co_return co_await read_all(received.body);
-});
+};
+auto response = co_await http::coroutine::scoped(client, std::move(run_session));
 ```
 
 HTTP/1.1 runs no drivers, so its `start`/`close` complete immediately.

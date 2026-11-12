@@ -167,9 +167,10 @@ static suite<"fetch"> fetch_suite = [] {
         http::v2::client client{transport};
         push_http2_settings_frame(s2c);
 
-        auto pending = http::coroutine::scoped(client, [](auto& endpoint) -> http::task<http::fetched> {
+        static constexpr auto run_session = [](auto& endpoint) -> http::task<http::fetched> {
             co_return co_await http::coroutine::fetch(endpoint, request_for("/h2"));
-        });
+        };
+        auto pending = http::coroutine::scoped(client, run_session);
         pending.start();
         expect(!pending.done());
         push_final_h2_response(s2c);

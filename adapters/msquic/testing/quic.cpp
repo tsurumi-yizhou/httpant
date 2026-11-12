@@ -81,16 +81,17 @@ auto read(stream& stream) -> http::task<std::vector<std::byte>> {
 auto cancel_accept(connection& connection, scheduler scheduler) -> http::task<void> {
     std::stop_source cancel;
     bool stopped = false;
-    co_await http::coroutine::with_scope([&](http::task_scope& scope) -> http::task<void> {
-        auto stop_later = [&]() -> http::task<void> {
-            co_await scheduler.schedule_after(std::chrono::milliseconds{1});
-            std::jthread worker{[&] { cancel.request_stop(); }};
-        };
+    auto stop_later = [&]() -> http::task<void> {
+        co_await scheduler.schedule_after(std::chrono::milliseconds{1});
+        std::jthread worker{[&] { cancel.request_stop(); }};
+    };
+    auto run_children = [&](http::task_scope& scope) -> http::task<void> {
         scope.spawn(stop_later());
         try { auto unused = co_await connection.async_accept(cancel.get_token()); }
         catch (const http::stopped&) { stopped = true; }
         co_await scope.join();
-    });
+    };
+    co_await http::coroutine::with_scope(std::move(run_children));
     on_engine();
     app::require(stopped, "pending stream accept did not stop");
 }
@@ -98,17 +99,18 @@ auto cancel_accept(connection& connection, scheduler scheduler) -> http::task<vo
 auto cancel_read(stream& stream, scheduler scheduler) -> http::task<void> {
     std::stop_source cancel;
     bool stopped = false;
-    co_await http::coroutine::with_scope([&](http::task_scope& scope) -> http::task<void> {
-        auto stop_later = [&]() -> http::task<void> {
-            co_await scheduler.schedule_after(std::chrono::milliseconds{1});
-            std::jthread worker{[&] { cancel.request_stop(); }};
-        };
+    auto stop_later = [&]() -> http::task<void> {
+        co_await scheduler.schedule_after(std::chrono::milliseconds{1});
+        std::jthread worker{[&] { cancel.request_stop(); }};
+    };
+    auto run_children = [&](http::task_scope& scope) -> http::task<void> {
         scope.spawn(stop_later());
         std::array<std::byte, 1> buffer;
         try { co_await stream.async_read(buffer, cancel.get_token()); }
         catch (const http::stopped&) { stopped = true; }
         co_await scope.join();
-    });
+    };
+    co_await http::coroutine::with_scope(std::move(run_children));
     on_engine();
     app::require(stopped, "pending stream read did not stop");
 }
@@ -149,7 +151,7 @@ auto transfer(scheduler scheduler, const std::filesystem::path& directory) -> ht
     std::vector<std::byte> payload(2 * 1024 * 1024);
     for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = std::byte(i % 251);
     auto serve = [&]() -> http::task<void> {
-        co_await server.run([&](auto& connection) -> http::task<void> {
+        auto exercise = [&](auto& connection) -> http::task<void> {
             const auto& stop = co_await http::current_stop_token();
             auto stream = co_await connection.async_accept(stop);
             app::require(stream.access() == http::stream_access::bidirectional, "expected bidirectional stream");
@@ -163,10 +165,11 @@ auto transfer(scheduler scheduler, const std::filesystem::path& directory) -> ht
             abandoned.shutdown(http::stream_side::sending, http::application_error{42});
             auto signal = co_await connection.async_open_unidirectional(stop);
             co_await write(signal, std::as_bytes(std::span{"done", 4}), true);
-        });
+        };
+        co_await server.run(std::move(exercise));
     };
     auto fetch = [&]() -> http::task<void> {
-        co_await client.run([&](auto& connection) -> http::task<void> {
+        auto exercise = [&](auto& connection) -> http::task<void> {
             co_await cancel_accept(connection, scheduler);
             const auto& stop = co_await http::current_stop_token();
             auto stream = co_await connection.async_open_bidirectional(stop);
@@ -185,9 +188,10 @@ auto transfer(scheduler scheduler, const std::filesystem::path& directory) -> ht
             app::require(signal.access() == http::stream_access::receive_only, "expected receive-only stream");
             auto marker = co_await read(signal);
             app::require(std::string_view{reinterpret_cast<const char*>(marker.data()), marker.size()} == "done", "unidirectional stream changed");
-        });
+        };
+        co_await client.run(std::move(exercise));
     };
-    co_await http::coroutine::with_scope([&](http::task_scope& scope) -> http::task<void> {
+    auto run_children = [&](http::task_scope& scope) -> http::task<void> {
         scope.spawn(network.upstream());
         scope.spawn(network.downstream());
         std::exception_ptr failure;
@@ -200,7 +204,8 @@ auto transfer(scheduler scheduler, const std::filesystem::path& directory) -> ht
         scope.request_stop();
         co_await scope.join();
         if (failure) std::rethrow_exception(failure);
-    });
+    };
+    co_await http::coroutine::with_scope(std::move(run_children));
     app::require(network.dropped, "loss test did not discard the initial packet");
 }
 
@@ -212,10 +217,12 @@ auto reject_identity(scheduler scheduler, const std::filesystem::path& directory
         {app::loopback.address(), server.port()}, "wrong.example"};
     bool entered = false, rejected = false;
     auto serve = [&]() -> http::task<void> {
-        co_await server.run([](auto&) -> http::task<void> { co_return; });
+        static constexpr auto exercise = [](auto&) -> http::task<void> { co_return; };
+        co_await server.run(exercise);
     };
     auto fetch = [&]() -> http::task<void> {
-        co_await client.run([&](auto&) -> http::task<void> { entered = true; co_return; });
+        auto exercise = [&](auto&) -> http::task<void> { entered = true; co_return; };
+        co_await client.run(std::move(exercise));
     };
     std::vector<http::task<void>> tasks;
     tasks.push_back(serve());
@@ -229,20 +236,22 @@ auto cancel_handshake(scheduler scheduler, const std::filesystem::path& director
         (directory / "quic-cert.pem").string(), (directory / "quic-key.pem").string())};
     std::stop_source cancel;
     bool entered = false, stopped = false;
-    co_await http::coroutine::with_scope([&](http::task_scope& scope) -> http::task<void> {
-        auto stop_later = [&]() -> http::task<void> {
-            co_await scheduler.schedule_after(std::chrono::milliseconds{1});
-            std::jthread worker{[&] { cancel.request_stop(); }};
-        };
+    auto stop_later = [&]() -> http::task<void> {
+        co_await scheduler.schedule_after(std::chrono::milliseconds{1});
+        std::jthread worker{[&] { cancel.request_stop(); }};
+    };
+    auto run_children = [&](http::task_scope& scope) -> http::task<void> {
         scope.spawn(stop_later());
         try {
-            co_await http::with_stop(cancel.get_token(), server.run([&](auto&) -> http::task<void> {
+            auto exercise = [&](auto&) -> http::task<void> {
                 entered = true;
                 co_return;
-            }));
+            };
+            co_await http::with_stop(cancel.get_token(), server.run(std::move(exercise)));
         } catch (const http::stopped&) { stopped = true; }
         co_await scope.join();
-    });
+    };
+    co_await http::coroutine::with_scope(std::move(run_children));
     on_engine();
     app::require(stopped && !entered, "handshake cancellation entered the connection body");
 }

@@ -56,14 +56,15 @@ template <typename Endpoint, typename Body>
 auto scoped(Endpoint& endpoint, Body body)
     -> task<typename std::invoke_result_t<Body&, Endpoint&>::value_type> {
     using value = typename std::invoke_result_t<Body&, Endpoint&>::value_type;
+    auto run_session = [&endpoint, body = std::move(body)]() mutable -> task<value> {
+        co_await coroutine::start(endpoint);
+        if constexpr (std::is_void_v<value>)
+            co_await body(endpoint);
+        else
+            co_return co_await body(endpoint);
+    };
     return http::detail::finally(
-        [&endpoint, body = std::move(body)]() mutable -> task<value> {
-            co_await coroutine::start(endpoint);
-            if constexpr (std::is_void_v<value>)
-                co_await body(endpoint);
-            else
-                co_return co_await body(endpoint);
-        },
+        std::move(run_session),
         [&endpoint] { return coroutine::close(endpoint); });
 }
 
@@ -80,12 +81,13 @@ template <typename Body>
 auto with_scope(Body body)
     -> task<typename std::invoke_result_t<Body&, http::task_scope&>::value_type> {
     http::task_scope scope;
+    auto stop_children = [&]() -> task<void> {
+        scope.request_stop();
+        co_await scope.join();
+    };
     co_return co_await http::detail::finally(
         [&] { return body(scope); },
-        [&]() -> task<void> {
-            scope.request_stop();
-            co_await scope.join();
-        });
+        std::move(stop_children));
 }
 
 template <typename Client, http::body_stream Body>
