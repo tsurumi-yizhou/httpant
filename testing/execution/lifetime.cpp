@@ -132,10 +132,11 @@ static suite<"execution lifetime"> lifetime_tests = [] {
         bool entered = false;
         bool failed = false;
         try {
-            run_sync(http::coroutine::scoped(endpoint, [&](auto&) -> http::task<void> {
+            auto run_session = [&](auto&) -> http::task<void> {
                 entered = true;
                 co_return;
-            }));
+            };
+            run_sync(http::coroutine::scoped(endpoint, std::move(run_session)));
         } catch (const std::runtime_error& e) { failed = std::string_view{e.what()} == "start failed"; }
         expect(failed);
         expect(!entered);

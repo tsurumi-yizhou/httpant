@@ -823,9 +823,10 @@ static suite<"conformance"> conformance_suite = [] {
         auto client_request = http::coroutine::request(client, basic_get("/index.html"));
         client_request.start();
 
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.target == "/index.html"sv);
         static_cast<void>(run_sync(drain_body(received.body)));
 
@@ -850,9 +851,10 @@ static suite<"conformance"> conformance_suite = [] {
             },
             response_body));
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
         expect(read_body_text(response.body) == "<html/>"sv);
 
@@ -888,9 +890,10 @@ static suite<"conformance"> conformance_suite = [] {
         auto client_request = http::coroutine::request(client, basic_get("/index.html"));
         client_request.start();
 
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.target == "/index.html"sv);
         static_cast<void>(run_sync(drain_body(received.body)));
 
@@ -918,9 +921,10 @@ static suite<"conformance"> conformance_suite = [] {
             },
             html_body));
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
 
         // The non-authoritative push is reset, never delivered to take_push().
@@ -955,9 +959,10 @@ static suite<"conformance"> conformance_suite = [] {
         });
         client_request.start();
 
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.method == http::method::HEAD);
         static_cast<void>(run_sync(drain_body(received.body)));
 
@@ -971,9 +976,10 @@ static suite<"conformance"> conformance_suite = [] {
             },
             html_body));
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
         auto body = run_sync(drain_body(response.body));
         expect(body.empty());
@@ -1023,16 +1029,18 @@ static suite<"conformance"> conformance_suite = [] {
         // ACK before the response, proving the round trip left the session healthy.
         auto client_request = http::coroutine::request(client, basic_get("/ping"));
         client_request.start();
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.target == "/ping"sv);
         static_cast<void>(run_sync(drain_body(received.body)));
         run_sync(http::coroutine::respond(server, std::move(received.token), http::response{
             .status = 200, .reason = {}, .fields = {}}));
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
     };
 
@@ -1321,9 +1329,10 @@ static suite<"conformance"> conformance_suite = [] {
             std::byte{'2'}, std::byte{'0'}, std::byte{'0'}};
         push_http2_frame(s2c, 0x01, 0x05, 1, ok_status);
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
 
         // take_push surfaces the cancelled promise as the typed stream error
@@ -1671,9 +1680,10 @@ static suite<"conformance"> conformance_suite = [] {
         auto client_request = http::coroutine::request(client, basic_get("/empty"));
         client_request.start();
 
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.target == "/empty"sv);
         static_cast<void>(run_sync(drain_body(received.body)));
 
@@ -1685,9 +1695,10 @@ static suite<"conformance"> conformance_suite = [] {
             http::response{.status = 204, .reason = {}, .fields = {}},
             body_204));
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 204_u);
         auto body = run_sync(drain_body(response.body));
         expect(body.empty());
@@ -1725,9 +1736,10 @@ static suite<"conformance"> conformance_suite = [] {
 
         auto server_request_2 = accept_request();
         server_request_2.start();
-        auto received_304 = run_sync([&]() -> http::task<h2_req> {
+        auto make_received_304 = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request_2);
-        }());
+        };
+        auto received_304 = run_sync(make_received_304());
         expect(received_304.head.target == "/cached"sv);
         expect(http::find_header(received_304.head.fields, "if-none-match") == R"("v1")"sv);
         static_cast<void>(run_sync(drain_body(received_304.body)));
@@ -1738,9 +1750,10 @@ static suite<"conformance"> conformance_suite = [] {
             http::response{.status = 304, .reason = {}, .fields = {}},
             body_304));
 
-        auto response_304 = run_sync([&]() -> http::task<h2_res> {
+        auto make_response_304 = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request_304);
-        }());
+        };
+        auto response_304 = run_sync(make_response_304());
         expect(response_304.head.status == 304_u);
         auto body_304_out = run_sync(drain_body(response_304.body));
         expect(body_304_out.empty());
@@ -1771,9 +1784,10 @@ static suite<"conformance"> conformance_suite = [] {
         auto client_request = http::coroutine::request(client, basic_get("/index.html"));
         client_request.start();
 
-        auto received = run_sync([&]() -> http::task<h2_req> {
+        auto make_received = [&]() -> http::task<h2_req> {
             co_return co_await std::move(server_request);
-        }());
+        };
+        auto received = run_sync(make_received());
         expect(received.head.target == "/index.html"sv);
         static_cast<void>(run_sync(drain_body(received.body)));
 
@@ -1790,9 +1804,10 @@ static suite<"conformance"> conformance_suite = [] {
             http::response{.status = 200, .reason = {}, .fields = {}},
             response_body));
 
-        auto response = run_sync([&]() -> http::task<h2_res> {
+        auto make_response = [&]() -> http::task<h2_res> {
             co_return co_await std::move(client_request);
-        }());
+        };
+        auto response = run_sync(make_response());
         expect(response.head.status == 200_u);
 
         auto pushed = client.take_push();

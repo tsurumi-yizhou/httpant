@@ -14,7 +14,7 @@ inline void check_tls(int result, std::string_view action) {
 
 namespace detail {
 struct buffers {
-    std::vector<std::byte> input, output;
+    std::vector<std::byte> input, output, spare_output;
     std::size_t consumed = 0;
     std::exception_ptr failure;
     static int read(WOLFSSL*, char* bytes, int size, void* context) noexcept {
@@ -156,7 +156,8 @@ class stream {
         }
         auto flush_output(std::stop_token stop) -> http::task<void> {
             while (!output.empty()) {
-                auto bytes = std::exchange(output, {});
+                auto bytes = std::move(spare_output);
+                bytes.swap(output);
                 std::span<const std::byte> remaining{bytes};
                 try {
                     while (!remaining.empty()) {
@@ -169,6 +170,8 @@ class stream {
                     output.insert(output.begin(), remaining.begin(), remaining.end());
                     throw;
                 }
+                bytes.clear();
+                spare_output = std::move(bytes);
             }
         }
         auto advance(int error, std::size_t before, std::stop_token stop) -> http::task<void> {

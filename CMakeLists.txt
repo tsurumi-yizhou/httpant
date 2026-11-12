@@ -46,7 +46,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Warnings stay on for the first-party tree but never fail the build.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  add_compile_options(-Wall -Wextra)
+  # Disable Debug symbols even when configuring without a preset.
+  add_compile_options(-Wall -Wextra "$<$<CONFIG:Debug>:-g0>")
 endif()
 
 ## Dependencies and modules

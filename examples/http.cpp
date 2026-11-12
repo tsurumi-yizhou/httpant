@@ -47,7 +47,7 @@ auto receive(Server& endpoint, bool execution) -> http::task<typename Server::in
 
 template<class Server>
 auto serve_endpoint(Server& endpoint, const options& config) -> http::task<void> {
-    co_await http::coroutine::scoped(endpoint, [&config](auto& server) -> http::task<void> {
+    auto run_session = [&config](auto& server) -> http::task<void> {
         const auto& stop = co_await http::current_stop_token();
         for (std::size_t sample = 0; sample <= config.samples; ++sample) {
             auto count = sample == 0 ? config.warmup : config.requests;
@@ -73,12 +73,13 @@ auto serve_endpoint(Server& endpoint, const options& config) -> http::task<void>
             }
             if (sample) report("server", config, sample - 1, begin);
         }
-    });
+    };
+    co_await http::coroutine::scoped(endpoint, std::move(run_session));
 }
 
 template<class Client>
 auto fetch_endpoint(Client& endpoint, const options& config) -> http::task<void> {
-    co_await http::coroutine::scoped(endpoint, [&config](auto& client) -> http::task<void> {
+    auto run_session = [&config](auto& client) -> http::task<void> {
         std::string payload(config.bytes, 'x');
         for (std::size_t sample = 0; sample <= config.samples; ++sample) {
             auto count = sample == 0 ? config.warmup : config.requests;
@@ -101,7 +102,8 @@ auto fetch_endpoint(Client& endpoint, const options& config) -> http::task<void>
             }
             if (sample) report("client", config, sample - 1, begin, latency);
         }
-    });
+    };
+    co_await http::coroutine::scoped(endpoint, std::move(run_session));
 }
 
 template<bool H2>

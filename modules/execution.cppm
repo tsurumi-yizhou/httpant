@@ -128,9 +128,10 @@ inline constexpr respond_t respond{};
 struct read_t {
     template <http::body_stream Body>
     auto operator()(Body& body, std::span<std::byte> buffer) const {
-        return http::defer([&body, buffer]() -> http::detail::operation<std::size_t> {
+        auto read_body = [&body, buffer]() -> http::detail::operation<std::size_t> {
             co_return co_await body.async_read(buffer, co_await http::current_stop_token());
-        });
+        };
+        return http::defer(std::move(read_body));
     }
     template <http::body_stream Body>
     auto operator()(Body& body) const { return detail::bound_operation<read_t, Body>{body}; }

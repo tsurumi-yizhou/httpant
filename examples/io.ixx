@@ -56,14 +56,14 @@ inline auto guarded(http::task_scope& scope, http::task<void> child) -> http::ta
 }
 
 inline auto parallel(std::vector<http::task<void>> children) -> http::task<void> {
-    co_await http::coroutine::with_scope(
-        [&children](http::task_scope& scope) -> http::task<void> {
-            const auto& token = co_await http::current_stop_token();
-            std::stop_callback forward{token, [&scope] { scope.request_stop(); }};
-            for (auto& child : children)
-                scope.spawn(guarded(scope, std::move(child)));
-            co_await scope.join();
-        });
+    auto run_children = [&children](http::task_scope& scope) -> http::task<void> {
+        const auto& token = co_await http::current_stop_token();
+        std::stop_callback forward{token, [&scope] { scope.request_stop(); }};
+        for (auto& child : children)
+            scope.spawn(guarded(scope, std::move(child)));
+        co_await scope.join();
+    };
+    co_await http::coroutine::with_scope(std::move(run_children));
 }
 
 namespace detail {
