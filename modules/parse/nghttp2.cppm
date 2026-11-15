@@ -1,5 +1,4 @@
 export module httpant:parse.nghttp2;
-import httpant.exception;
 
 import httpant.dependencies.nghttp2;
 import std;

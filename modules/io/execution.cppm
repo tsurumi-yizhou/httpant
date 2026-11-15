@@ -1,5 +1,4 @@
 export module httpant.io:execution;
-import httpant.exception;
 import std;
 import httpant.dependencies.stdexec;
 import :native;
@@ -156,17 +155,17 @@ export namespace http::io::net {
                             if constexpr (Network)
                                 stdexec::set_error(std::move(receiver), error.code());
                             else
-                                stdexec::set_error(std::move(receiver), http::exceptions::current_exception());
+                                stdexec::set_error(std::move(receiver), std::current_exception());
                         } catch (const std::bad_alloc&) {
                             if constexpr (Network)
                                 stdexec::set_error(std::move(receiver), std::make_error_code(std::errc::not_enough_memory));
                             else
-                                stdexec::set_error(std::move(receiver), http::exceptions::current_exception());
+                                stdexec::set_error(std::move(receiver), std::current_exception());
                         } catch (...) {
                             if constexpr (Network)
                                 stdexec::set_error(std::move(receiver), std::make_error_code(std::errc::io_error));
                             else
-                                stdexec::set_error(std::move(receiver), http::exceptions::current_exception());
+                                stdexec::set_error(std::move(receiver), std::current_exception());
                         }
                     };
                 }
@@ -196,7 +195,7 @@ export namespace http::io::net {
                     try {
                         watch.emplace(stdexec::get_stop_token(stdexec::get_env(receiver)), on_stop{this});
                     } catch (...) {
-                        auto failure = http::exceptions::current_exception();
+                        auto failure = std::current_exception();
                         auto target = std::move(receiver);
                         if constexpr (Network)
                             stdexec::set_error(std::move(target), std::make_error_code(std::errc::not_enough_memory));
@@ -723,8 +722,7 @@ export namespace http::io::net {
         return async_write_some(socket, buffer(bytes));
     }
 
-    struct closed : std::system_error, public http::exceptions::exception_capture {
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
+    struct closed : std::system_error {
         closed() : std::system_error(std::make_error_code(std::errc::connection_reset), "peer closed") {}
     };
 
@@ -880,7 +878,7 @@ export namespace http::io::net {
                                 return;
                         }
                     } catch (...) {
-                        auto failure = http::exceptions::current_exception();
+                        auto failure = std::current_exception();
                         destroy_child();
                         auto target = std::move(receiver_);
                         stdexec::set_error(std::move(target), std::move(failure));

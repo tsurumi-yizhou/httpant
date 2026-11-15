@@ -1,5 +1,4 @@
 export module httpant:parse.nghttp3;
-import httpant.exception;
 
 import httpant.dependencies.nghttp3;
 import std;

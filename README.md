@@ -350,11 +350,17 @@ uniform Release optimization for all application and foundation modules.
 
 ## Build
 
-Requires CMake 4.0+, Ninja, C++23, and the
-[xclang toolchain](https://github.com/clice-io/xclang), whose `xclang::std`
-target provides the standard library module. `cmake/toolchain.cmake` reads two
-environment variables: `XCLANG_ROOT` names the xclang tree and `VCPKG_ROOT` the
-vcpkg checkout. `XCLANG_TARGET` selects the target, the host's by default.
+Requires CMake 4.5+, Ninja, C++23 and clang 23 or newer.
+`cmake/toolchain.cmake` reads two environment variables: `CLANG_ROOT` names a
+clang tree (unset, the platform's `clang++-23` or newer, or `clang-cl` on Windows, from
+`PATH`) and
+`VCPKG_ROOT` the vcpkg checkout. `CLANG_STDLIB` selects the standard library
+(`libc++` by default, or `libstdc++` on Linux) and `CLANG_SANITIZER` the
+sanitizers. On Windows clang-cl compiles for the MSVC ABI with libc++ and the
+static CRT. CMake 4.5 synthesizes the std module from the library's own
+manifest, and vcpkg builds the ports with the same compiler, tools and flags.
+`cmake/platform/<system>.cmake` lists each system's I/O mechanisms and the
+engine units, libraries and definitions they need.
 `CMakePresets.json` has the `debug` and `release` configurations; machine paths
 belong in a Git-ignored `CMakeUserPresets.json` that inherits them:
 
@@ -401,8 +407,8 @@ Options: `HTTPANT_BUILD_TESTS` and `HTTPANT_ENABLE_TLS` (default `ON` at top
 level), `HTTPANT_BUILD_EXAMPLES`, `HTTPANT_BUILD_BENCHMARKS` and
 `HTTPANT_ENABLE_IO` (default `OFF`). Every dependency
 comes from vcpkg at the microsoft/vcpkg baseline in `vcpkg-configuration.json`
-through `cmake/toolchain.cmake`, which writes the `*-xclang` triplet for the
-target into the build directory. The protocol needs llhttp, nghttp2, nghttp3 and
+through `cmake/toolchain.cmake`, which writes the triplet for the host and
+standard library into the build directory. The protocol needs llhttp, nghttp2, nghttp3 and
 stdexec; the engine adds liburing on Linux, and TLS, tests and examples add
 Asio, wolfSSL and Boost.UT. `cmake/dependencies.cmake` finds them for this build
 and for the installed package alike; nghttp2 and liburing install no CMake

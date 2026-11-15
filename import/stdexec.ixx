@@ -7,6 +7,20 @@ module;
 #include <cstdio>
 #include <cstdlib>
 
+#if defined(_WIN32)
+// The Windows scheduler includes these headers inside execution.hpp. Their
+// declarations belong to the global module, not the execution module.
+#include <algorithm>
+#include <exception>
+#include <functional>
+#include <system_error>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <windows.h>
+#include <threadpoolapiset.h>
+#endif
+
 #if __has_include(<dispatch/dispatch.h>)
 #include <dispatch/dispatch.h>
 #endif

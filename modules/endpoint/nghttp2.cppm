@@ -1,5 +1,4 @@
 export module httpant:endpoint.nghttp2;
-import httpant.exception;
 
 import httpant.dependencies.nghttp2;
 import std;
@@ -107,7 +106,7 @@ export namespace http::v2 {
                     // parked or later handshake()/request() fails fast with this error
                     // instead of hanging. started_ stays true: a retry must neither
                     // relaunch the driver nor silently succeed.
-                    failure = http::exceptions::current_exception();
+                    failure = std::current_exception();
                     fail_connection(failure);
                 }
                 if (failure) {
@@ -121,7 +120,7 @@ export namespace http::v2 {
             auto close() -> http::detail::operation<void> {
                 scope_.request_stop();
                 co_await scope_.join();
-                fail_connection(http::exceptions::make_exception_ptr(http::stopped{}));
+                fail_connection(std::make_exception_ptr(http::stopped{}));
                 co_await http::detail::dispatch_wakeups{wakeups_};
             }
 
@@ -250,13 +249,12 @@ export namespace http::v2 {
                 auto code = static_cast<std::uint32_t>(NGHTTP2_SETTINGS_TIMEOUT);
                 check(nghttp2_session_terminate_session(session_.get(), code), "terminate_session");
                 flush_output(session_.get(), context_);
-                context_.core.connection_error =
-                    http::exceptions::make_exception_ptr(protocol_error{error_info{
-                                                                            .condition = error_condition::timeout,
-                                                                            .exchange_identity = std::nullopt,
-                                                                            .library_code = std::nullopt,
-                                                                        },
-                                                                        close_connection{code}, "http/2: SETTINGS acknowledgment timed out"});
+                context_.core.connection_error = std::make_exception_ptr(protocol_error{error_info{
+                                                                                            .condition = error_condition::timeout,
+                                                                                            .exchange_identity = std::nullopt,
+                                                                                            .library_code = std::nullopt,
+                                                                                        },
+                                                                                        close_connection{code}, "http/2: SETTINGS acknowledgment timed out"});
                 notify();
             }
 
@@ -269,7 +267,7 @@ export namespace http::v2 {
                 try {
                     co_await flush();
                 } catch (...) {
-                    failure = http::exceptions::current_exception();
+                    failure = std::current_exception();
                 }
                 co_await http::detail::dispatch_wakeups{wakeups_};
                 if (failure)
@@ -341,7 +339,7 @@ export namespace http::v2 {
                         }
                     }
                 } catch (...) {
-                    failure = http::exceptions::current_exception();
+                    failure = std::current_exception();
                 }
                 // A stopped reader leaves the connection to close(), which fails it
                 // once the reader has been joined; a destroyed endpoint wakes nobody.

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 4.0)
+cmake_minimum_required(VERSION 4.5)
 project(httpant VERSION 0.2.0 LANGUAGES CXX)
 
 ## Options
@@ -15,16 +15,16 @@ if((HTTPANT_BUILD_TESTS OR HTTPANT_BUILD_EXAMPLES) AND NOT HTTPANT_ENABLE_TLS)
   message(FATAL_ERROR "The tests and examples need HTTPANT_ENABLE_TLS")
 endif()
 
-# One I/O mechanism is compiled in; the first one listed is the platform's
-# default.
-if(WIN32)
-  set(HTTPANT_IO_BACKENDS asio ioring iocp)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(HTTPANT_IO_BACKENDS asio uring epoll)
-elseif(APPLE OR CMAKE_SYSTEM_NAME MATCHES "BSD")
-  set(HTTPANT_IO_BACKENDS asio kqueue)
-else()
-  set(HTTPANT_IO_BACKENDS asio)
+## Platform
+#
+# cmake/platform/<system>.cmake describes the target: its I/O mechanisms, of
+# which one is compiled in and the first is the default, and the engine units,
+# libraries and definitions they need. A system without a description is not
+# supported.
+
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/platform/${CMAKE_SYSTEM_NAME}.cmake" OPTIONAL RESULT_VARIABLE HTTPANT_PLATFORM_DESCRIPTION)
+if(NOT HTTPANT_PLATFORM_DESCRIPTION)
+  message(FATAL_ERROR "No platform description for ${CMAKE_SYSTEM_NAME} under cmake/platform")
 endif()
 list(GET HTTPANT_IO_BACKENDS 0 HTTPANT_DEFAULT_IO_BACKEND)
 set(HTTPANT_IO_BACKEND "${HTTPANT_DEFAULT_IO_BACKEND}" CACHE STRING "Native I/O mechanism")
@@ -35,8 +35,9 @@ endif()
 
 ## Language
 #
-# C++23 modules with the standard library as a module; the compiler comes from
-# the xclang tree that cmake/toolchain.cmake selects.
+# C++23 modules with the standard library as a module; cmake/toolchain.cmake
+# picks clang — the platform's, or the tree named by CLANG_ROOT — and lets
+# CMake synthesize std from the standard library's manifest.
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,11 +45,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Warnings stay on for the first-party tree but never fail the build.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-  # Disable Debug symbols even when configuring without a preset.
-  add_compile_options(-Wall -Wextra "$<$<CONFIG:Debug>:-g0>")
-endif()
+# Warnings stay on for the first-party tree but never fail the build. The
+# MSVC command line spells -Wall -Wextra as /W4; its /Wall is -Weverything.
+add_compile_options("$<IF:$<CXX_COMPILER_FRONTEND_VARIANT:MSVC>,/W4,-Wall;-Wextra>")
 
 ## Dependencies and modules
 
