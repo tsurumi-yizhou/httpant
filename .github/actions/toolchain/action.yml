@@ -11,6 +11,9 @@ inputs:
   xclang-version:
     description: xclang release for Windows
     default: 23.1.5.2
+  cmake-version:
+    description: CMake release
+    default: 4.5.0
 
 outputs:
   installed-key:
@@ -27,11 +30,31 @@ runs:
       with:
         python-version: "3.x"
 
+    # PyPI lags the CMake release, so CMake comes from Kitware's release.
     - name: Install build tools
       shell: bash
+      env:
+        CMAKE_VERSION: ${{ inputs.cmake-version }}
       run: |
         set -euo pipefail
-        python -m pip install --upgrade 'cmake>=4.5' ninja
+        python -m pip install --upgrade ninja
+        case "$RUNNER_OS-$RUNNER_ARCH" in
+          Linux-X64) package=linux-x86_64.tar.gz bin=bin ;;
+          Linux-ARM64) package=linux-aarch64.tar.gz bin=bin ;;
+          macOS-*) package=macos-universal.tar.gz bin=CMake.app/Contents/bin ;;
+          Windows-X64) package=windows-x86_64.zip bin=bin ;;
+          Windows-ARM64) package=windows-arm64.zip bin=bin ;;
+        esac
+        archive="$RUNNER_TEMP/cmake-$CMAKE_VERSION-$package"
+        curl -fsSL --retry 3 -o "$archive" \
+          "https://github.com/Kitware/CMake/releases/download/v$CMAKE_VERSION/cmake-$CMAKE_VERSION-$package"
+        case "$package" in
+          *.zip) 7z x -y -o"$RUNNER_TEMP" "$archive" >/dev/null ;;
+          *) tar -xzf "$archive" -C "$RUNNER_TEMP" ;;
+        esac
+        root="$RUNNER_TEMP/cmake-$CMAKE_VERSION-${package%%.*}/$bin"
+        if [ "$RUNNER_OS" = Windows ]; then root="$(cygpath -w "$root")"; fi
+        echo "$root" >> "$GITHUB_PATH"
         case "$RUNNER_OS" in
           Linux)
             sudo apt-get update
