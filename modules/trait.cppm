@@ -1,5 +1,4 @@
 export module httpant:trait;
-import httpant.exception;
 
 import httpant.dependencies.stdexec;
 import httpant.memory;
@@ -35,10 +34,9 @@ export namespace http {
     // exchange token from another server, an outbound message that cannot be
     // framed, a transport that breaks the byte_stream contract. Only the caller
     // can fix it, so it is a std::logic_error.
-    class usage_error : public std::logic_error, public http::exceptions::exception_capture {
+    class usage_error : public std::logic_error {
     public:
         using std::logic_error::logic_error;
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
     };
 
     namespace detail {
@@ -120,7 +118,7 @@ export namespace http {
 
             auto initial_suspend() noexcept -> std::suspend_always { return {}; }
             auto final_suspend() noexcept -> task_final_awaiter { return {}; }
-            void unhandled_exception() noexcept { exception_ = http::exceptions::current_exception(); }
+            void unhandled_exception() noexcept { exception_ = std::current_exception(); }
 
             [[nodiscard]] auto stop_token() const noexcept -> const std::stop_token& { return *stop_; }
         };
@@ -366,7 +364,7 @@ export namespace http {
                         self_->result_.template emplace<typename sender_awaiter::values_type>(std::in_place_type<decayed_tuple<Values...>>,
                                                                                               std::forward<Values>(values)...);
                     } catch (...) {
-                        self_->result_.template emplace<std::exception_ptr>(http::exceptions::current_exception());
+                        self_->result_.template emplace<std::exception_ptr>(std::current_exception());
                     }
                     self_->complete();
                 }
@@ -413,11 +411,11 @@ export namespace http {
                     if constexpr (std::same_as<decayed, std::exception_ptr>)
                         return error;
                     else if constexpr (std::same_as<decayed, std::error_code>)
-                        return http::exceptions::make_exception_ptr(std::system_error(error));
+                        return std::make_exception_ptr(std::system_error(error));
                     else
-                        return http::exceptions::make_exception_ptr(std::forward<Error>(error));
+                        return std::make_exception_ptr(std::forward<Error>(error));
                 } catch (...) {
-                    return http::exceptions::current_exception();
+                    return std::current_exception();
                 }
             }
 
@@ -449,7 +447,7 @@ export namespace http {
                 try {
                     ::new (static_cast<void*>(storage_)) operation_type(stdexec::connect(std::move(sender_), receiver{this}));
                 } catch (...) {
-                    result_.template emplace<std::exception_ptr>(http::exceptions::current_exception());
+                    result_.template emplace<std::exception_ptr>(std::current_exception());
                     return false;
                 }
                 live_ = true;
@@ -956,7 +954,7 @@ export namespace http {
                     if (!task_.handle_)
                         throw usage_error("httpant: operation returned an empty task");
                 } catch (...) {
-                    auto failure = http::exceptions::current_exception();
+                    auto failure = std::current_exception();
                     stop_.detach();
                     auto receiver = std::move(receiver_);
                     stdexec::set_error(std::move(receiver), std::move(failure));
@@ -994,7 +992,7 @@ export namespace http {
                         auto value = std::move(*promise.result_);
                         stdexec::set_value(std::move(receiver), std::move(value));
                     } catch (...) {
-                        stdexec::set_error(std::move(receiver), http::exceptions::current_exception());
+                        stdexec::set_error(std::move(receiver), std::current_exception());
                     }
                 }
                 return std::noop_coroutine();
@@ -1286,8 +1284,7 @@ export namespace http {
     // or abandons this one stream (QUIC RESET_STREAM / STOP_SENDING). RFC 9114
     // §4.1.1 — stream errors are stream-level events, so the protocol layer treats
     // this as terminal for that stream only, never as a connection failure.
-    struct stream_reset : std::runtime_error, public http::exceptions::exception_capture {
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
+    struct stream_reset : std::runtime_error {
         explicit stream_reset(application_error error_code) : std::runtime_error{"stream reset by peer"}, error_code{error_code} {}
         application_error error_code;
     };
@@ -1392,13 +1389,13 @@ export namespace http::detail {
             else
                 result.emplace(co_await work());
         } catch (...) {
-            failure = http::exceptions::current_exception();
+            failure = std::current_exception();
         }
         try {
             co_await cleanup();
         } catch (...) {
             if (!failure)
-                failure = http::exceptions::current_exception();
+                failure = std::current_exception();
         }
         if (failure)
             std::rethrow_exception(failure);

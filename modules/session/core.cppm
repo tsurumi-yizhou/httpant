@@ -1,5 +1,4 @@
 export module httpant:session.core;
-import httpant.exception;
 
 import std;
 import :trait;
@@ -69,7 +68,7 @@ export namespace http {
                     return std::forward<Callback>(callback)();
                 }
             } catch (...) {
-                ctx.core.pending_callback_failure = http::exceptions::current_exception();
+                ctx.core.pending_callback_failure = std::current_exception();
                 return engine_failure_code;
             }
         }

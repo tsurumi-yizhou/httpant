@@ -1,5 +1,4 @@
 export module httpant:error;
-import httpant.exception;
 
 import std;
 import :message;
@@ -91,10 +90,8 @@ export namespace http {
 
     using protocol_action = std::variant<no_action, reset_stream, close_connection>;
 
-    class protocol_error : public std::runtime_error, public http::exceptions::exception_capture {
+    class protocol_error : public std::runtime_error {
     public:
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
-
         // The action decides the scope, so no construction site can hand a stream
         // reset a connection scope (or the reverse): the type of the action is the
         // invariant. no_action keeps the scope the failure names, since a failure

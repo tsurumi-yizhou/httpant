@@ -1,5 +1,4 @@
 export module httpant:serialize.nghttp3;
-import httpant.exception;
 
 import httpant.dependencies.nghttp3;
 import std;
@@ -110,7 +109,7 @@ export namespace http::v3 {
                     *flags |= NGHTTP3_DATA_FLAG_EOF;
                 return 1;
             } catch (...) {
-                ctx.core.pending_callback_failure = http::exceptions::current_exception();
+                ctx.core.pending_callback_failure = std::current_exception();
                 return NGHTTP3_ERR_CALLBACK_FAILURE;
             }
         }

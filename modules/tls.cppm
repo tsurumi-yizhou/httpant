@@ -1,5 +1,4 @@
 export module httpant.tls;
-import httpant.exception;
 
 import std;
 import httpant;
@@ -35,7 +34,7 @@ export namespace http::tls {
                     self.output.insert(self.output.end(), data.begin(), data.end());
                     return size;
                 } catch (...) {
-                    self.failure = http::exceptions::current_exception();
+                    self.failure = std::current_exception();
                     return WOLFSSL_CBIO_ERR_GENERAL;
                 }
             }
@@ -99,7 +98,7 @@ export namespace http::tls {
                         std::erase(waiting_, &next);
                         if (!next.acquired)
                             throw;
-                        failure = http::exceptions::current_exception();
+                        failure = std::current_exception();
                     }
                 }
                 if constexpr (std::is_void_v<T>) {
@@ -107,7 +106,7 @@ export namespace http::tls {
                         if (!failure)
                             co_await std::move(work);
                     } catch (...) {
-                        failure = http::exceptions::current_exception();
+                        failure = std::current_exception();
                     }
                     co_await release{*this};
                     if (failure)
@@ -118,7 +117,7 @@ export namespace http::tls {
                         if (!failure)
                             result.emplace(co_await std::move(work));
                     } catch (...) {
-                        failure = http::exceptions::current_exception();
+                        failure = std::current_exception();
                     }
                     co_await release{*this};
                     if (failure)
@@ -129,9 +128,8 @@ export namespace http::tls {
         };
     } // namespace detail
 
-    struct verification_failure : std::runtime_error, public http::exceptions::exception_capture {
+    struct verification_failure : std::runtime_error {
         using std::runtime_error::runtime_error;
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
     };
 
     class context {

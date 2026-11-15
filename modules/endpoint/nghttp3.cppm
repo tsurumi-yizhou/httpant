@@ -1,5 +1,4 @@
 export module httpant:endpoint.nghttp3;
-import httpant.exception;
 
 import httpant.dependencies.nghttp3;
 import std;
@@ -149,7 +148,7 @@ export namespace http::v3 {
                     // No driver can repair a failed initialization. Keep this endpoint
                     // terminal and wake existing waiters; a new connection needs a
                     // new endpoint and transport, instead of rebinding partial state.
-                    fail_connection(context_, http::exceptions::current_exception());
+                    fail_connection(context_, std::current_exception());
                     throw;
                 }
             }
@@ -160,7 +159,7 @@ export namespace http::v3 {
             auto close() -> http::detail::operation<void> {
                 scope_.request_stop();
                 co_await scope_.join();
-                fail_connection(context_, http::exceptions::make_exception_ptr(http::stopped{}));
+                fail_connection(context_, std::make_exception_ptr(http::stopped{}));
             }
 
             auto flush() -> http::detail::operation<void> {
@@ -307,7 +306,7 @@ export namespace http::v3 {
                     abandon(sid, reset);
                 } catch (...) {
                     if (!scope_.stop_requested())
-                        fail_connection(context_, http::exceptions::current_exception());
+                        fail_connection(context_, std::current_exception());
                 }
                 if (--unacknowledged_ == 0)
                     acknowledged_.resume();
@@ -335,7 +334,7 @@ export namespace http::v3 {
                     }
                 } catch (...) {
                     if (!scope_.stop_requested())
-                        fail_connection(context_, http::exceptions::current_exception());
+                        fail_connection(context_, std::current_exception());
                 }
             }
 
@@ -358,7 +357,7 @@ export namespace http::v3 {
                     context_.inputs.erase(stream_id);
                     co_return;
                 } catch (...) {
-                    failure = http::exceptions::current_exception();
+                    failure = std::current_exception();
                 }
 
                 if (scope_.stop_requested())
@@ -374,7 +373,7 @@ export namespace http::v3 {
                         stream->shutdown(stream_side::both, application_error{*code});
                         co_await flush();
                     } catch (...) {
-                        failure = http::exceptions::current_exception();
+                        failure = std::current_exception();
                         record_connection_error(context_, connection_, NGHTTP3_H3_INTERNAL_ERROR);
                     }
                     if (context_.connection_error_code == 0) {
@@ -413,7 +412,7 @@ export namespace http::v3 {
                         // The protocol action was selected and attempted; failure of
                         // the transport action is now the terminal error and must not
                         // be swallowed behind the original protocol violation.
-                        failure = http::exceptions::current_exception();
+                        failure = std::current_exception();
                     }
                 }
                 fail_connection(context_, std::move(failure));
@@ -458,7 +457,7 @@ export namespace http::v3 {
                                 it->second->core.resume_waiter();
                         }
                     } catch (...) {
-                        input_failure = http::exceptions::current_exception();
+                        input_failure = std::current_exception();
                     }
                     co_await http::detail::dispatch_wakeups{wakeups_};
                     if (input_failure)

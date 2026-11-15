@@ -14,20 +14,13 @@
 #
 # HTTPANT_TARGETS collects what the package installs.
 
-# xclang::std is built by each project that finds xclang, so the targets reach
-# it through this interface target: httpant-config.cmake links the installed
-# one to the consumer's xclang::std.
-add_library(httpant-std INTERFACE)
-set_target_properties(httpant-std PROPERTIES EXPORT_NAME std)
-target_link_libraries(httpant-std INTERFACE $<BUILD_INTERFACE:xclang::std>)
-set(HTTPANT_TARGETS httpant-std)
+set(HTTPANT_TARGETS)
 
 # httpant_add_module(<target> <export name> <interface unit>...)
 function(httpant_add_module TARGET NAME)
   add_library(${TARGET} STATIC)
   add_library(httpant::${NAME} ALIAS ${TARGET})
   set_target_properties(${TARGET} PROPERTIES EXPORT_NAME ${NAME})
-  target_link_libraries(${TARGET} PUBLIC httpant-std)
   target_sources(${TARGET} PUBLIC FILE_SET CXX_MODULES FILES ${ARGN})
   set(HTTPANT_TARGETS ${HTTPANT_TARGETS} ${TARGET} PARENT_SCOPE)
 endfunction()
@@ -38,11 +31,11 @@ endfunction()
 # are targets of their own: CMake rejects a public module source that imports a
 # module provided by a private source of the same target.
 
-httpant_add_module(httpant-stdexec stdexec import/stdexec.ixx import/memory.ixx import/queue.ixx import/exception.ixx)
+httpant_add_module(httpant-stdexec stdexec import/stdexec.ixx import/memory.ixx import/queue.ixx)
 target_link_libraries(httpant-stdexec PUBLIC STDEXEC::stdexec)
-target_compile_definitions(httpant-stdexec PRIVATE STDEXEC_BUILD_MODULES=1)
+target_compile_definitions(httpant-stdexec PRIVATE STDEXEC_BUILD_MODULES=1 ${HTTPANT_PLATFORM_DEFINITIONS})
 
-# The xclang triplets link every dependency statically.
+# The vcpkg triplets link every dependency statically.
 httpant_add_module(httpant-imports imports import/llhttp.ixx import/nghttp2.ixx import/nghttp3.ixx)
 target_link_libraries(httpant-imports PUBLIC httpant-stdexec
   llhttp::llhttp_static Nghttp2::nghttp2 nghttp3::nghttp3_static)
@@ -98,26 +91,26 @@ target_link_libraries(httpant PUBLIC httpant-imports)
 # Opt-in: httpant's default identity is the sans-I/O protocol library. The
 # engine uses stdexec and platform APIs with no dependency on the protocol, so
 # it is a separate target and a protocol consumer never links it. One
-# mechanism is compiled in, chosen by HTTPANT_IO_BACKEND; the first one listed
-# for a platform is its default.
+# mechanism is compiled in, chosen by HTTPANT_IO_BACKEND. The platform
+# description names its interface units, implementation units and libraries,
+# and each mechanism adds its own below; units are named without the extension
+# under modules/io/native/.
+
+set(HTTPANT_IO_IMPLEMENTATION_asio context)
+set(HTTPANT_IO_LIBRARIES_asio httpant-asio)
+set(HTTPANT_IO_LIBRARIES_uring Liburing::liburing)
 
 if(HTTPANT_ENABLE_IO)
+  set(HTTPANT_IO_INTERFACE ${HTTPANT_IO_BACKEND} ${HTTPANT_IO_MODULES})
+  set(HTTPANT_IO_UNITS ${HTTPANT_IO_IMPLEMENTATION} ${HTTPANT_IO_IMPLEMENTATION_${HTTPANT_IO_BACKEND}})
+  foreach(UNITS HTTPANT_IO_INTERFACE HTTPANT_IO_UNITS)
+    list(TRANSFORM ${UNITS} PREPEND modules/io/native/)
+    list(TRANSFORM ${UNITS} APPEND .cppm)
+  endforeach()
   httpant_add_module(httpant-io io modules/io/native.cppm modules/io/native/core.cppm modules/io/execution.cppm
-    modules/io/native/queue.cppm modules/io/native/${HTTPANT_IO_BACKEND}.cppm)
-  target_link_libraries(httpant-io PUBLIC httpant-stdexec)
-  set(HTTPANT_IO_UNITS)
-  if(WIN32)
-    target_sources(httpant-io PUBLIC FILE_SET CXX_MODULES FILES modules/io/native/windows.cppm)
-    target_link_libraries(httpant-io PRIVATE ws2_32 kernel32)
-  else()
-    list(APPEND HTTPANT_IO_UNITS modules/io/native/posix.cppm)
-  endif()
-  if(HTTPANT_IO_BACKEND STREQUAL "asio")
-    list(APPEND HTTPANT_IO_UNITS modules/io/native/context.cppm)
-    target_link_libraries(httpant-io PRIVATE httpant-asio)
-  elseif(HTTPANT_IO_BACKEND STREQUAL "uring")
-    target_link_libraries(httpant-io PRIVATE Liburing::liburing)
-  endif()
+    modules/io/native/queue.cppm ${HTTPANT_IO_INTERFACE})
+  target_link_libraries(httpant-io PUBLIC httpant-stdexec
+    PRIVATE ${HTTPANT_IO_LIBRARIES} ${HTTPANT_IO_LIBRARIES_${HTTPANT_IO_BACKEND}})
   # Implementation units. clang reads a .cppm file as an interface unit unless
   # CMake passes the language to the compiler.
   target_sources(httpant-io PRIVATE ${HTTPANT_IO_UNITS})

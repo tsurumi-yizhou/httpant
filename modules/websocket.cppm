@@ -1,5 +1,4 @@
 export module httpant:websocket;
-import httpant.exception;
 import std;
 import :message;
 
@@ -13,8 +12,7 @@ export namespace http::websocket {
         std::size_t message_bytes = 8u << 20;
         std::size_t buffer_bytes = 80u << 10;
     };
-    struct failure : std::runtime_error, public http::exceptions::exception_capture {
-        auto capture() const noexcept -> std::exception_ptr override { return http::exceptions::capture(*this); }
+    struct failure : std::runtime_error {
         std::uint16_t status;
         failure(std::uint16_t status, std::string_view message) : std::runtime_error(std::string{message}), status(status) {}
     };
