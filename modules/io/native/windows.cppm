@@ -1,6 +1,7 @@
 module;
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
+#include <cstddef>
 #include <winsock2.h>
 #include <mswsock.h>
 #include <windows.h>
