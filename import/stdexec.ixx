@@ -12,6 +12,7 @@ module;
 // declarations belong to the global module, not the execution module.
 #include <algorithm>
 #include <exception>
+#include <execution>
 #include <functional>
 #include <system_error>
 #include <thread>
